@@ -3,6 +3,7 @@ package generated
 import (
 	"goir-native-test/baseline"
 	"goir-native-test/constrained"
+	"goir-native-test/optimized"
 	"runtime"
 	"sync"
 	"testing"
@@ -88,5 +89,17 @@ func BenchmarkChainRegisters(b *testing.B) {
 func BenchmarkChainStack(b *testing.B) {
 	for b.Loop() {
 		benchmarkResult = baseline.LargeStack(17)
+	}
+}
+
+func BenchmarkSimplifyRaw(b *testing.B) {
+	for b.Loop() {
+		benchmarkResult = SimplifyChain(17)
+	}
+}
+
+func BenchmarkSimplifyOptimized(b *testing.B) {
+	for b.Loop() {
+		benchmarkResult = optimized.SimplifyChain(17)
 	}
 }

@@ -3,6 +3,7 @@ package tests;
 use ecosystem::goir as ir;
 use ecosystem::goir::amd64;
 use ecosystem::goir::regalloc;
+use ecosystem::goir::opt;
 use std::env;
 use ecosystem::goir::examples::basic as example;
 use std::crypto::hash;
@@ -93,12 +94,27 @@ fn literal(value: ir::Datum) -> string {
 }
 
 fn add_differential(lines: Vec[string], function: ir::Function, cases: Vec[Vec[ir::Datum]]) -> () {
+    let optimized = testing::expect_ok(opt::simplify(function), "optimize differential function");
+    testing::assert_eq(
+        testing::expect_ok(ir::display(optimized), "optimized IR"),
+        testing::expect_ok(
+            ir::display(testing::expect_ok(opt::simplify(optimized), "repeat optimization")),
+            "repeated IR",
+        ),
+    );
     lines.push("func TestDifferential" + function.name() + "(t *testing.T) {");
     for index in 0..cases.len() {
         let arguments = cases[index];
         let expected = testing::expect_ok(
             ir::interpret(function, arguments, 100000),
             "reference interpretation",
+        );
+        testing::assert(
+            expected
+                == testing::expect_ok(
+                    ir::interpret(optimized, arguments, 100000),
+                    "optimized interpretation",
+                ),
         );
         let inputs = Vec::new();
         for value in arguments {
@@ -108,10 +124,9 @@ fn add_differential(lines: Vec[string], function: ir::Function, cases: Vec[Vec[i
         for position in 0..expected.len() {
             names.push(f"got{position}");
         }
-        let backends = Vec::from_array(["", "baseline.", "constrained."]);
-        if function.name() == "Rotate12" {
-            backends.push("spilled.");
-        }
+        let backends = Vec::from_array(
+            ["", "baseline.", "constrained.", "optimized.", "optstack.", "spilled."],
+        );
         for backend in backends {
             lines.push("{");
             let call = backend + function.name() + "(" + inputs.join(", ") + ")";
@@ -205,7 +220,7 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
     let lines = Vec::from_array(
         [
             "package generated",
-            "import (\"testing\"; baseline \"goir-native-test/baseline\"; constrained \"goir-native-test/constrained\"; spilled \"goir-native-test/spilled\")",
+            "import (\"testing\"; baseline \"goir-native-test/baseline\"; constrained \"goir-native-test/constrained\"; spilled \"goir-native-test/spilled\"; optimized \"goir-native-test/optimized\"; optstack \"goir-native-test/optstack\")",
         ],
     );
     let ops = Vec::from_array(
@@ -367,6 +382,41 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
         diamond_cases.push(Vec::from_array([ir::Datum::Bool(false), values[0], values[1]]));
     }
     add_differential(lines, diamond, diamond_cases);
+    let chain = simplification_chain();
+    functions.push(chain);
+    add_differential(
+        lines,
+        chain,
+        Vec::from_array(
+            [
+                Vec::from_array([ir::Datum::I64(17)]),
+                Vec::from_array([ir::Datum::I64(9223372036854775807)]),
+            ],
+        ),
+    );
+    for seed in 0..32 {
+        let function = generated_program(seed);
+        functions.push(function);
+        let cases = Vec::new();
+        let inputs = integer_cases();
+        for index in 0..16 {
+            let values = inputs[(index * 7 + seed) % inputs.len()];
+            cases.push(Vec::from_array([values[0], values[1], ir::Datum::Bool(index % 2 == 0)]));
+        }
+        add_differential(lines, function, cases);
+    }
+    let optimized_functions = Vec::new();
+    for function in functions {
+        optimized_functions.push(testing::expect_ok(opt::simplify(function), "optimize package"));
+    }
+    let optimized_package = testing::expect_ok(
+        amd64::emit_package("optimized", optimized_functions),
+        "optimized registers",
+    );
+    let optimized_stack = testing::expect_ok(
+        amd64::emit_stack_package("optstack", optimized_functions),
+        "optimized stack",
+    );
     let baseline = testing::expect_ok(
         amd64::emit_stack_package("baseline", functions),
         "stack backend",
@@ -382,13 +432,19 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
     let spilled = testing::expect_ok(
         amd64::emit_package_with_options(
             "spilled",
-            Vec::from_array([rotation]),
+            optimized_functions,
             regalloc::Options { registers: 0, ..regalloc::Options::standard() },
         ),
         "all-spill backend",
     );
     for (name, output) in Vec::from_array(
-        [("baseline", baseline), ("constrained", constrained), ("spilled", spilled)],
+        [
+            ("baseline", baseline),
+            ("constrained", constrained),
+            ("spilled", spilled),
+            ("optimized", optimized_package),
+            ("optstack", optimized_stack),
+        ],
     ) {
         let destination = path::join(directory, name);
         testing::assert_ok(fs::create_dir_all(destination));
@@ -400,19 +456,43 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
         );
     }
     let report = Vec::from_array(
-        ["function\tbackend\tframe_bytes\tstack_reads\tstack_writes\tinstructions\tassembly_bytes"],
+        [
+            "function\tbackend\tframe_bytes\tstack_reads\tstack_writes\tinstructions\tassembly_bytes\tssa_values\toptimize_ns\temit_ns",
+        ],
     );
     for function in functions {
-        for (name, compiled) in Vec::from_array(
+        let started = time::Instant::now();
+        let optimized = testing::expect_ok(opt::simplify(function), "measure optimization");
+        let optimize_ns = started.elapsed().as_nanoseconds();
+        for (name, source, use_stack) in Vec::from_array(
             [
-                ("registers", testing::expect_ok(amd64::emit(function), "measure registers")),
-                ("stack", testing::expect_ok(amd64::emit_stack(function), "measure baseline")),
+                ("registers", function, false),
+                ("stack", function, true),
+                ("optimized", optimized, false),
+                ("optimized_stack", optimized, true),
             ],
         ) {
+            let started = time::Instant::now();
+            let compiled = testing::expect_ok(
+                if use_stack {
+                    amd64::emit_stack(source)
+                } else {
+                    amd64::emit(source)
+                },
+                "measure emission",
+            );
+            let emit_ns = started.elapsed().as_nanoseconds();
+            let optimization_ns = if name.starts_with("optimized") {
+                optimize_ns
+            } else {
+                0
+            };
             let metrics = amd64::metrics(compiled);
             report.push(
                 function.name()
-                    + f"\t{name}\t{compiled.frame_bytes}\t{metrics.stack_reads}\t{metrics.stack_writes}\t{metrics.instructions}\t{metrics.assembly_bytes}",
+                    + f"\t{name}\t{compiled.frame_bytes}\t{metrics.stack_reads}\t{metrics.stack_writes}\t{metrics.instructions}\t{metrics.assembly_bytes}\t"
+                    + source.value_count().to_string()
+                    + f"\t{optimization_ns}\t{emit_ns}",
             );
         }
     }

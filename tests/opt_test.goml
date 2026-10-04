@@ -1,0 +1,293 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use std::testing;
+
+#[test]
+fn folding_preserves_wrapping_arithmetic_shifts_and_comparisons() -> () {
+    let operations = Vec::from_array(
+        [
+            ir::BinaryOp::Add,
+            ir::BinaryOp::Sub,
+            ir::BinaryOp::Mul,
+            ir::BinaryOp::And,
+            ir::BinaryOp::Or,
+            ir::BinaryOp::Xor,
+            ir::BinaryOp::Shl,
+            ir::BinaryOp::ShrU,
+            ir::BinaryOp::ShrS,
+        ],
+    );
+    let comparisons = Vec::from_array(
+        [
+            ir::IntCC::Equal,
+            ir::IntCC::NotEqual,
+            ir::IntCC::SignedLess,
+            ir::IntCC::SignedLessEqual,
+            ir::IntCC::UnsignedLess,
+            ir::IntCC::UnsignedLessEqual,
+        ],
+    );
+    let types = Vec::new();
+    for _ in operations {
+        types.push(ir::Type::I64);
+    }
+    for _ in comparisons {
+        types.push(ir::Type::Bool);
+    }
+    let boundaries: Vec[i64] = Vec::from_array(
+        [-9223372036854775808, -65, -64, -1, 0, 1, 63, 64, 65, 9223372036854775807],
+    );
+    for left in boundaries {
+        for right in boundaries {
+            let builder = testing::expect_ok(
+                ir::Builder::new("Constants", Vec::new(), types),
+                "builder",
+            );
+            let a = testing::expect_ok(builder.iconst(left), "left");
+            let b = testing::expect_ok(builder.iconst(right), "right");
+            let results = Vec::new();
+            for op in operations {
+                results.push(testing::expect_ok(builder.binary(op, a, b), "binary"));
+            }
+            for cc in comparisons {
+                results.push(testing::expect_ok(builder.icmp(cc, a, b), "compare"));
+            }
+            testing::assert_ok(builder.ret(results));
+            let source = testing::expect_ok(builder.finish(), "source");
+            let optimized = testing::expect_ok(opt::simplify(source), "optimize");
+            testing::assert(
+                testing::expect_ok(ir::interpret(source, Vec::new(), 100), "original")
+                    == testing::expect_ok(ir::interpret(optimized, Vec::new(), 100), "optimized"),
+            );
+            for instruction in optimized.blocks()[0].instructions {
+                testing::assert(
+                    match instruction.operation {
+                        Constant(_) => true,
+                        _ => false,
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn simplification_preserves_inputs_identity_and_recoverable_limits() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Identity",
+            Vec::from_array([ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let input = testing::expect_ok(builder.parameters(builder.entry()), "parameter")[0];
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let shift = testing::expect_ok(builder.iconst(-64), "shift");
+    let mask = testing::expect_ok(builder.iconst(-1), "mask");
+    let mut value = input;
+    for (op, right) in Vec::from_array(
+        [
+            (ir::BinaryOp::Add, zero),
+            (ir::BinaryOp::Sub, zero),
+            (ir::BinaryOp::Mul, one),
+            (ir::BinaryOp::And, mask),
+            (ir::BinaryOp::Or, zero),
+            (ir::BinaryOp::Xor, zero),
+            (ir::BinaryOp::Shl, shift),
+            (ir::BinaryOp::ShrU, shift),
+            (ir::BinaryOp::ShrS, shift),
+        ],
+    ) {
+        value = testing::expect_ok(builder.binary(op, value, right), "identity");
+    }
+    let condition = testing::expect_ok(
+        builder.icmp(ir::IntCC::UnsignedLessEqual, input, input),
+        "true",
+    );
+    value = testing::expect_ok(builder.select(condition, value, zero), "select");
+    testing::assert_ok(builder.ret(Vec::from_array([value])));
+    let source = testing::expect_ok(builder.finish(), "function");
+    let before = testing::expect_ok(ir::display(source), "before");
+    let optimized = testing::expect_ok(opt::simplify(source), "optimize");
+    testing::assert_eq(optimized.value_count(), 1);
+    testing::assert_eq(testing::expect_ok(ir::display(source), "source unchanged"), before);
+    testing::assert_eq(
+        testing::expect_err(optimized.value_type(input), "fresh ownership").kind,
+        ir::ErrorKind::WrongFunction,
+    );
+    let again = testing::expect_ok(opt::simplify(optimized), "repeat");
+    testing::assert_eq(
+        testing::expect_ok(ir::display(again), "again"),
+        testing::expect_ok(ir::display(optimized), "optimized"),
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            opt::simplify_with_options(source, opt::Options { max_steps: 1 }),
+            "bounded work",
+        ).kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+    testing::assert_err(opt::simplify_with_options(source, opt::Options { max_steps: 0 }));
+}
+
+#[test]
+fn constant_branches_remove_unreachable_blocks_and_dead_parameter_cycles() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Control",
+            Vec::from_array([ir::Type::I64, ir::Type::Bool]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let inputs = testing::expect_ok(builder.parameters(builder.entry()), "inputs");
+    let dead = testing::expect_ok(builder.append_block(Vec::new()), "dead");
+    let loop_block = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64])),
+        "loop",
+    );
+    let exit = testing::expect_ok(builder.append_block(Vec::from_array([ir::Type::I64])), "exit");
+    let yes = testing::expect_ok(builder.bconst(true), "true");
+    let discarded = testing::expect_ok(builder.iconst(17), "discarded");
+    testing::assert_ok(
+        builder.branch(
+            yes,
+            ir::Edge { target: loop_block, arguments: Vec::from_array([inputs[0], discarded]) },
+            ir::Edge { target: dead, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(dead));
+    testing::assert_ok(builder.jump(dead, Vec::new()));
+    testing::assert_ok(builder.switch_to(loop_block));
+    let params = testing::expect_ok(builder.parameters(loop_block), "loop params");
+    let unused = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, params[1], discarded),
+        "dead recurrence",
+    );
+    testing::assert_ok(
+        builder.branch(
+            inputs[1],
+            ir::Edge { target: exit, arguments: Vec::from_array([params[0]]) },
+            ir::Edge { target: loop_block, arguments: Vec::from_array([params[0], unused]) },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(exit));
+    testing::assert_ok(builder.ret(testing::expect_ok(builder.parameters(exit), "return")));
+    let source = testing::expect_ok(builder.finish(), "source");
+    let optimized = testing::expect_ok(opt::simplify(source), "optimized");
+    testing::assert_eq(optimized.blocks().len(), 3);
+    testing::assert_eq(optimized.blocks()[1].parameters.len(), 1);
+    for block in optimized.blocks() {
+        testing::assert(block.instructions.is_empty());
+    }
+    let arguments = Vec::from_array([ir::Datum::I64(42), ir::Datum::Bool(true)]);
+    testing::assert(
+        testing::expect_ok(ir::interpret(optimized, arguments, 100), "return")
+            == Vec::from_array([ir::Datum::I64(42)]),
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            ir::interpret(
+                optimized,
+                Vec::from_array([ir::Datum::I64(42), ir::Datum::Bool(false)]),
+                100,
+            ),
+            "infinite loop retained",
+        ).kind,
+        ir::ErrorKind::FuelExhausted,
+    );
+}
+
+#[test]
+fn checked_rewrite_rejects_missing_duplicate_and_foreign_definitions() -> () {
+    let source = allocation_chain();
+    let blocks = source.blocks();
+    blocks[0].instructions.clear();
+    testing::assert_err(ir::rewrite(source, blocks));
+    let blocks = source.blocks();
+    blocks[0].instructions.push(blocks[0].instructions[0]);
+    testing::assert_err(ir::rewrite(source, blocks));
+    let foreign = allocation_chain();
+    let blocks = source.blocks();
+    blocks[0].instructions[0] = foreign.blocks()[0].instructions[0];
+    testing::assert_eq(
+        testing::expect_err(ir::rewrite(source, blocks), "foreign definition").kind,
+        ir::ErrorKind::WrongFunction,
+    );
+    testing::assert_ok(ir::verify(source));
+}
+
+#[test]
+fn removing_unused_edge_arguments_exposes_identical_branches() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "SameEdge",
+            Vec::from_array([ir::Type::Bool, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "inputs");
+    let exit = testing::expect_ok(builder.append_block(Vec::from_array([ir::Type::I64])), "exit");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let two = testing::expect_ok(builder.iconst(2), "two");
+    testing::assert_ok(
+        builder.branch(
+            args[0],
+            ir::Edge { target: exit, arguments: Vec::from_array([one]) },
+            ir::Edge { target: exit, arguments: Vec::from_array([two]) },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(exit));
+    testing::assert_ok(builder.ret(Vec::from_array([args[1]])));
+    let optimized = testing::expect_ok(
+        opt::simplify(testing::expect_ok(builder.finish(), "source")),
+        "optimized",
+    );
+    testing::assert_eq(optimized.value_count(), 2);
+    testing::assert(
+        match optimized.blocks()[0].terminator {
+            Option::Some(ir::Terminator::Jump(_)) => true,
+            _ => false,
+        },
+    );
+    testing::assert_eq(
+        testing::expect_ok(ir::display(optimized), "first"),
+        testing::expect_ok(
+            ir::display(testing::expect_ok(opt::simplify(optimized), "repeat")),
+            "second",
+        ),
+    );
+}
+
+#[test]
+fn folding_follows_dominance_when_blocks_are_stored_out_of_order() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new("OutOfOrder", Vec::new(), Vec::from_array([ir::Type::I64])),
+        "builder",
+    );
+    let exit = testing::expect_ok(builder.append_block(Vec::new()), "exit");
+    let middle = testing::expect_ok(builder.append_block(Vec::new()), "middle");
+    testing::assert_ok(builder.jump(middle, Vec::new()));
+    testing::assert_ok(builder.switch_to(middle));
+    let six = testing::expect_ok(builder.iconst(6), "six");
+    let seven = testing::expect_ok(builder.iconst(7), "seven");
+    let product = testing::expect_ok(builder.binary(ir::BinaryOp::Mul, six, seven), "product");
+    testing::assert_ok(builder.jump(exit, Vec::new()));
+    testing::assert_ok(builder.switch_to(exit));
+    let sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, product, product), "sum");
+    testing::assert_ok(builder.ret(Vec::from_array([sum])));
+    let function = testing::expect_ok(
+        opt::simplify(testing::expect_ok(builder.finish(), "source")),
+        "optimized",
+    );
+    testing::assert_eq(function.value_count(), 1);
+    testing::assert(
+        testing::expect_ok(ir::interpret(function, Vec::new(), 10), "result")
+            == Vec::from_array([ir::Datum::I64(84)]),
+    );
+}

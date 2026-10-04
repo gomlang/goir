@@ -92,3 +92,70 @@ fn machine_snapshots_and_allocation_handles_remain_isolated() -> () {
         ),
     );
 }
+
+#[test]
+fn allocation_prefers_a_dying_operand_over_an_unrelated_free_register() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Reuse",
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "inputs");
+    let constant = testing::expect_ok(builder.iconst(17), "constant");
+    let result = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Sub, args[1], constant),
+        "subtract",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([result])));
+    let machine = testing::expect_ok(
+        mach::lower(testing::expect_ok(builder.finish(), "function")),
+        "machine",
+    );
+    let allocation = testing::expect_ok(regalloc::allocate(machine), "allocation");
+    testing::assert_eq(
+        testing::expect_ok(
+            allocation.location(
+                testing::expect_ok(machine.register(args[1].index()), "input register"),
+            ),
+            "input location",
+        ),
+        testing::expect_ok(
+            allocation.location(
+                testing::expect_ok(machine.register(result.index()), "result register"),
+            ),
+            "result location",
+        ),
+    );
+}
+
+#[test]
+fn comparison_metrics_count_both_spilled_operands_as_reads() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Compare",
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::Bool]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "inputs");
+    let result = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, args[0], args[1]),
+        "compare",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([result])));
+    let function = testing::expect_ok(builder.finish(), "function");
+    let spilled = testing::expect_ok(
+        amd64::emit_with_options(
+            function,
+            regalloc::Options { registers: 0, ..regalloc::Options::standard() },
+        ),
+        "all spills",
+    );
+    let metrics = amd64::metrics(spilled);
+    testing::assert_eq(metrics.stack_reads, 5);
+    testing::assert_eq(metrics.stack_writes, 4);
+}

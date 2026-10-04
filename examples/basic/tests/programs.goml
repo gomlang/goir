@@ -1,0 +1,130 @@
+package tests;
+
+use ecosystem::goir as ir;
+use std::testing;
+
+fn next_seed(state: Ref[u64]) -> u64 {
+    let mut value = state.get();
+    value = value ^ (value << 13);
+    value = value ^ (value >> 7);
+    value = value ^ (value << 17);
+    state.set(value);
+    value
+}
+
+fn generated_program(seed: isize) -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            f"Program{seed}",
+            Vec::from_array([ir::Type::I64, ir::Type::I64, ir::Type::Bool]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "program",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "inputs");
+    let state = Ref::new(seed.to_u64() + 0x6a09e667f3bcc909);
+    let operations = Vec::from_array(
+        [
+            ir::BinaryOp::Add,
+            ir::BinaryOp::Sub,
+            ir::BinaryOp::Mul,
+            ir::BinaryOp::And,
+            ir::BinaryOp::Or,
+            ir::BinaryOp::Xor,
+            ir::BinaryOp::Shl,
+            ir::BinaryOp::ShrU,
+            ir::BinaryOp::ShrS,
+        ],
+    );
+    let constants: Vec[i64] = Vec::from_array(
+        [0, 1, -1, 64, -64, -9223372036854775808, 9223372036854775807],
+    );
+    let values = Vec::from_array([args[0], args[1]]);
+    let mut current = args[0];
+    for step in 0..32 {
+        let random = next_seed(state);
+        let constant = testing::expect_ok(
+            builder.iconst(constants[(random % constants.len().to_u64()).to_isize()]),
+            "constant",
+        );
+        values.push(constant);
+        let other = values[(next_seed(state) % values.len().to_u64()).to_isize()];
+        let op = operations[(next_seed(state) % operations.len().to_u64()).to_isize()];
+        current = testing::expect_ok(
+            if step % 2 == 0 {
+                builder.binary(op, current, other)
+            } else {
+                builder.binary(op, other, current)
+            },
+            "operation",
+        );
+        if step % 4 == 0 {
+            let condition = testing::expect_ok(
+                builder.icmp(ir::IntCC::SignedLess, current, other),
+                "condition",
+            );
+            current = testing::expect_ok(builder.select(condition, current, other), "select");
+        }
+        values.push(current);
+    }
+    let join = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64])),
+        "join",
+    );
+    let left = testing::expect_ok(builder.append_block(Vec::new()), "left");
+    let right = testing::expect_ok(builder.append_block(Vec::new()), "right");
+    let condition = if seed % 3 == 0 {
+        testing::expect_ok(builder.bconst(seed % 2 == 0), "constant branch")
+    } else {
+        args[2]
+    };
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: left, arguments: Vec::new() },
+            ir::Edge { target: right, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(left));
+    let yes = testing::expect_ok(builder.binary(ir::BinaryOp::Sub, args[1], current), "left result");
+    testing::assert_ok(builder.jump(join, Vec::from_array([yes, current])));
+    testing::assert_ok(builder.switch_to(right));
+    let no = testing::expect_ok(
+        builder.binary(ir::BinaryOp::ShrS, current, args[1]),
+        "right result",
+    );
+    testing::assert_ok(builder.jump(join, Vec::from_array([no, current])));
+    testing::assert_ok(builder.switch_to(join));
+    let params = testing::expect_ok(builder.parameters(join), "join params");
+    let result = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Xor, params[0], args[0]),
+        "live-through input",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([result])));
+    testing::expect_ok(builder.finish(), "generated function")
+}
+
+fn simplification_chain() -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "SimplifyChain",
+            Vec::from_array([ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "chain",
+    );
+    let mut value = testing::expect_ok(builder.parameters(builder.entry()), "input")[0];
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let always = testing::expect_ok(builder.bconst(true), "true");
+    for index in 0..64 {
+        let x = testing::expect_ok(builder.iconst(index.to_i64()), "constant");
+        let squared = testing::expect_ok(builder.binary(ir::BinaryOp::Mul, x, x), "square");
+        value = testing::expect_ok(builder.binary(ir::BinaryOp::Add, value, squared), "sum");
+        value = testing::expect_ok(builder.binary(ir::BinaryOp::Mul, value, one), "identity");
+        value = testing::expect_ok(builder.select(always, value, zero), "selection");
+        let _ = testing::expect_ok(builder.binary(ir::BinaryOp::Xor, value, x), "dead");
+    }
+    testing::assert_ok(builder.ret(Vec::from_array([value])));
+    testing::expect_ok(builder.finish(), "chain function")
+}
