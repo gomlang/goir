@@ -1,0 +1,224 @@
+package opt;
+
+use ecosystem::goir as ir;
+
+pub struct Options {
+    pub max_steps: isize,
+}
+
+impl Options {
+    pub fn standard() -> Options {
+        Options { max_steps: 10000000 }
+    }
+}
+
+fn spend(budget: Ref[isize]) -> Result[(), ir::Error] {
+    if budget.get() <= 0 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "SSA optimization work limit exceeded"),
+        )
+    }
+    budget.set(budget.get() - 1);
+    Result::Ok(())
+}
+
+fn resolve(value: ir::Value, aliases: Vec[Option[ir::Value]], budget: Ref[isize]) -> Result[
+    ir::Value,
+    ir::Error,
+] {
+    let mut current = value;
+    let path = Vec::new();
+    loop {
+        spend(budget)?;
+        match aliases[current.index()] {
+            Option::Some(next) => {
+                path.push(current);
+                current = next;
+            },
+            Option::None => break,
+        }
+    }
+    for previous in path {
+        aliases[previous.index()] = Option::Some(current);
+    }
+    Result::Ok(current)
+}
+
+fn resolve_operation(operation: ir::Operation, aliases: Vec[Option[ir::Value]], budget: Ref[isize]) -> Result[
+    ir::Operation,
+    ir::Error,
+] {
+    match operation {
+        Constant(_) => Result::Ok(operation),
+        Binary(op, a, b) => Result::Ok(
+            ir::Operation::Binary(op, resolve(a, aliases, budget)?, resolve(b, aliases, budget)?),
+        ),
+        Compare(cc, a, b) => Result::Ok(
+            ir::Operation::Compare(cc, resolve(a, aliases, budget)?, resolve(b, aliases, budget)?),
+        ),
+        Select(c, a, b) => Result::Ok(
+            ir::Operation::Select(
+                resolve(c, aliases, budget)?,
+                resolve(a, aliases, budget)?,
+                resolve(b, aliases, budget)?,
+            ),
+        ),
+    }
+}
+
+fn resolve_edge(edge: ir::Edge, aliases: Vec[Option[ir::Value]], budget: Ref[isize]) -> Result[
+    ir::Edge,
+    ir::Error,
+] {
+    let arguments = Vec::new();
+    for value in edge.arguments {
+        arguments.push(resolve(value, aliases, budget)?);
+    }
+    Result::Ok(ir::Edge { target: edge.target, arguments })
+}
+
+fn resolve_term(
+    term: ir::Terminator,
+    aliases: Vec[Option[ir::Value]],
+    constants: Vec[Option[ir::Datum]],
+    budget: Ref[isize],
+) -> Result[ir::Terminator, ir::Error] {
+    match term {
+        Jump(edge) => Result::Ok(ir::Terminator::Jump(resolve_edge(edge, aliases, budget)?)),
+        Branch(condition, yes, no) => {
+            let condition = resolve(condition, aliases, budget)?;
+            let yes = resolve_edge(yes, aliases, budget)?;
+            let no = resolve_edge(no, aliases, budget)?;
+            match constants[condition.index()] {
+                Option::Some(ir::Datum::Bool(value)) => Result::Ok(
+                    ir::Terminator::Jump(
+                        if value {
+                            yes
+                        } else {
+                            no
+                        },
+                    ),
+                ),
+                _ => if yes.target == no.target && yes.arguments == no.arguments {
+                    Result::Ok(ir::Terminator::Jump(yes))
+                } else {
+                    Result::Ok(ir::Terminator::Branch(condition, yes, no))
+                },
+            }
+        },
+        Return(input) => {
+            let output = Vec::new();
+            for value in input {
+                output.push(resolve(value, aliases, budget)?);
+            }
+            Result::Ok(ir::Terminator::Return(output))
+        },
+    }
+}
+
+pub fn simplify(function: ir::Function) -> Result[ir::Function, ir::Error] {
+    simplify_with_options(function, Options::standard())
+}
+
+pub fn simplify_with_options(function: ir::Function, options: Options) -> Result[
+    ir::Function,
+    ir::Error,
+] {
+    if options.max_steps < 1 || options.max_steps > 100000000 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::InvalidArgument, "invalid SSA optimization options"),
+        )
+    }
+    ir::verify(function)?;
+    let budget = Ref::new(options.max_steps);
+    let mut current = function;
+    let mut size = progress_size(current);
+    loop {
+        spend(budget)?;
+        let next = simplify_once(current, budget)?;
+        let next_size = progress_size(next);
+        if next_size >= size {
+            return Result::Ok(next)
+        }
+        current = next;
+        size = next_size;
+    }
+}
+
+fn progress_size(function: ir::Function) -> isize {
+    let blocks = function.blocks();
+    let mut count = function.value_count() + blocks.len();
+    for block in blocks {
+        match block.terminator {
+            Option::Some(ir::Terminator::Branch(_, _, _)) => {
+                count = count + 1;
+            },
+            _ => (),
+        }
+    }
+    count
+}
+
+fn simplify_once(function: ir::Function, budget: Ref[isize]) -> Result[ir::Function, ir::Error] {
+    let blocks = function.blocks();
+    let aliases: Vec[Option[ir::Value]] = Vec::new();
+    let constants: Vec[Option[ir::Datum]] = Vec::new();
+    for _ in 0..function.value_count() {
+        aliases.push(Option::None);
+        constants.push(Option::None);
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in blocks {
+            spend(budget)?;
+            for instruction in block.instructions {
+                spend(budget)?;
+                let index = instruction.result.index();
+                if aliases[index].is_some() || constants[index].is_some() {
+                    continue;
+                }
+                let operation = resolve_operation(instruction.operation, aliases, budget)?;
+                match fold(operation, constants) {
+                    Keep => (),
+                    Alias(value) => {
+                        aliases[index] = Option::Some(value);
+                        changed = true;
+                    },
+                    Constant(value) => {
+                        constants[index] = Option::Some(value);
+                        changed = true;
+                    },
+                }
+            }
+        }
+    }
+    for index in 0..blocks.len() {
+        let block = blocks[index];
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            spend(budget)?;
+            let operation = match constants[instruction.result.index()] {
+                Option::Some(value) => ir::Operation::Constant(value),
+                Option::None => resolve_operation(instruction.operation, aliases, budget)?,
+            };
+            instructions.push(ir::Instruction { result: instruction.result, operation });
+        }
+        blocks[index] = ir::BlockData {
+            id: block.id,
+            parameters: block.parameters,
+            instructions,
+            terminator: Option::Some(
+                resolve_term(
+                    block.terminator.ok_or(
+                        ir::error(ir::ErrorKind::ControlFlow, "missing terminator"),
+                    )?,
+                    aliases,
+                    constants,
+                    budget,
+                )?,
+            ),
+        };
+    }
+    ir::rewrite(function, eliminate(blocks, function.value_count(), budget)?)
+}

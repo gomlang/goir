@@ -6,8 +6,8 @@ the Go assembler's ABI0 convention. It emits assembly function bodies and Go
 declarations that the ordinary Go toolchain assembles and links.
 
 The library implements typed SSA construction, block parameters, a verifier,
-a fuel-bounded interpreter, deterministic IR printing, a virtual-register machine
-IR, liveness analysis, register allocation, ABI0 argument/result layout and amd64
+a fuel-bounded interpreter, deterministic IR printing, bounded SSA simplification,
+a virtual-register machine IR, liveness analysis, register allocation, ABI0 layout and amd64
 assembly emission. There are no native adapters, cgo
 requirements or ecosystem dependencies.
 
@@ -21,6 +21,7 @@ implementation, with a deliberately smaller initial scope.
 ```goml
 use ecosystem::goir as ir;
 use ecosystem::goir::amd64;
+use ecosystem::goir::opt;
 
 fn compile_add() -> Result[amd64::Package, ir::Error] {
     let builder = ir::Builder::new(
@@ -31,7 +32,7 @@ fn compile_add() -> Result[amd64::Package, ir::Error] {
     let args = builder.parameters(builder.entry())?;
     let sum = builder.binary(ir::BinaryOp::Add, args[0], args[1])?;
     builder.ret(Vec::from_array([sum]))?;
-    let function = builder.finish()?;
+    let function = opt::simplify(builder.finish()?)?;
     amd64::emit_package("generated", Vec::from_array([function]))
 }
 ```
@@ -106,6 +107,41 @@ functions: the body makes no calls, allocates no Go heap objects and holds no
 GC references. Long native loops do not provide polling safepoints and must
 be bounded by the caller. Interpreter fuel is not a native execution limit.
 
+## SSA optimization
+
+`opt::simplify(function)` returns a separately owned, verified function with the
+same signature. Optimization is explicit: pass the returned function to either
+emitter, or interpret it alongside the original. Emission alone does not run
+SSA simplification.
+
+The pass folds constant integer operations, comparisons and selections, removes
+algebraic identities, folds constant or identical branches, and removes
+unreachable blocks, unused instructions and unused non-entry block parameters.
+Dead parameter cycles are removed by tracing dependencies from returned values
+and branch conditions, including dependencies carried by control-flow edges.
+Folding respects wrapping arithmetic and masked shift counts. Control-flow
+cleanup repeats while the number of values, blocks or branches decreases.
+Block storage order need not follow dominance order.
+
+All current IR operations are pure and non-trapping; removing an unused
+operation preserves program results. Loops and divergence remain observable:
+dead arithmetic inside an infinite loop can disappear, but the loop remains.
+Optimization can change interpreter fuel consumption. Do not expect identical
+fuel-exhaustion thresholds before and after optimization.
+
+`opt::simplify_with_options` accepts an `opt::Options` work budget. Exceeding the
+budget returns `LimitExceeded` and leaves the input unchanged. The optimizer
+does not yet propagate constants through block parameters, perform general
+common-subexpression elimination, reassociate arithmetic chains or move code
+out of loops.
+
+`ir::rewrite(source, blocks)` is the checked reconstruction boundary for custom
+passes. It accepts edited block snapshots using existing source handles,
+preserves the entry signature and original resource limits, assigns fresh
+handles, and verifies the result. It can remove or reorder definitions and
+blocks but cannot introduce new handles. Missing or duplicate definitions,
+foreign handles, type errors and dominance violations return recoverable errors.
+
 ## ABI and native output
 
 `abi::amd64_abi0` reports input/result `Slot` records and the TEXT argument size.
@@ -126,14 +162,21 @@ The machine IR makes virtual register definitions, uses and edge copies explicit
 handles. `regalloc::analyze` computes fixed-point block liveness and conservative
 whole-function intervals, including loops and blocks stored out of control-flow
 order. `regalloc::allocate` uses deterministic linear scan and reuses expired
-spill slots. Each virtual register has one location for its entire interval;
-there is no interval splitting, eviction, copy coalescing or dead-code removal.
+spill slots. It prefers an available register already assigned to a related
+instruction operand or edge-copy value, reducing moves without merging intervals.
+Each virtual register has one location for its entire interval; there is no
+interval splitting, eviction or general copy coalescing. Dead-code removal
+belongs to the explicit SSA optimization pass.
 `regalloc::verify` checks location bounds and interval conflicts.
 
 The amd64 allocator uses BX, SI, DI and R8–R11. AX, CX and DX remain reserved
 for instruction operands and parallel-copy scheduling; allocation never uses
-SP, BP, R14 or R15. Instructions currently pass operands through scratch
-registers, so allocation primarily reduces memory traffic and edge-copy work.
+SP, BP, R14 or R15. Instructions use assigned registers directly when possible.
+Two-address arithmetic can reuse a dying operand; noncommutative operations
+preserve overlapping inputs with AX when needed. Variable shifts read their
+count into CX before overwriting a destination, comparisons produce a canonical
+boolean through AL, and parallel-copy cycles use DX. Spilled arithmetic uses
+a scratch accumulator, avoiding memory-to-memory arithmetic.
 Spilled values occupy eight-byte local stack slots. The frame size reports
 these locals, excluding assembler-added frame-pointer and stack-split code.
 
@@ -167,6 +210,7 @@ boundary.
 | Inputs or results per signature | 256 | 1,024 |
 | Verifier work steps | 10,000,000 | 100,000,000 |
 | Allocation work steps | 10,000,000 | 100,000,000 |
+| SSA optimization work steps | 10,000,000 | 100,000,000 |
 | Abstract allocation registers | 7 | 32 (amd64: 7) |
 
 The entry parameters also count toward block/value limits. Dominance uses
@@ -198,19 +242,27 @@ directory it writes the two Go package source files.
 `goml test` includes public API and verifier regressions plus the example's
 native integration test. That test generates a temporary Go module under
 `_artifact/`, runs `go vet` and `go test`, and compares generated functions with
-the interpreter over more than 2,000 deterministic cases using the register,
-reference stack and single-register backends. A separately written
+the interpreter over more than 2,000 deterministic cases using original and
+simplified IR, register and reference stack backends, a single-register backend
+and an optimized all-spill backend. A separately written
 Go oracle checks all integer operations/comparisons and exercises large frames,
 mixed boolean/integer signatures, multiple returns, Go wrappers exceeding the
 register argument budget, cyclic edge copies and concurrent Go callers with GC.
-A 12-value rotation additionally tests forced spills, and a diamond checks
+A 12-value rotation tests cyclic copies under register pressure, and a diamond checks
 non-topological block layout and a value live through the join. A symbolic
 parallel-copy test exhausts all 256 source assignments to four mixed
-register/stack destinations.
+register/stack destinations. Another 32 programs generated from fixed seeds mix
+integer operations, selections and branches, with 512 boundary/random input cases.
+Library tests cover constant folding across 100 boundary pairs, dead parameter
+cycles, stable repeated optimization, out-of-order blocks and work limits.
 Temporary native files are removed on success and retained on failure.
 
 The native test writes `_artifact/codegen.tsv` with per-function frame size and
-`amd64::metrics` results for both main backends. Metrics count emitted body
+`amd64::metrics` results before and after SSA optimization for both main backends.
+Rows also include SSA value counts and separately measured optimization and
+emission times in nanoseconds. Timings are single wall-clock observations,
+including validation, and are diagnostic rather than test thresholds.
+Metrics count emitted body
 instructions, explicit stack reads/writes including ABI argument/result accesses,
 and assembly-source bytes. They do not measure encoded machine-code size or
 assembler-inserted instructions. Optional execution benchmarks write
@@ -220,7 +272,8 @@ assembler-inserted instructions. Optional execution benchmarks write
 GOIR_BENCHMARK=1 goml test --example basic native_go --timeout 180s
 ```
 
-The benchmarks compare a bounded sum loop and a long arithmetic chain. Use
+The benchmarks compare a bounded sum loop, a long arithmetic chain and a chain
+with foldable constants and redundant operations before/after SSA optimization. Use
 repeated measurements on the target machine before drawing performance conclusions.
 
 `goml verify` copies the example into an independent module against an isolated
@@ -244,6 +297,7 @@ python3 ci/ecosystem.py verify --libraries .. --module goir --goml /absolute/pat
 | --- | --- |
 | `model.goml`, `builder.goml` | IR, handles, snapshots and checked construction |
 | `verify.goml` | Structural/type validation, reachability and dominance |
+| `rewrite.goml`, `opt/` | Checked IR reconstruction, bounded folding and dead-code elimination |
 | `interp.goml`, `display.goml` | Reference execution and deterministic diagnostics |
 | `abi/layout.goml` | Go scalar layout, symbols and declarations |
 | `mach/` | Virtual-register instructions, explicit edge copies and SSA lowering |
@@ -252,8 +306,8 @@ python3 ci/ecosystem.py verify --libraries .. --module goir --goml /absolute/pat
 | `amd64/emit.goml`, `amd64/metrics.goml` | Reference stack backend and source-code metrics |
 | `examples/basic/` | Consumer example and native differential validation |
 
-The next implementation stages are local SSA simplification, fewer redundant
-register moves, improved spill decisions and explicit call lowering. Managed
+The next implementation stages are constant propagation through block parameters,
+improved spill decisions and explicit call lowering. Managed
 references require a separate runtime-aware design for safepoints, stack maps,
 stack movement and write barriers. ABIInternal and Go object emission should
 be introduced with a pinned toolchain profile and independent ABI conformance

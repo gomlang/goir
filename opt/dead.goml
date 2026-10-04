@@ -1,0 +1,124 @@
+package opt;
+
+use ecosystem::goir as ir;
+
+fn terminator(block: ir::BlockData) -> Result[ir::Terminator, ir::Error] {
+    block.terminator.ok_or(ir::error(ir::ErrorKind::ControlFlow, "missing terminator"))
+}
+
+fn retain_edge(edge: ir::Edge, blocks: Vec[ir::BlockData], live: Vec[bool]) -> ir::Edge {
+    let parameters = blocks[edge.target.index()].parameters;
+    let arguments = Vec::new();
+    for index in 0..parameters.len() {
+        if live[parameters[index].index()] {
+            arguments.push(edge.arguments[index]);
+        }
+    }
+    ir::Edge { target: edge.target, arguments }
+}
+
+fn eliminate(blocks: Vec[ir::BlockData], count: isize, budget: Ref[isize]) -> Result[
+    Vec[ir::BlockData],
+    ir::Error,
+] {
+    let reachable = Vec::new();
+    for _ in blocks {
+        reachable.push(false);
+    }
+    let pending = Vec::from_array([0]);
+    let mut cursor = 0;
+    reachable[0] = true;
+    while cursor < pending.len() {
+        let block = blocks[pending[cursor]];
+        cursor = cursor + 1;
+        spend(budget)?;
+        for edge in ir::successors(terminator(block)?) {
+            if !reachable[edge.target.index()] {
+                reachable[edge.target.index()] = true;
+                pending.push(edge.target.index());
+            }
+        }
+    }
+    let dependencies: Vec[Vec[ir::Value]] = Vec::new();
+    let live = Vec::new();
+    for _ in 0..count {
+        dependencies.push(Vec::new());
+        live.push(false);
+    }
+    let roots = Vec::new();
+    for block in blocks {
+        if !reachable[block.id.index()] {
+            continue;
+        }
+        for instruction in block.instructions {
+            spend(budget)?;
+            dependencies[instruction.result.index()] = ir::operands(instruction.operation);
+        }
+        let term = terminator(block)?;
+        match term {
+            Branch(condition, _, _) => roots.push(condition),
+            Return(values) => roots.extend(values),
+            _ => (),
+        }
+        for edge in ir::successors(term) {
+            let parameters = blocks[edge.target.index()].parameters;
+            for index in 0..parameters.len() {
+                spend(budget)?;
+                dependencies[parameters[index].index()].push(edge.arguments[index]);
+            }
+        }
+    }
+    cursor = 0;
+    let queue = Vec::new();
+    for value in roots {
+        if !live[value.index()] {
+            live[value.index()] = true;
+            queue.push(value);
+        }
+    }
+    while cursor < queue.len() {
+        let value = queue[cursor];
+        cursor = cursor + 1;
+        spend(budget)?;
+        for dependency in dependencies[value.index()] {
+            spend(budget)?;
+            if !live[dependency.index()] {
+                live[dependency.index()] = true;
+                queue.push(dependency);
+            }
+        }
+    }
+    let output = Vec::new();
+    for block in blocks {
+        spend(budget)?;
+        if !reachable[block.id.index()] {
+            continue;
+        }
+        let parameters = Vec::new();
+        for parameter in block.parameters {
+            if block.id.index() == 0 || live[parameter.index()] {
+                parameters.push(parameter);
+            }
+        }
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            spend(budget)?;
+            if live[instruction.result.index()] {
+                instructions.push(instruction);
+            }
+        }
+        let term = match terminator(block)? {
+            Jump(edge) => ir::Terminator::Jump(retain_edge(edge, blocks, live)),
+            Branch(condition, yes, no) => ir::Terminator::Branch(
+                condition,
+                retain_edge(yes, blocks, live),
+                retain_edge(no, blocks, live),
+            ),
+            Return(values) => ir::Terminator::Return(values),
+        };
+        output.push(
+            ir::BlockData { id: block.id, parameters, instructions, terminator: Option::Some(term) },
+        );
+    }
+    Result::Ok(output)
+}

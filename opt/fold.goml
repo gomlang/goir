@@ -1,0 +1,171 @@
+package opt;
+
+use ecosystem::goir as ir;
+
+enum Replacement {
+    Keep,
+    Alias(ir::Value),
+    Constant(ir::Datum),
+}
+
+fn integer(constants: Vec[Option[ir::Datum]], value: ir::Value) -> Option[i64] {
+    match constants[value.index()] {
+        Option::Some(ir::Datum::I64(value)) => Option::Some(value),
+        _ => Option::None,
+    }
+}
+
+fn constant_integer(value: i64) -> Replacement {
+    Replacement::Constant(ir::Datum::I64(value))
+}
+
+fn fold_binary(
+    op: ir::BinaryOp,
+    left: ir::Value,
+    right: ir::Value,
+    constants: Vec[Option[ir::Datum]],
+) -> Replacement {
+    let a = integer(constants, left);
+    let b = integer(constants, right);
+    match (a, b) {
+        (Option::Some(x), Option::Some(y)) => {
+            let shift = (y.to_u64() & 63).to_isize();
+            return constant_integer(
+                match op {
+                    Add => (x.to_u64() + y.to_u64()).to_i64(),
+                    Sub => (x.to_u64() - y.to_u64()).to_i64(),
+                    Mul => (x.to_u64() * y.to_u64()).to_i64(),
+                    And => x & y,
+                    Or => x | y,
+                    Xor => x ^ y,
+                    Shl => (x.to_u64() << shift).to_i64(),
+                    ShrU => (x.to_u64() >> shift).to_i64(),
+                    ShrS => x >> shift,
+                },
+            )
+        },
+        _ => (),
+    }
+    if left == right {
+        match op {
+            Sub | Xor => return constant_integer(0),
+            And | Or => return Replacement::Alias(left),
+            _ => (),
+        }
+    }
+    match op {
+        Add | Or | Xor => {
+            if a == Option::Some(0) {
+                return Replacement::Alias(right)
+            }
+            if b == Option::Some(0) {
+                return Replacement::Alias(left)
+            }
+            if op == ir::BinaryOp::Or && (a == Option::Some(-1) || b == Option::Some(-1)) {
+                return constant_integer(-1)
+            }
+        },
+        Sub => {
+            if b == Option::Some(0) {
+                return Replacement::Alias(left)
+            }
+        },
+        Mul => {
+            if a == Option::Some(0) || b == Option::Some(0) {
+                return constant_integer(0)
+            }
+            if a == Option::Some(1) {
+                return Replacement::Alias(right)
+            }
+            if b == Option::Some(1) {
+                return Replacement::Alias(left)
+            }
+        },
+        And => {
+            if a == Option::Some(0) || b == Option::Some(0) {
+                return constant_integer(0)
+            }
+            if a == Option::Some(-1) {
+                return Replacement::Alias(right)
+            }
+            if b == Option::Some(-1) {
+                return Replacement::Alias(left)
+            }
+        },
+        Shl | ShrU | ShrS => {
+            if a == Option::Some(0) {
+                return constant_integer(0)
+            }
+            if op == ir::BinaryOp::ShrS && a == Option::Some(-1) {
+                return constant_integer(-1)
+            }
+            match b {
+                Option::Some(count) => {
+                    if (count.to_u64() & 63) == 0 {
+                        return Replacement::Alias(left)
+                    }
+                },
+                _ => (),
+            }
+        },
+    }
+    Replacement::Keep
+}
+
+fn fold(operation: ir::Operation, constants: Vec[Option[ir::Datum]]) -> Replacement {
+    match operation {
+        Constant(value) => Replacement::Constant(value),
+        Binary(op, left, right) => fold_binary(op, left, right, constants),
+        Compare(cc, left, right) => {
+            let result = match (integer(constants, left), integer(constants, right)) {
+                (Option::Some(a), Option::Some(b)) => Option::Some(
+                    match cc {
+                        Equal => a == b,
+                        NotEqual => a != b,
+                        SignedLess => a < b,
+                        SignedLessEqual => a <= b,
+                        UnsignedLess => a.to_u64() < b.to_u64(),
+                        UnsignedLessEqual => a.to_u64() <= b.to_u64(),
+                    },
+                ),
+                _ => if left == right {
+                    Option::Some(
+                        match cc {
+                            Equal | SignedLessEqual | UnsignedLessEqual => true,
+                            _ => false,
+                        },
+                    )
+                } else {
+                    Option::None
+                },
+            };
+            match result {
+                Option::Some(value) => Replacement::Constant(ir::Datum::Bool(value)),
+                _ => Replacement::Keep,
+            }
+        },
+        Select(condition, yes, no) => {
+            if yes == no {
+                return Replacement::Alias(yes)
+            }
+            match constants[condition.index()] {
+                Option::Some(ir::Datum::Bool(value)) => return Replacement::Alias(
+                    if value {
+                        yes
+                    } else {
+                        no
+                    },
+                ),
+                _ => (),
+            }
+            match (constants[yes.index()], constants[no.index()]) {
+                (Option::Some(a), Option::Some(b)) => if a == b {
+                    Replacement::Constant(a)
+                } else {
+                    Replacement::Keep
+                },
+                _ => Replacement::Keep,
+            }
+        },
+    }
+}

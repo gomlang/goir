@@ -20,7 +20,11 @@ pub fn metrics(compiled: Compiled) -> Metrics {
                     stack_reads = stack_reads + 1;
                 }
                 if operands[1].contains("(SP)") || operands[1].contains("(FP)") {
-                    stack_writes = stack_writes + 1;
+                    if line.starts_with("    CMP") {
+                        stack_reads = stack_reads + 1;
+                    } else {
+                        stack_writes = stack_writes + 1;
+                    }
                 }
             }
         }

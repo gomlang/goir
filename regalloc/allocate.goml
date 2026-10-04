@@ -72,6 +72,7 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
     }
     let budget = Ref::new(options.max_steps);
     let live = analyze_with_budget(function, budget)?;
+    let hints = preferences(function, budget)?;
     let register_ends = Vec::new();
     for _ in 0..options.registers {
         register_ends.push(-1);
@@ -84,11 +85,25 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
     let mut spilled_values = 0;
     for interval in live.ranges {
         let mut selected = -1;
-        for index in 0..register_ends.len() {
+        for hint in hints[interval.reg.index()] {
             spend(budget)?;
-            if register_ends[index] < interval.start {
-                selected = index;
-                break;
+            match locations[hint.index()] {
+                Register(index) => {
+                    if register_ends[index] < interval.start {
+                        selected = index;
+                        break;
+                    }
+                },
+                _ => (),
+            }
+        }
+        if selected < 0 {
+            for index in 0..register_ends.len() {
+                spend(budget)?;
+                if register_ends[index] < interval.start {
+                    selected = index;
+                    break;
+                }
             }
         }
         if selected >= 0 {

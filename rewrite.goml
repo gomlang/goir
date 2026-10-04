@@ -1,0 +1,183 @@
+package goir;
+
+fn rewritten_value(source: Function, values: Vec[Option[Value]], value: Value) -> Result[
+    Value,
+    Error,
+] {
+    check_value(source, value)?;
+    values[value.slot].ok_or(error(ErrorKind::InvalidHandle, "rewrite uses a removed definition"))
+}
+
+fn rewritten_operation(source: Function, values: Vec[Option[Value]], operation: Operation) -> Result[
+    Operation,
+    Error,
+] {
+    match operation {
+        Constant(_) => Result::Ok(operation),
+        Binary(op, left, right) => Result::Ok(
+            Operation::Binary(
+                op,
+                rewritten_value(source, values, left)?,
+                rewritten_value(source, values, right)?,
+            ),
+        ),
+        Compare(cc, left, right) => Result::Ok(
+            Operation::Compare(
+                cc,
+                rewritten_value(source, values, left)?,
+                rewritten_value(source, values, right)?,
+            ),
+        ),
+        Select(condition, yes, no) => Result::Ok(
+            Operation::Select(
+                rewritten_value(source, values, condition)?,
+                rewritten_value(source, values, yes)?,
+                rewritten_value(source, values, no)?,
+            ),
+        ),
+    }
+}
+
+fn rewritten_edge(
+    source: Function,
+    blocks: Vec[Option[Block]],
+    values: Vec[Option[Value]],
+    edge: Edge,
+) -> Result[Edge, Error] {
+    check_block(source, edge.target)?;
+    if edge.arguments.len() > source.limits.max_block_parameters {
+        return Result::Err(error(ErrorKind::LimitExceeded, "rewrite edge exceeds parameter limit"))
+    }
+    let target = blocks[edge.target.slot].ok_or(
+        error(ErrorKind::InvalidHandle, "rewrite targets a removed block"),
+    )?;
+    let arguments = Vec::new();
+    for value in edge.arguments {
+        arguments.push(rewritten_value(source, values, value)?);
+    }
+    Result::Ok(Edge { target, arguments })
+}
+
+pub fn rewrite(source: Function, body: Vec[BlockData]) -> Result[Function, Error] {
+    verify(source)?;
+    if body.is_empty() || body.len() > source.body.len() {
+        return Result::Err(
+            error(ErrorKind::InvalidArgument, "rewrite requires a subset of source blocks"),
+        )
+    }
+    if body[0].id != source.body[0].id || body[0].parameters != source.body[0].parameters {
+        return Result::Err(
+            error(ErrorKind::InvalidArgument, "rewrite must preserve entry parameters"),
+        )
+    }
+    let identity = Ref::new(());
+    let blocks: Vec[Option[Block]] = Vec::new();
+    let values: Vec[Option[Value]] = Vec::new();
+    let definitions = Vec::new();
+    for _ in source.body {
+        blocks.push(Option::None);
+    }
+    for _ in source.values {
+        values.push(Option::None);
+    }
+    for index in 0..body.len() {
+        let block = body[index];
+        check_block(source, block.id)?;
+        if blocks[block.id.slot].is_some() {
+            return Result::Err(error(ErrorKind::InvalidHandle, "rewrite repeats a block"))
+        }
+        if block.parameters.len() > source.limits.max_block_parameters
+            || block.instructions.len() > source.values.len()
+            || block.parameters.len() + block.instructions.len()
+                > source.values.len() - definitions.len() {
+            return Result::Err(
+                error(ErrorKind::LimitExceeded, "rewrite exceeds source value limits"),
+            )
+        }
+        let target = Block { slot: index, owner: identity };
+        blocks[block.id.slot] = Option::Some(target);
+        let old_values = copy_vec(block.parameters);
+        for instruction in block.instructions {
+            old_values.push(instruction.result);
+        }
+        for position in 0..old_values.len() {
+            let old = old_values[position];
+            check_value(source, old)?;
+            if values[old.slot].is_some() {
+                return Result::Err(error(ErrorKind::InvalidHandle, "rewrite repeats a definition"))
+            }
+            values[old.slot] = Option::Some(Value { slot: definitions.len(), owner: identity });
+            definitions.push(
+                ValueData {
+                    ty: source.values[old.slot].ty,
+                    block: target,
+                    position: if position < block.parameters.len() {
+                        -1
+                    } else {
+                        position - block.parameters.len()
+                    },
+                },
+            );
+        }
+    }
+    let output = Vec::new();
+    for block in body {
+        let parameters = Vec::new();
+        for parameter in block.parameters {
+            parameters.push(rewritten_value(source, values, parameter)?);
+        }
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            instructions.push(
+                Instruction {
+                    result: rewritten_value(source, values, instruction.result)?,
+                    operation: rewritten_operation(source, values, instruction.operation)?,
+                },
+            );
+        }
+        let term = block.terminator.ok_or(
+            error(ErrorKind::ControlFlow, "rewrite lacks a terminator"),
+        )?;
+        let terminator = match term {
+            Jump(edge) => Terminator::Jump(rewritten_edge(source, blocks, values, edge)?),
+            Branch(condition, yes, no) => Terminator::Branch(
+                rewritten_value(source, values, condition)?,
+                rewritten_edge(source, blocks, values, yes)?,
+                rewritten_edge(source, blocks, values, no)?,
+            ),
+            Return(input) => {
+                if input.len() != source.outputs.len() {
+                    return Result::Err(
+                        error(ErrorKind::TypeMismatch, "rewrite changes result arity"),
+                    )
+                }
+                let results = Vec::new();
+                for value in input {
+                    results.push(rewritten_value(source, values, value)?);
+                }
+                Terminator::Return(results)
+            },
+        };
+        output.push(
+            BlockData {
+                id: blocks[block.id.slot].ok_or(
+                    error(ErrorKind::InvalidHandle, "missing rewritten block"),
+                )?,
+                parameters,
+                instructions,
+                terminator: Option::Some(terminator),
+            },
+        );
+    }
+    let function = Function {
+        identity,
+        name_value: source.name_value,
+        inputs: copy_vec(source.inputs),
+        outputs: copy_vec(source.outputs),
+        body: output,
+        values: definitions,
+        limits: source.limits,
+    };
+    verify(function)?;
+    Result::Ok(function)
+}

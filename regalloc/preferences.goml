@@ -1,0 +1,41 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+
+fn preferences(function: mach::Function, budget: Ref[isize]) -> Result[
+    Vec[Vec[mach::Reg]],
+    ir::Error,
+] {
+    let hints: Vec[Vec[mach::Reg]] = Vec::new();
+    for _ in 0..function.register_count() {
+        hints.push(Vec::new());
+    }
+    for block in function.blocks() {
+        for instruction in block.instructions {
+            spend(budget)?;
+            match instruction {
+                Binary { dst, op, left, right } => {
+                    hints[dst.index()].push(left);
+                    match op {
+                        Add | Mul | And | Or | Xor => hints[dst.index()].push(right),
+                        _ => (),
+                    }
+                },
+                Select { dst, yes, no, .. } => {
+                    hints[dst.index()].push(yes);
+                    hints[dst.index()].push(no);
+                },
+                _ => (),
+            }
+        }
+        for edge in block.terminator.successors() {
+            for item in edge.copies {
+                spend(budget)?;
+                hints[item.destination.index()].push(item.source);
+                hints[item.source.index()].push(item.destination);
+            }
+        }
+    }
+    Result::Ok(hints)
+}

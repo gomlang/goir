@@ -16,20 +16,24 @@ fn place(location: regalloc::Location) -> string {
     }
 }
 
-fn read_reg(lines: Vec[string], allocation: regalloc::Allocation, reg: mach::Reg, scratch: string) -> Result[
-    (),
-    ir::Error,
-] {
-    lines.push("    MOVQ " + place(allocation.location(reg)?) + ", " + scratch);
-    Result::Ok(())
+fn move_operand(lines: Vec[string], source: string, destination: string) -> () {
+    if source != destination {
+        lines.push("    MOVQ " + source + ", " + destination);
+    }
 }
 
-fn write_reg(lines: Vec[string], allocation: regalloc::Allocation, reg: mach::Reg, scratch: string) -> Result[
-    (),
-    ir::Error,
-] {
-    lines.push("    MOVQ " + scratch + ", " + place(allocation.location(reg)?));
-    Result::Ok(())
+fn register_location(location: regalloc::Location) -> bool {
+    match location {
+        Register(_) => true,
+        Stack(_) => false,
+    }
+}
+
+fn commutative(op: ir::BinaryOp) -> bool {
+    match op {
+        Add | Mul | And | Or | Xor => true,
+        _ => false,
+    }
 }
 
 fn allocated_instruction(
@@ -37,29 +41,65 @@ fn allocated_instruction(
     allocation: regalloc::Allocation,
     instruction: mach::Instruction,
 ) -> Result[(), ir::Error] {
+    let destination = allocation.location(instruction.definition())?;
+    let output = place(destination);
+    let mut accumulator = if register_location(destination) {
+        output
+    } else {
+        "AX"
+    };
     match instruction {
-        Immediate { value, .. } => lines.push("    MOVQ $" + value.to_string() + ", AX"),
+        Immediate { value, .. } => lines.push("    MOVQ $" + value.to_string() + ", " + accumulator),
         Binary { op, left, right, .. } => {
-            read_reg(lines, allocation, left, "AX")?;
-            read_reg(lines, allocation, right, "CX")?;
-            lines.push("    " + binary_opcode(op) + " CX, AX");
+            let left = allocation.location(left)?;
+            let right = allocation.location(right)?;
+            match op {
+                Shl | ShrU | ShrS => {
+                    move_operand(lines, place(right), "CX");
+                    move_operand(lines, place(left), accumulator);
+                    lines.push("    " + binary_opcode(op) + " CX, " + accumulator);
+                },
+                _ => {
+                    let mut source = place(right);
+                    if destination == right && register_location(destination) && commutative(op) {
+                        source = place(left);
+                    } else {
+                        if destination == right && destination != left {
+                            accumulator = "AX";
+                        }
+                        move_operand(lines, place(left), accumulator);
+                    }
+                    lines.push("    " + binary_opcode(op) + " " + source + ", " + accumulator);
+                },
+            }
         },
         Compare { cc, left, right, .. } => {
-            read_reg(lines, allocation, left, "AX")?;
-            read_reg(lines, allocation, right, "CX")?;
-            lines.push("    CMPQ AX, CX");
+            let left = allocation.location(left)?;
+            let right = allocation.location(right)?;
+            let mut operand = place(left);
+            if !register_location(left) && !register_location(right) {
+                move_operand(lines, operand, "AX");
+                operand = "AX";
+            }
+            lines.push("    CMPQ " + operand + ", " + place(right));
             lines.push("    " + comparison_opcode(cc) + " AL");
-            lines.push("    MOVBQZX AL, AX");
+            lines.push("    MOVBQZX AL, " + accumulator);
         },
         Select { condition, yes, no, .. } => {
-            read_reg(lines, allocation, condition, "DX")?;
-            read_reg(lines, allocation, yes, "AX")?;
-            read_reg(lines, allocation, no, "CX")?;
-            lines.push("    CMPQ DX, $0");
-            lines.push("    CMOVQEQ CX, AX");
+            let condition = allocation.location(condition)?;
+            let yes = allocation.location(yes)?;
+            let no = allocation.location(no)?;
+            lines.push("    CMPQ " + place(condition) + ", $0");
+            if destination == no && register_location(destination) {
+                lines.push("    CMOVQNE " + place(yes) + ", " + accumulator);
+            } else {
+                move_operand(lines, place(yes), accumulator);
+                lines.push("    CMOVQEQ " + place(no) + ", " + accumulator);
+            }
         },
     }
-    write_reg(lines, allocation, instruction.definition(), "AX")
+    move_operand(lines, accumulator, output);
+    Result::Ok(())
 }
 
 pub fn emit(function: ir::Function) -> Result[Compiled, ir::Error] {
@@ -125,8 +165,14 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
             I64 => "MOVQ",
             Bool => "MOVBQZX",
         };
-        lines.push(f"    {opcode} p{index}+{offset}(FP), AX");
-        write_reg(lines, allocation, blocks[0].parameters[index], "AX")?;
+        let destination = allocation.location(blocks[0].parameters[index])?;
+        let register = if register_location(destination) {
+            place(destination)
+        } else {
+            "AX"
+        };
+        lines.push(f"    {opcode} p{index}+{offset}(FP), " + register);
+        move_operand(lines, register, place(destination));
     }
     for block in blocks {
         let index = block.index;
@@ -137,21 +183,26 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
         match block.terminator {
             Return(values) => {
                 for position in 0..values.len() {
-                    read_reg(lines, allocation, values[position], "AX")?;
+                    let source = allocation.location(values[position])?;
+                    let register = if register_location(source) {
+                        place(source)
+                    } else {
+                        "AX"
+                    };
+                    move_operand(lines, place(source), register);
                     let slot = plan.results[position];
                     let offset = slot.offset;
                     let opcode = match slot.ty {
                         I64 => "MOVQ",
                         Bool => "MOVB",
                     };
-                    lines.push(f"    {opcode} AX, r{position}+{offset}(FP)");
+                    lines.push(f"    {opcode} " + register + f", r{position}+{offset}(FP)");
                 }
                 lines.push("    RET");
             },
             Jump(edge) => allocated_transfer(lines, allocation, edge)?,
             Branch { condition, yes, no } => {
-                read_reg(lines, allocation, condition, "AX")?;
-                lines.push("    CMPQ AX, $0");
+                lines.push("    CMPQ " + place(allocation.location(condition)?) + ", $0");
                 lines.push(f"    JNE edge_yes{index}");
                 allocated_transfer(lines, allocation, no)?;
                 lines.push(f"edge_yes{index}:");

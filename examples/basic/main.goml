@@ -2,6 +2,7 @@ package main;
 
 use ecosystem::goir as ir;
 use ecosystem::goir::amd64;
+use ecosystem::goir::opt;
 use std::env;
 use std::fs;
 use std::path;
@@ -68,8 +69,14 @@ pub fn swap_function() -> Result[ir::Function, ir::Error] {
 }
 
 fn main() -> () {
-    let sum = testing::expect_ok(sum_function(), "build sum");
-    let swap = testing::expect_ok(swap_function(), "build swap");
+    let sum = testing::expect_ok(
+        opt::simplify(testing::expect_ok(sum_function(), "build sum")),
+        "optimize sum",
+    );
+    let swap = testing::expect_ok(
+        opt::simplify(testing::expect_ok(swap_function(), "build swap")),
+        "optimize swap",
+    );
     let output = testing::expect_ok(
         amd64::emit_package("generated", Vec::from_array([sum, swap])),
         "emit amd64",
