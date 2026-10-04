@@ -30,22 +30,112 @@ pub fn datum_from_bits(ty: Type, value: i64) -> Datum {
     }
 }
 
-fn binary_i32(op: BinaryOp, left: i64, right: i64) -> i64 {
-    let a = left.to_u32();
-    let b = right.to_u32();
-    let shift = (b & 31).to_isize();
-    let value = match op {
-        Add => a + b,
-        Sub => a - b,
-        Mul => a * b,
-        And => a & b,
-        Or => a | b,
-        Xor => a ^ b,
-        Shl => a << shift,
-        ShrU => a >> shift,
-        ShrS => (a.to_i32() >> shift).to_u32(),
+impl BinaryOp {
+    pub fn may_trap(self: BinaryOp) -> bool {
+        match self {
+            DivS | DivU | RemS | RemU | ShlChecked | ShrUChecked | ShrSChecked => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_division(self: BinaryOp) -> bool {
+        match self {
+            DivS | DivU | RemS | RemU => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_checked_shift(self: BinaryOp) -> bool {
+        match self {
+            ShlChecked | ShrUChecked | ShrSChecked => true,
+            _ => false,
+        }
+    }
+}
+
+pub fn evaluate_binary(op: BinaryOp, left: Datum, right: Datum) -> Result[Datum, Error] {
+    let ty = left.value_type();
+    if (ty != Type::I32 && ty != Type::I64) || right.value_type() != ty {
+        return Result::Err(
+            error(ErrorKind::TypeMismatch, "binary evaluation requires matching integer types"),
+        )
+    }
+    let a = left.bits();
+    let b = right.bits();
+    if op.is_division() && b == 0 {
+        return Result::Err(error(ErrorKind::ArithmeticTrap, "integer division by zero"))
+    }
+    if op.is_checked_shift() && b < 0 {
+        return Result::Err(error(ErrorKind::ArithmeticTrap, "negative shift amount"))
+    }
+    let width = if ty == Type::I32 {
+        32
+    } else {
+        64
     };
-    value.to_i32().to_i64()
+    if op.is_checked_shift() && b >= width {
+        let result = if op == BinaryOp::ShrSChecked && a < 0 {
+            -1
+        } else {
+            0
+        };
+        return Result::Ok(datum_from_bits(ty, result))
+    }
+    let shift = (b.to_u64() & (width - 1).to_u64()).to_isize();
+    let bits = if ty == Type::I32 {
+        let x = a.to_u32();
+        let y = b.to_u32();
+        let minimum: i32 = -2147483648;
+        match op {
+            Add => x + y,
+            Sub => x - y,
+            Mul => x * y,
+            And => x & y,
+            Or => x | y,
+            Xor => x ^ y,
+            Shl | ShlChecked => x << shift,
+            ShrU | ShrUChecked => x >> shift,
+            ShrS | ShrSChecked => (a.to_i32() >> shift).to_u32(),
+            DivS => if a.to_i32() == minimum && b == -1 {
+                minimum.to_u32()
+            } else {
+                (a.to_i32() / b.to_i32()).to_u32()
+            },
+            RemS => if a.to_i32() == minimum && b == -1 {
+                0
+            } else {
+                (a.to_i32() % b.to_i32()).to_u32()
+            },
+            DivU => x / y,
+            RemU => x % y,
+        }.to_i32().to_i64()
+    } else {
+        let minimum: i64 = -9223372036854775808;
+        match op {
+            Add => (a.to_u64() + b.to_u64()).to_i64(),
+            Sub => (a.to_u64() - b.to_u64()).to_i64(),
+            Mul => (a.to_u64() * b.to_u64()).to_i64(),
+            And => a & b,
+            Or => a | b,
+            Xor => a ^ b,
+            Shl | ShlChecked => (a.to_u64() << shift).to_i64(),
+            ShrU | ShrUChecked => (a.to_u64() >> shift).to_i64(),
+            ShrS | ShrSChecked => a >> shift,
+            DivS => if a == minimum && b == -1 {
+                minimum
+            } else {
+                a / b
+            },
+            RemS => if a == minimum && b == -1 {
+                0
+            } else {
+                a % b
+            },
+            DivU => (a.to_u64() / b.to_u64()).to_i64(),
+            RemU => (a.to_u64() % b.to_u64()).to_i64(),
+        }
+    };
+    Result::Ok(datum_from_bits(ty, bits))
 }
 
 fn compare_i32(cc: IntCC, left: i64, right: i64) -> bool {

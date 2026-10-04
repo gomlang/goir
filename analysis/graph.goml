@@ -1,0 +1,319 @@
+package analysis;
+
+use ecosystem::goir as ir;
+
+pub struct Loop {
+    pub header: isize,
+    pub blocks: Vec[isize],
+    pub latches: Vec[isize],
+    pub depth: isize,
+}
+
+pub struct Graph {
+    outgoing: Vec[Vec[isize]],
+    incoming: Vec[Vec[isize]],
+    reachable: Vec[bool],
+    order: Vec[isize],
+    dom: Vec[Vec[u64]],
+    natural_loops: Vec[Loop],
+    weights: Vec[isize],
+}
+
+fn spend(budget: Ref[isize]) -> Result[(), ir::Error] {
+    if budget.get() <= 0 {
+        return Result::Err(ir::error(ir::ErrorKind::LimitExceeded, "analysis work limit exceeded"))
+    }
+    budget.set(budget.get() - 1);
+    Result::Ok(())
+}
+
+fn copy_vec[T](input: Vec[T]) -> Vec[T] {
+    let output = Vec::new();
+    for value in input {
+        output.push(value);
+    }
+    output
+}
+
+fn row(words: isize) -> Vec[u64] {
+    let output = Vec::new();
+    for _ in 0..words {
+        output.push(0);
+    }
+    output
+}
+
+fn has(bits: Vec[u64], index: isize) -> bool {
+    bits[index / 64] & (1.to_u64() << (index % 64)) != 0
+}
+
+fn put(bits: Vec[u64], index: isize) -> () {
+    bits[index / 64] = bits[index / 64] | (1.to_u64() << (index % 64));
+}
+
+impl Graph {
+    pub fn new(successors: Vec[Vec[isize]], budget: Ref[isize]) -> Result[Graph, ir::Error] {
+        build_graph(successors, budget, Scratch::new())
+    }
+
+    pub fn block_count(self: Graph) -> isize {
+        self.outgoing.len()
+    }
+
+    fn check_block(self: Graph, index: isize) -> Result[(), ir::Error] {
+        if index < 0 || index >= self.block_count() {
+            return Result::Err(
+                ir::error(ir::ErrorKind::InvalidHandle, "analysis block is outside graph"),
+            )
+        }
+        Result::Ok(())
+    }
+
+    pub fn successors(self: Graph, block: isize) -> Result[Vec[isize], ir::Error] {
+        self.check_block(block)?;
+        Result::Ok(copy_vec(self.outgoing[block]))
+    }
+
+    pub fn predecessors(self: Graph, block: isize) -> Result[Vec[isize], ir::Error] {
+        self.check_block(block)?;
+        Result::Ok(copy_vec(self.incoming[block]))
+    }
+
+    pub fn is_reachable(self: Graph, block: isize) -> Result[bool, ir::Error] {
+        self.check_block(block)?;
+        Result::Ok(self.reachable[block])
+    }
+
+    pub fn dominates(self: Graph, definition: isize, use_block: isize) -> Result[bool, ir::Error] {
+        self.check_block(definition)?;
+        self.check_block(use_block)?;
+        Result::Ok(self.reachable[use_block] && has(self.dom[use_block], definition))
+    }
+
+    pub fn reverse_postorder(self: Graph) -> Vec[isize] {
+        copy_vec(self.order)
+    }
+
+    pub fn block_weights(self: Graph) -> Vec[isize] {
+        copy_vec(self.weights)
+    }
+
+    pub fn loops(self: Graph) -> Vec[Loop] {
+        let output = Vec::new();
+        for item in self.natural_loops {
+            output.push(
+                Loop {
+                    header: item.header,
+                    blocks: copy_vec(item.blocks),
+                    latches: copy_vec(item.latches),
+                    depth: item.depth,
+                },
+            );
+        }
+        output
+    }
+}
+
+struct Scratch {
+    visited: Vec[bool],
+    stack: Vec[isize],
+    cursors: Vec[isize],
+    pending: Vec[isize],
+}
+
+impl Scratch {
+    fn new() -> Scratch {
+        Scratch { visited: Vec::new(), stack: Vec::new(), cursors: Vec::new(), pending: Vec::new() }
+    }
+
+    fn retained_capacity(self: Scratch) -> isize {
+        vec_capacity(self.visited) + vec_capacity(self.stack) + vec_capacity(self.cursors)
+            + vec_capacity(self.pending)
+    }
+}
+
+fn build_graph(successors: Vec[Vec[isize]], budget: Ref[isize], scratch: Scratch) -> Result[
+    Graph,
+    ir::Error,
+] {
+    spend(budget)?;
+    let count = successors.len();
+    if count < 1 || count > 1024 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "analysis requires 1..1024 blocks"),
+        )
+    }
+    let mut edge_count = 0;
+    for edges in successors {
+        spend(budget)?;
+        edge_count += edges.len();
+        if edge_count > 65536 {
+            return Result::Err(
+                ir::error(ir::ErrorKind::LimitExceeded, "analysis edge limit exceeded"),
+            )
+        }
+        for target in edges {
+            spend(budget)?;
+            if target < 0 || target >= count {
+                return Result::Err(
+                    ir::error(ir::ErrorKind::InvalidHandle, "analysis edge is outside graph"),
+                )
+            }
+        }
+    }
+    let outgoing = Vec::new();
+    let incoming: Vec[Vec[isize]] = Vec::new();
+    scratch.visited.clear();
+    scratch.stack.clear();
+    scratch.cursors.clear();
+    for edges in successors {
+        spend(budget)?;
+        outgoing.push(copy_vec(edges));
+        incoming.push(Vec::new());
+        scratch.visited.push(false);
+    }
+    for source in 0..count {
+        for target in outgoing[source] {
+            spend(budget)?;
+            if target < 0 || target >= count {
+                return Result::Err(
+                    ir::error(ir::ErrorKind::InvalidHandle, "analysis edge is outside graph"),
+                )
+            }
+            incoming[target].push(source);
+        }
+    }
+    let postorder = Vec::new();
+    scratch.visited[0] = true;
+    scratch.stack.push(0);
+    scratch.cursors.push(0);
+    while !scratch.stack.is_empty() {
+        spend(budget)?;
+        let top = scratch.stack.len() - 1;
+        let current = scratch.stack[top];
+        let cursor = scratch.cursors[top];
+        if cursor < outgoing[current].len() {
+            scratch.cursors[top] = cursor + 1;
+            let target = outgoing[current][cursor];
+            if !scratch.visited[target] {
+                scratch.visited[target] = true;
+                scratch.stack.push(target);
+                scratch.cursors.push(0);
+            }
+        } else {
+            let _ = scratch.stack.remove(top);
+            let _ = scratch.cursors.remove(top);
+            postorder.push(current);
+        }
+    }
+    let reachable = copy_vec(scratch.visited);
+    let order = Vec::new();
+    for index in 0..postorder.len() {
+        order.push(postorder[postorder.len() - index - 1]);
+    }
+    let words = (count + 63) / 64;
+    let dom = Vec::new();
+    for block in 0..count {
+        let bits = row(words);
+        if reachable[block] {
+            for candidate in order {
+                spend(budget)?;
+                if block != 0 || candidate == 0 {
+                    put(bits, candidate);
+                }
+            }
+        }
+        dom.push(bits);
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in order {
+            if block == 0 {
+                continue
+            }
+            for word in 0..words {
+                spend(budget)?;
+                let mut bits: u64 = ~0;
+                for predecessor in incoming[block] {
+                    spend(budget)?;
+                    if reachable[predecessor] {
+                        bits = bits & dom[predecessor][word];
+                    }
+                }
+                if block / 64 == word {
+                    bits = bits | (1.to_u64() << (block % 64));
+                }
+                if bits != dom[block][word] {
+                    dom[block][word] = bits;
+                    changed = true;
+                }
+            }
+        }
+    }
+    let memberships = Vec::new();
+    let latches: Vec[Vec[isize]] = Vec::new();
+    for _ in 0..count {
+        memberships.push(row(words));
+        latches.push(Vec::new());
+    }
+    for source in order {
+        for header in outgoing[source] {
+            spend(budget)?;
+            if !has(dom[source], header) {
+                continue
+            }
+            latches[header].push(source);
+            put(memberships[header], header);
+            scratch.pending.clear();
+            scratch.pending.push(source);
+            let mut cursor = 0;
+            while cursor < scratch.pending.len() {
+                spend(budget)?;
+                let member = scratch.pending[cursor];
+                cursor = cursor + 1;
+                if has(memberships[header], member) {
+                    continue
+                }
+                put(memberships[header], member);
+                for predecessor in incoming[member] {
+                    spend(budget)?;
+                    if reachable[predecessor] {
+                        scratch.pending.push(predecessor);
+                    }
+                }
+            }
+        }
+    }
+    let loops = Vec::new();
+    for header in order {
+        if latches[header].is_empty() {
+            continue
+        }
+        let blocks = Vec::new();
+        let mut depth = 1;
+        for candidate in 0..count {
+            spend(budget)?;
+            if has(memberships[header], candidate) {
+                blocks.push(candidate);
+            }
+            if candidate != header && !latches[candidate].is_empty()
+                && has(memberships[candidate], header) {
+                depth += 1;
+            }
+        }
+        loops.push(Loop { header, blocks, latches: latches[header], depth });
+    }
+    let weights = Vec::new();
+    for block in 0..count {
+        let mut weight = 1;
+        for item in loops {
+            spend(budget)?;
+            if has(memberships[item.header], block) && weight < 262144 {
+                weight *= 8;
+            }
+        }
+        weights.push(weight);
+    }
+    Result::Ok(Graph { outgoing, incoming, reachable, order, dom, natural_loops: loops, weights })
+}

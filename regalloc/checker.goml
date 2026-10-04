@@ -214,6 +214,18 @@ fn checker_same_instruction(left: mach::Instruction, right: mach::Instruction) -
             && x == y
             && p == r
             && q == s,
+        (Divide { dst: a, op: x, left: p, right: q }, Divide { dst: b, op: y, left: r, right: s }) | (
+            CheckedShift { dst: a, op: x, left: p, right: q },
+            CheckedShift { dst: b, op: y, left: r, right: s },
+        ) => a == b && x == y && p == r && q == s,
+        (
+            BinaryStack { dst: a, op: x, left: p, slot: q },
+            BinaryStack { dst: b, op: y, left: r, slot: s },
+        ) => a == b && x == y && p == r && q == s,
+        (
+            FloatBinaryStack { dst: a, op: x, left: p, slot: q },
+            FloatBinaryStack { dst: b, op: y, left: r, slot: s },
+        ) => a == b && x == y && p == r && q == s,
         (Compare { dst: a, cc: x, left: p, right: q }, Compare { dst: b, cc: y, left: r, right: s }) => a
             == b
             && x == y
@@ -379,7 +391,7 @@ fn checker_edge(
             allocation,
             output,
             copy.source,
-            allocation.location(copy.destination)?,
+            allocation.entry_location(edge.edge.target, copy.destination)?,
             budget,
         )?;
     }
@@ -388,7 +400,10 @@ fn checker_edge(
     }
     for copy in edge.edge.copies {
         spend(budget)?;
-        let lane = checker_lane(allocation, allocation.location(copy.destination)?)?;
+        let lane = checker_lane(
+            allocation,
+            allocation.entry_location(edge.edge.target, copy.destination)?,
+        )?;
         output.cells[lane].push(copy.destination.index());
     }
     Result::Ok(output)
@@ -448,10 +463,25 @@ pub fn check_with_budget(allocation: Allocation, budget: Ref[isize]) -> Result[(
             _ => (),
         }
     }
+    verify_placements(allocation, budget)?;
     let blocks = allocation.blocks();
     let machine = allocation.function().blocks();
     checker_shape(allocation, blocks, machine, budget)?;
     let constants = constants_for(allocation.function());
+    let origins = Vec::new();
+    for _ in 0..allocation.function().register_count() {
+        origins.push(-1);
+    }
+    for block in machine {
+        for reg in block.parameters {
+            origins[reg.index()] = block.index;
+        }
+        for instruction in block.instructions {
+            for reg in instruction.definitions() {
+                origins[reg.index()] = block.index;
+            }
+        }
+    }
     let lanes = allocation.register_count() + allocation.stack_slots() + 6;
     if lanes < 6 || blocks.len() > 1048576 / lanes {
         return Result::Err(
@@ -464,7 +494,7 @@ pub fn check_with_budget(allocation: Allocation, budget: Ref[isize]) -> Result[(
         entry.cells.push(Vec::new());
     }
     for parameter in machine[0].parameters {
-        let location = allocation.location(parameter)?;
+        let location = allocation.entry_location(0, parameter)?;
         let lane = checker_lane(allocation, location)?;
         if !entry.cells[lane].is_empty() {
             return Result::Err(checker_error("entry parameters share a location"))
@@ -492,6 +522,21 @@ pub fn check_with_budget(allocation: Allocation, budget: Ref[isize]) -> Result[(
             budget,
         )?;
         let block = blocks[index];
+        for placement in allocation.placements[index] {
+            spend(budget)?;
+            if origins[placement.reg.index()] != index {
+                checker_read(allocation, state, placement.reg, placement.location, budget)?;
+            }
+        }
+        for parameter in machine[index].parameters {
+            checker_read(
+                allocation,
+                state,
+                parameter,
+                allocation.entry_location(index, parameter)?,
+                budget,
+            )?;
+        }
         for instruction in block.instructions {
             checker_instruction(allocation, state, instruction, constants, budget)?;
         }

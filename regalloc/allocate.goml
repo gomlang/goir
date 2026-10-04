@@ -2,6 +2,7 @@ package regalloc;
 
 use ecosystem::goir as ir;
 use module::mach;
+use module::analysis;
 use std::time;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -35,9 +36,38 @@ pub struct Allocation {
     slots: isize,
     spilled_values: isize,
     plan: Vec[AllocatedBlock],
+    placements: Vec[Vec[Placement]],
+    algorithm_value: Algorithm,
+    statistics_value: Statistics,
 }
 
 impl Allocation {
+    pub fn algorithm(self: Allocation) -> Algorithm {
+        self.algorithm_value
+    }
+
+    pub fn statistics(self: Allocation) -> Statistics {
+        self.statistics_value
+    }
+
+    pub fn block_locations(self: Allocation, block: isize) -> Result[Vec[Placement], ir::Error] {
+        if block < 0 || block >= self.placements.len() {
+            return Result::Err(ir::error(ir::ErrorKind::InvalidHandle, "invalid allocation block"))
+        }
+        Result::Ok(copy_vec(self.placements[block]))
+    }
+
+    pub fn entry_location(self: Allocation, block: isize, reg: mach::Reg) -> Result[
+        Location,
+        ir::Error,
+    ] {
+        self.machine.register_type(reg)?;
+        if block < 0 || block >= self.placements.len() {
+            return Result::Err(ir::error(ir::ErrorKind::InvalidHandle, "invalid allocation block"))
+        }
+        placement_location(self.placements[block], reg)
+    }
+
     pub fn blocks(self: Allocation) -> Vec[AllocatedBlock] {
         copy_plan(self.plan)
     }
@@ -117,25 +147,66 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
     Result::Ok(allocate_profiled(function, options, Workspace::new())?.allocation)
 }
 
+pub fn allocate_with_algorithm(function: mach::Function, options: Options, algorithm: Algorithm) -> Result[
+    Allocation,
+    ir::Error,
+] {
+    Result::Ok(
+        allocate_profiled_with_algorithm(function, options, Workspace::new(), algorithm)?.allocation,
+    )
+}
+
 pub fn allocate_profiled(function: mach::Function, options: Options, workspace: Workspace) -> Result[
     ProfiledAllocation,
     ir::Error,
 ] {
+    allocate_profiled_with_algorithm(function, options, workspace, Algorithm::Global)
+}
+
+pub fn allocate_profiled_with_algorithm(
+    function: mach::Function,
+    options: Options,
+    workspace: Workspace,
+    algorithm: Algorithm,
+) -> Result[ProfiledAllocation, ir::Error] {
+    allocate_shared(function, options, workspace, algorithm, Option::None)
+}
+
+pub fn allocate_profiled_with_graph(
+    function: mach::Function,
+    options: Options,
+    workspace: Workspace,
+    algorithm: Algorithm,
+    graph: analysis::Graph,
+) -> Result[ProfiledAllocation, ir::Error] {
+    allocate_shared(function, options, workspace, algorithm, Option::Some(graph))
+}
+
+fn allocate_shared(
+    function: mach::Function,
+    options: Options,
+    workspace: Workspace,
+    algorithm: Algorithm,
+    graph: Option[analysis::Graph],
+) -> Result[ProfiledAllocation, ir::Error] {
     if workspace.active.get() {
         return Result::Err(
             ir::error(ir::ErrorKind::InvalidState, "allocation workspace is already active"),
         )
     }
     workspace.active.set(true);
-    let output = allocate_in_workspace(function, options, workspace);
+    let output = allocate_in_workspace(function, options, workspace, algorithm, graph);
     workspace.active.set(false);
     output
 }
 
-fn allocate_in_workspace(function: mach::Function, options: Options, workspace: Workspace) -> Result[
-    ProfiledAllocation,
-    ir::Error,
-] {
+fn allocate_in_workspace(
+    function: mach::Function,
+    options: Options,
+    workspace: Workspace,
+    algorithm: Algorithm,
+    graph: Option[analysis::Graph],
+) -> Result[ProfiledAllocation, ir::Error] {
     if options.registers < 0 || options.registers > 7 || options.max_steps < 1
         || options.max_steps > 100000000 {
         return Result::Err(
@@ -144,6 +215,14 @@ fn allocate_in_workspace(function: mach::Function, options: Options, workspace: 
     }
     let budget = Ref::new(options.max_steps);
     let started = time::Instant::now();
+    let graph = match graph {
+        Some(existing) => {
+            validate_graph(function, existing, budget)?;
+            existing
+        },
+        None => allocation_graph(function, budget)?,
+    };
+    let block_weights = graph.block_weights();
     let live = analyze_with_workspace(function, budget, workspace)?;
     let liveness_ns = started.elapsed().as_nanoseconds();
     let allocation_started = time::Instant::now();
@@ -212,7 +291,39 @@ fn allocate_in_workspace(function: mach::Function, options: Options, workspace: 
             homes[interval.reg.index()] = slot;
         }
     }
-    coalesce_edges(function, live, locations, budget)?;
+    let weights = value_weights(function, block_weights, budget)?;
+    let global_evictions = if algorithm == Algorithm::Global && options.registers > 0 {
+        let regs = Vec::new();
+        for index in 0..function.register_count() {
+            regs.push(function.register(index)?);
+        }
+        promote_ranges(
+            function,
+            live,
+            regs,
+            locations,
+            global_costs(function, live, weights, budget)?,
+            Vec::new(),
+            homes,
+            slot_owners,
+            options.registers,
+            budget,
+        )?
+    } else {
+        0
+    };
+    coalesce_edges(function, live, locations, block_weights, budget)?;
+    let (placements, regional_evictions) = placements_for(
+        function,
+        live,
+        locations,
+        homes,
+        slot_owners,
+        graph,
+        options.registers,
+        algorithm,
+        budget,
+    )?;
     let plan = allocate_plan(
         function,
         live,
@@ -220,6 +331,9 @@ fn allocate_in_workspace(function: mach::Function, options: Options, workspace: 
         homes,
         slot_owners,
         options.registers,
+        weights,
+        placements,
+        algorithm,
         budget,
     )?;
     let mut spilled_values = 0;
@@ -236,7 +350,18 @@ fn allocate_in_workspace(function: mach::Function, options: Options, workspace: 
         class_limit: options.registers,
         slots: slot_owners.len(),
         spilled_values,
+        statistics_value: allocation_statistics(
+            function,
+            plan,
+            placements,
+            block_weights,
+            global_evictions,
+            regional_evictions,
+            budget,
+        )?,
         plan,
+        placements,
+        algorithm_value: algorithm,
     };
     let allocation_ns = allocation_started.elapsed().as_nanoseconds();
     let checking_started = time::Instant::now();
@@ -297,4 +422,43 @@ fn verify_with_budget(allocation: Allocation, budget: Ref[isize]) -> Result[(), 
         lanes[lane].push(interval.reg);
     }
     check_with_budget(allocation, budget)
+}
+
+fn validate_graph(function: mach::Function, graph: analysis::Graph, budget: Ref[isize]) -> Result[
+    (),
+    ir::Error,
+] {
+    let blocks = function.blocks();
+    if graph.block_count() != blocks.len() {
+        return Result::Err(
+            ir::error(ir::ErrorKind::InvalidArgument, "analysis graph differs from machine CFG"),
+        )
+    }
+    for block in blocks {
+        let targets = Vec::new();
+        for edge in block.terminator.successors() {
+            spend(budget)?;
+            if !targets.contains(edge.target) {
+                targets.push(edge.target);
+            }
+        }
+        let expected = graph.successors(block.index)?;
+        if expected.len() != targets.len() {
+            return Result::Err(
+                ir::error(ir::ErrorKind::InvalidArgument, "analysis graph differs from machine CFG"),
+            )
+        }
+        for target in targets {
+            spend(budget)?;
+            if !expected.contains(target) {
+                return Result::Err(
+                    ir::error(
+                        ir::ErrorKind::InvalidArgument,
+                        "analysis graph differs from machine CFG",
+                    ),
+                )
+            }
+        }
+    }
+    Result::Ok(())
 }

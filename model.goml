@@ -19,6 +19,13 @@ pub enum BinaryOp {
     Shl,
     ShrU,
     ShrS,
+    DivS,
+    DivU,
+    RemS,
+    RemU,
+    ShlChecked,
+    ShrUChecked,
+    ShrSChecked,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -127,6 +134,7 @@ pub enum ErrorKind {
     Dominance,
     LimitExceeded,
     FuelExhausted,
+    ArithmeticTrap,
     Unsupported,
 }
 
@@ -441,6 +449,16 @@ fn operation_types(function: Function, operation: Operation) -> Result[Vec[Type]
 
 impl Operation {
     pub fn effects(self: Operation) -> Effects {
+        if let Operation::Binary(op, _, _) = self {
+            if op.may_trap() {
+                return Effects {
+                    reads_memory: false,
+                    writes_memory: false,
+                    may_trap: true,
+                    call: false,
+                }
+            }
+        }
         match self {
             StackLoad(_) => Effects {
                 reads_memory: true,

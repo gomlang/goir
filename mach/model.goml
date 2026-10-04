@@ -91,6 +91,30 @@ pub enum Instruction {
         left: Reg,
         right: Reg,
     },
+    Divide {
+        dst: Reg,
+        op: ir::BinaryOp,
+        left: Reg,
+        right: Reg,
+    },
+    CheckedShift {
+        dst: Reg,
+        op: ir::BinaryOp,
+        left: Reg,
+        right: Reg,
+    },
+    BinaryStack {
+        dst: Reg,
+        op: ir::BinaryOp,
+        left: Reg,
+        slot: ir::StackSlot,
+    },
+    FloatBinaryStack {
+        dst: Reg,
+        op: ir::FloatOp,
+        left: Reg,
+        slot: ir::StackSlot,
+    },
     BinaryImmediate {
         dst: Reg,
         op: ir::BinaryOp,
@@ -155,7 +179,10 @@ pub enum Instruction {
 impl Instruction {
     pub fn definitions(self: Instruction) -> Vec[Reg] {
         match self {
-            Immediate { dst, .. } | FloatImmediate { dst, .. } | Binary { dst, .. } | BinaryImmediate {
+            Immediate { dst, .. } | FloatImmediate { dst, .. } | Divide { dst, .. } | CheckedShift {
+                dst,
+                ..,
+            } | BinaryStack { dst, .. } | FloatBinaryStack { dst, .. } | Binary { dst, .. } | BinaryImmediate {
                 dst,
                 ..,
             } | Lea { dst, .. } | Compare { dst, .. } | Select { dst, .. } | FloatBinary { dst, .. } | FloatCompare {
@@ -173,6 +200,13 @@ impl Instruction {
         let uses = self.uses();
         let constraints = match self {
             Immediate { .. } | FloatImmediate { .. } | StackLoad { .. } => Vec::new(),
+            Divide { .. } => Vec::from_array(
+                [Constraint::Fixed(FixedReg::AX), Constraint::Fixed(FixedReg::CX)],
+            ),
+            CheckedShift { .. } => Vec::from_array(
+                [Constraint::Register, Constraint::Fixed(FixedReg::CX)],
+            ),
+            BinaryStack { .. } | FloatBinaryStack { .. } => Vec::from_array([Constraint::Register]),
             Binary { op, .. } => Vec::from_array(
                 [
                     Constraint::Register,
@@ -216,7 +250,16 @@ impl Instruction {
             );
         }
         let constraint = match self {
-            Binary { .. } | BinaryImmediate { .. } | FloatBinary { .. } => Constraint::Reuse(0),
+            Binary { .. } | BinaryImmediate { .. } | FloatBinary { .. } | CheckedShift { .. } | BinaryStack {
+                ..,
+            } | FloatBinaryStack { .. } => Constraint::Reuse(0),
+            Divide { op, .. } => Constraint::Fixed(
+                if op == ir::BinaryOp::RemS || op == ir::BinaryOp::RemU {
+                    FixedReg::DX
+                } else {
+                    FixedReg::AX
+                },
+            ),
             Compare { .. } | FloatCompare { .. } => Constraint::Fixed(FixedReg::AX),
             Select { .. } => Constraint::Reuse(1),
             FloatSelect { .. } => Constraint::Fixed(FixedReg::X0),
@@ -236,7 +279,10 @@ impl Instruction {
             Immediate { .. } | Lea { .. } | StackLoad { .. } | Convert { .. } => Vec::new(),
             StackStore { .. } => Vec::from_array([Clobber::Fixed(FixedReg::AX)]),
             FloatImmediate { .. } => Vec::from_array([Clobber::Fixed(FixedReg::AX)]),
-            FloatBinary { .. } => Vec::new(),
+            FloatBinary { .. } | FloatBinaryStack { .. } => Vec::new(),
+            Divide { .. } => Vec::from_array(
+                [Clobber::Flags, Clobber::Fixed(FixedReg::AX), Clobber::Fixed(FixedReg::DX)],
+            ),
             FloatCompare { .. } => Vec::from_array([Clobber::Flags, Clobber::Fixed(FixedReg::DX)]),
             Call { .. } => {
                 let output = Vec::new();
@@ -265,12 +311,18 @@ impl Instruction {
     pub fn uses(self: Instruction) -> Vec[Reg] {
         match self {
             Immediate { .. } | FloatImmediate { .. } | StackLoad { .. } => Vec::new(),
-            Binary { left, right, .. } | Compare { left, right, .. } | FloatBinary {
+            Binary { left, right, .. } | Divide { left, right, .. } | CheckedShift {
                 left,
                 right,
                 ..,
-            } | FloatCompare { left, right, .. } => Vec::from_array([left, right]),
-            BinaryImmediate { left, .. } => Vec::from_array([left]),
+            } | Compare { left, right, .. } | FloatBinary { left, right, .. } | FloatCompare {
+                left,
+                right,
+                ..,
+            } => Vec::from_array([left, right]),
+            BinaryImmediate { left, .. } | BinaryStack { left, .. } | FloatBinaryStack { left, .. } => Vec::from_array(
+                [left],
+            ),
             Lea { value, .. } | Convert { value, .. } | StackStore { value, .. } => Vec::from_array(
                 [value],
             ),

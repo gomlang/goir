@@ -1,0 +1,185 @@
+package cli;
+
+use ecosystem::goir as ir;
+use module::amd64;
+use module::filetest;
+use module::fuzz;
+use module::opt;
+use module::reader;
+use std::bytes;
+use std::crypto::hash;
+
+pub struct Artifact {
+    pub name: string,
+    pub contents: string,
+}
+
+pub struct Output {
+    pub text: string,
+    pub artifacts: Vec[Artifact],
+}
+
+pub fn read_program(source: string) -> Result[ir::Module, ir::Error] {
+    if source.trim().starts_with("module") {
+        return reader::read_module(source)
+    }
+    let function = reader::read(source)?;
+    let builder = ir::ModuleBuilder::new();
+    let target = builder.declare(function.name(), function.signature())?;
+    builder.define(target, function)?;
+    builder.finish()
+}
+
+fn optimize_module(source: ir::Module) -> Result[ir::Module, ir::Error] {
+    let mut module = source;
+    for target in module.references() {
+        if let Some(function) = module.function(target)? {
+            module = module.with_function(target, opt::simplify(function)?)?;
+        }
+    }
+    Result::Ok(module)
+}
+
+pub fn entry(module: ir::Module, name: string) -> Result[ir::FuncRef, ir::Error] {
+    let definitions = module.functions();
+    for target in module.references() {
+        if !target.is_imported()
+            && (target.name() == name || (name == "" && definitions.len() == 1)) {
+            return Result::Ok(target)
+        }
+    }
+    Result::Err(invalid("select a defined function with --entry NAME"))
+}
+
+pub fn execute(request: Request, source: string) -> Result[Output, ir::Error] {
+    let artifacts = Vec::new();
+    if request.command == Command::Help {
+        return Result::Ok(Output { text: help(), artifacts })
+    }
+    request.target.validate_options(request.options)?;
+    if request.command == Command::Fuzz {
+        let case = fuzz::generate(request.seed)?;
+        artifacts.push(
+            Artifact { name: "module.goir", contents: reader::display_module(case.module)? },
+        );
+        artifacts.push(Artifact { name: "case.txt", contents: fuzz::manifest(case) });
+        return Result::Ok(
+            Output { text: f"seed {request.seed}: " + case.entry.name() + "\n", artifacts },
+        )
+    }
+    if request.command == Command::Snapshot {
+        let stages = Vec::from_array(
+            [
+                (filetest::Stage::Verify, "verify.goir"),
+                (filetest::Stage::Optimize, "optimize.goir"),
+                (filetest::Stage::Lower, "lower.txt"),
+                (filetest::Stage::Allocate, "allocate.txt"),
+                (filetest::Stage::Compile, "compile.s"),
+                (filetest::Stage::Run, "run.txt"),
+            ],
+        );
+        for (stage, name) in stages {
+            let result = execute(
+                Request {
+                    command: if stage == filetest::Stage::Run {
+                        Command::Run
+                    } else {
+                        Command::Dump
+                    },
+                    stage,
+                    ..request,
+                },
+                source,
+            )?;
+            artifacts.push(Artifact { name, contents: result.text });
+        }
+        return Result::Ok(Output { text: "generated six phase snapshots\n", artifacts })
+    }
+    let original = read_program(source)?;
+    ir::verify_module(original)?;
+    if request.command == Command::Check {
+        return Result::Ok(
+            Output { text: f"verified {original.functions().len()} functions\n", artifacts },
+        )
+    }
+    let mut module = original;
+    if request.command == Command::Dump && request.stage == filetest::Stage::Verify {
+        return Result::Ok(Output { text: reader::display_module(module)?, artifacts })
+    }
+    if request.command == Command::Bench {
+        return benchmark(request, module)
+    }
+    if request.optimize
+        || (request.command == Command::Dump && request.stage == filetest::Stage::Optimize) {
+        module = optimize_module(module)?;
+    }
+    if request.command == Command::Run {
+        let values = ir::interpret_module(
+            module,
+            entry(module, request.entry)?,
+            request.arguments,
+            request.fuel,
+        )?;
+        let texts = Vec::new();
+        for value in values {
+            texts.push(datum_text(value));
+        }
+        return Result::Ok(Output { text: texts.join("\n") + "\n", artifacts })
+    }
+    if request.command == Command::Dump {
+        let text = match request.stage {
+            Verify | Optimize => reader::display_module(module)?,
+            Lower | Allocate => {
+                let texts = Vec::new();
+                for function in module.functions() {
+                    texts.push(
+                        filetest::machine_stage(
+                            function,
+                            request.stage,
+                            request.options,
+                            request.algorithm,
+                        )?,
+                    );
+                }
+                texts.join("\n")
+            },
+            Compile => amd64::emit_module_for_target_with_algorithm(
+                request.package_name,
+                module,
+                request.target,
+                request.options,
+                request.algorithm,
+            )?.assembly,
+            Run => return Result::Err(invalid("run is a separate command")),
+        };
+        return Result::Ok(Output { text, artifacts })
+    }
+    let output = amd64::emit_module_for_target_with_algorithm(
+        request.package_name,
+        module,
+        request.target,
+        request.options,
+        request.algorithm,
+    )?;
+    artifacts.push(Artifact { name: "generated.go", contents: output.declarations });
+    artifacts.push(Artifact { name: "generated_amd64.s", contents: output.assembly });
+    artifacts.push(Artifact { name: "module.goir", contents: reader::display_module(module)? });
+    let imports = Vec::new();
+    for target in module.references() {
+        if target.is_imported() {
+            imports.push(target.name());
+        }
+    }
+    artifacts.push(
+        Artifact {
+            name: "target.txt",
+            contents: "target=linux-amd64-go1.26-abi0\nalgorithm=" + request.algorithm.debug()
+                + f"\nregisters={request.options.registers}\noptimize={request.optimize}\nimports="
+                + imports.join(",")
+                + "\ninput_sha256="
+                + hash::sha256(bytes::Bytes::from_string(source))
+                + "\n",
+        },
+    );
+    Result::Ok(Output { text: "generated Go package " + request.package_name + "\n", artifacts })
+}

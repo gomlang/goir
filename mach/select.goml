@@ -1,0 +1,131 @@
+package mach;
+
+use ecosystem::goir as ir;
+
+fn commutative(op: ir::BinaryOp) -> bool {
+    match op {
+        Add | Mul | And | Or | Xor => true,
+        _ => false,
+    }
+}
+
+enum BinarySelection {
+    Divide,
+    CheckedShift,
+    Registers,
+    Immediate(Reg, i64),
+    Lea(Reg, isize),
+}
+
+fn match_binary(
+    op: ir::BinaryOp,
+    left: Reg,
+    right: Reg,
+    constants: Vec[Option[ir::Operation]],
+    ty: ir::Type,
+) -> BinarySelection {
+    if op.is_division() {
+        return BinarySelection::Divide
+    }
+    if op.is_checked_shift() {
+        return BinarySelection::CheckedShift
+    }
+    let mut input = left;
+    let mut constant = integer_constant(constants[right.slot]);
+    if constant == Option::None && commutative(op) {
+        constant = integer_constant(constants[left.slot]);
+        input = right;
+    }
+    if let Some(value) = constant {
+        if op == ir::BinaryOp::Mul && (value == 3 || value == 5 || value == 9) {
+            return BinarySelection::Lea(input, (value - 1).to_isize())
+        }
+        let immediate = match op {
+            Shl | ShrU | ShrS => value
+                & if ty == ir::Type::I32 {
+                    31
+                } else {
+                    63
+                },
+            _ => value,
+        };
+        if immediate >= -2147483648 && immediate <= 2147483647 {
+            return BinarySelection::Immediate(input, immediate)
+        }
+    }
+    BinarySelection::Registers
+}
+
+fn lower_binary(
+    dst: Reg,
+    op: ir::BinaryOp,
+    left: Reg,
+    right: Reg,
+    constants: Vec[Option[ir::Operation]],
+    ty: ir::Type,
+) -> Instruction {
+    match match_binary(op, left, right, constants, ty) {
+        Divide => Instruction::Divide { dst, op, left, right },
+        CheckedShift => Instruction::CheckedShift { dst, op, left, right },
+        Registers => Instruction::Binary { dst, op, left, right },
+        Immediate(input, value) => Instruction::BinaryImmediate { dst, op, left: input, value },
+        Lea(input, scale) => Instruction::Lea { dst, value: input, scale },
+    }
+}
+
+fn stack_binary_legal(op: ir::BinaryOp) -> bool {
+    match op {
+        Add | Sub | Mul | And | Or | Xor => true,
+        _ => false,
+    }
+}
+
+fn match_private_stack_load(previous: Instruction, instruction: Instruction, uses: Vec[isize]) -> Option[
+    Instruction,
+] {
+    if let Instruction::StackLoad { dst: loaded, slot } = previous {
+        if uses[loaded.slot] == 1 {
+            match instruction {
+                Binary { dst, op, left, right } => {
+                    if stack_binary_legal(op) && right == loaded {
+                        return Option::Some(Instruction::BinaryStack { dst, op, left, slot })
+                    }
+                    if stack_binary_legal(op) && commutative(op) && left == loaded {
+                        return Option::Some(Instruction::BinaryStack { dst, op, left: right, slot })
+                    }
+                },
+                FloatBinary { dst, op, left, right } => {
+                    if right == loaded {
+                        return Option::Some(Instruction::FloatBinaryStack { dst, op, left, slot })
+                    }
+                },
+                _ => (),
+            }
+        }
+    }
+    Option::None
+}
+
+fn fold_private_stack_loads(block: Block, uses: Vec[isize]) -> Block {
+    let output = Vec::new();
+    for instruction in block.instructions {
+        let matched = if output.is_empty() {
+            Option::None
+        } else {
+            match_private_stack_load(output[output.len() - 1], instruction, uses)
+        };
+        match matched {
+            Some(selected) => {
+                let _ = output.pop();
+                output.push(selected);
+            },
+            None => output.push(instruction),
+        }
+    }
+    Block {
+        index: block.index,
+        parameters: block.parameters,
+        instructions: output,
+        terminator: block.terminator,
+    }
+}

@@ -28,9 +28,11 @@ fn binary_opcode(op: ir::BinaryOp) -> string {
         And => "ANDQ",
         Or => "ORQ",
         Xor => "XORQ",
-        Shl => "SHLQ",
-        ShrU => "SHRQ",
-        ShrS => "SARQ",
+        Shl | ShlChecked => "SHLQ",
+        ShrU | ShrUChecked => "SHRQ",
+        ShrS | ShrSChecked => "SARQ",
+        DivS | RemS => "IDIVQ",
+        DivU | RemU => "DIVQ",
     }
 }
 
@@ -51,6 +53,7 @@ fn instruction(
     base: isize,
     function: ir::Function,
     locals: isize,
+    serial: Ref[isize],
 ) -> Result[(), ir::Error] {
     match value.operation {
         Constant(datum) => {
@@ -60,7 +63,19 @@ fn instruction(
         Binary(op, left, right) => {
             load(lines, left, "AX", base);
             load(lines, right, "CX", base);
-            lines.push("    " + typed_binary_opcode(op, function.value_type(left)?) + " CX, AX");
+            let ty = function.value_type(left)?;
+            if op.is_division() {
+                emit_division(lines, op, ty, serial);
+                if op == ir::BinaryOp::RemS || op == ir::BinaryOp::RemU {
+                    lines.push("    MOVQ DX, AX");
+                }
+            } else {
+                if op.is_checked_shift() {
+                    emit_checked_shift(lines, op, ty, "AX", function.name(), serial);
+                } else {
+                    lines.push("    " + typed_binary_opcode(op, ty) + " CX, AX");
+                }
+            }
         },
         Compare(cc, left, right) => {
             load(lines, left, "AX", base);
@@ -155,7 +170,7 @@ pub fn emit_stack(function: ir::Function) -> Result[Compiled, ir::Error] {
 
 fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled, ir::Error] {
     ir::verify(function)?;
-    let declaration = abi::declaration(function)?;
+    let declaration = scalar_declaration(function)?;
     let plan = abi::amd64_abi0(function)?;
     let blocks = function.blocks();
     let mut temporary_slots = 0;
@@ -191,11 +206,12 @@ fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled,
         lines.push(f"    {opcode} p{index}+{offset}(FP), AX");
         save(lines, blocks[0].parameters[index], "AX", base);
     }
+    let serial = Ref::new(0);
     for block in blocks {
         let index = block.id.index();
         lines.push(f"block{index}:");
         for value in block.instructions {
-            instruction(lines, value, base, function, locals)?;
+            instruction(lines, value, base, function, locals, serial)?;
         }
         let term = block.terminator.ok_or(
             ir::error(ir::ErrorKind::ControlFlow, "missing terminator"),
@@ -301,9 +317,11 @@ fn typed_binary_opcode(op: ir::BinaryOp, ty: ir::Type) -> string {
         And => "ANDL",
         Or => "ORL",
         Xor => "XORL",
-        Shl => "SHLL",
-        ShrU => "SHRL",
-        ShrS => "SARL",
+        Shl | ShlChecked => "SHLL",
+        ShrU | ShrUChecked => "SHRL",
+        ShrS | ShrSChecked => "SARL",
+        DivS | RemS => "IDIVL",
+        DivU | RemU => "DIVL",
     }
 }
 
@@ -371,4 +389,88 @@ fn initialize_slots(lines: Vec[string], function: ir::Function, base: isize) -> 
         let offset = base + slot.index() * 8;
         lines.push(f"    MOVQ $0, {offset}(SP)");
     }
+}
+
+fn scalar_declaration(function: ir::Function) -> Result[string, ir::Error] {
+    let declaration = abi::declaration(function)?;
+    for block in function.blocks() {
+        for instruction in block.instructions {
+            if let ir::Operation::Binary(op, _, _) = instruction.operation {
+                if op.is_checked_shift() {
+                    return Result::Ok(
+                        declaration + "func goirPanicNegativeShift_" + function.name()
+                            + "() { panic(\"negative shift amount\") }\n",
+                    )
+                }
+            }
+        }
+    }
+    Result::Ok(declaration)
+}
+
+fn emit_division(lines: Vec[string], op: ir::BinaryOp, ty: ir::Type, serial: Ref[isize]) -> () {
+    let label = serial.get();
+    serial.set(label + 1);
+    let width = if ty == ir::Type::I32 {
+        "L"
+    } else {
+        "Q"
+    };
+    if op == ir::BinaryOp::DivS || op == ir::BinaryOp::RemS {
+        lines.push("    CMP" + width + " CX, $-1");
+        lines.push(f"    JNE divide_normal{label}");
+        lines.push("    NEG" + width + " AX");
+        lines.push("    XOR" + width + " DX, DX");
+        lines.push(f"    JMP divide_done{label}");
+        lines.push(f"divide_normal{label}:");
+        lines.push(
+            if ty == ir::Type::I32 {
+                "    CDQ"
+            } else {
+                "    CQO"
+            },
+        );
+    } else {
+        lines.push("    XOR" + width + " DX, DX");
+    }
+    lines.push("    " + typed_binary_opcode(op, ty) + " CX");
+    lines.push(f"divide_done{label}:");
+}
+
+fn emit_checked_shift(
+    lines: Vec[string],
+    op: ir::BinaryOp,
+    ty: ir::Type,
+    destination: string,
+    name: string,
+    serial: Ref[isize],
+) -> () {
+    let label = serial.get();
+    serial.set(label + 1);
+    let width = if ty == ir::Type::I32 {
+        32
+    } else {
+        64
+    };
+    let suffix = if ty == ir::Type::I32 {
+        "L"
+    } else {
+        "Q"
+    };
+    lines.push("    CMP" + suffix + " CX, $0");
+    lines.push(f"    JLT shift_panic{label}");
+    lines.push("    CMP" + suffix + " CX, $" + width.to_string());
+    lines.push(f"    JLT shift_normal{label}");
+    if op == ir::BinaryOp::ShrSChecked {
+        lines.push("    SAR" + suffix + " $" + (width - 1).to_string() + ", " + destination);
+    } else {
+        lines.push("    MOV" + suffix + " $0, " + destination);
+    }
+    lines.push(f"    JMP shift_done{label}");
+    lines.push(f"shift_normal{label}:");
+    lines.push("    " + typed_binary_opcode(op, ty) + " CX, " + destination);
+    lines.push(f"    JMP shift_done{label}");
+    lines.push(f"shift_panic{label}:");
+    lines.push("    CALL ·goirPanicNegativeShift_" + name + "(SB)");
+    lines.push(f"shift_done{label}:");
 }

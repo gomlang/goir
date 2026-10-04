@@ -7,9 +7,9 @@ fn coalesce_edges(
     function: mach::Function,
     live: Liveness,
     locations: Vec[Location],
+    weights: Vec[isize],
     budget: Ref[isize],
 ) -> Result[(), ir::Error] {
-    let weights = loop_weights(function, budget)?;
     let blocks = function.blocks();
     let order = Vec::new();
     for index in 0..blocks.len() {

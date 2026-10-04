@@ -75,7 +75,7 @@ impl Propagation {
 }
 
 fn evaluate(operation: ir::Operation, state: Propagation) -> Lattice {
-    if operation.has_effects() {
+    if !safe_to_fold(operation, state.constants) {
         return Lattice::Overdefined
     }
     match fold(state.function, operation, state.constants) {

@@ -1,0 +1,138 @@
+package goir;
+
+impl Function {
+    pub fn limits(self: Function) -> Limits {
+        self.limits
+    }
+}
+
+pub struct Reconstruction {
+    source: Function,
+    engine: Builder,
+}
+
+impl Reconstruction {
+    pub fn new(source: VerifiedFunction) -> Result[Reconstruction, Error] {
+        let source = source.function();
+        let mut engine = Builder::with_limits(
+            source.name(),
+            source.parameter_types(),
+            source.result_types(),
+            source.limits,
+        )?;
+        let mut function = engine.function;
+        function.module_identity = source.module_identity;
+        function.slots = copy_vec(source.slots);
+        engine.function = function;
+        Result::Ok(Reconstruction { source, engine })
+    }
+
+    pub fn entry(self: Reconstruction) -> Block {
+        self.engine.entry()
+    }
+
+    pub fn parameters(self: Reconstruction, block: Block) -> Result[Vec[Value], Error] {
+        self.engine.parameters(block)
+    }
+
+    pub fn append_block(self: Reconstruction, types: Vec[Type]) -> Result[Block, Error] {
+        self.engine.append_block(types)
+    }
+
+    pub fn append_parameter(self: Reconstruction, block: Block, ty: Type) -> Result[Value, Error] {
+        self.engine.require_open()?;
+        check_block(self.engine.function, block)?;
+        if block.slot == 0 {
+            return Result::Err(error(ErrorKind::InvalidArgument, "entry parameters are fixed"))
+        }
+        if self.engine.function.body[block.slot].parameters.len()
+            >= self.engine.function.limits.max_block_parameters {
+            return Result::Err(
+                error(ErrorKind::LimitExceeded, "reconstruction parameter limit exceeded"),
+            )
+        }
+        let value = self.reserve_value(block, ty)?;
+        self.engine.function.body[block.slot].parameters.push(value);
+        Result::Ok(value)
+    }
+
+    pub fn reserve_value(self: Reconstruction, block: Block, ty: Type) -> Result[Value, Error] {
+        self.engine.require_open()?;
+        check_block(self.engine.function, block)?;
+        let function = self.engine.function;
+        if function.values.len() >= function.limits.max_values {
+            return Result::Err(
+                error(ErrorKind::LimitExceeded, "reconstruction value limit exceeded"),
+            )
+        }
+        let value = Value { slot: function.values.len(), owner: function.identity };
+        function.values.push(ValueData { ty, block, position: -2 });
+        Result::Ok(value)
+    }
+
+    pub fn remove_stack_slots(self: Reconstruction) -> Result[(), Error] {
+        self.engine.require_open()?;
+        self.engine.function.slots.clear();
+        Result::Ok(())
+    }
+
+    pub fn map_operation(self: Reconstruction, operation: Operation, values: Vec[Option[Value]]) -> Result[
+        Operation,
+        Error,
+    ] {
+        self.engine.require_open()?;
+        if values.len() != self.source.value_count() {
+            return Result::Err(
+                error(ErrorKind::InvalidArgument, "reconstruction mapping has wrong size"),
+            )
+        }
+        rewritten_operation(self.source, self.engine.function.identity, values, operation)
+    }
+
+    pub fn finish(self: Reconstruction, blocks: Vec[BlockData]) -> Result[VerifiedFunction, Error] {
+        self.engine.require_open()?;
+        let function = self.engine.function;
+        if blocks.len() != function.body.len() {
+            return Result::Err(
+                error(ErrorKind::InvalidArgument, "reconstruction must define every block"),
+            )
+        }
+        let body = Vec::new();
+        for index in 0..blocks.len() {
+            let block = blocks[index];
+            check_block(function, block.id)?;
+            if block.id.slot != index || block.parameters != function.body[index].parameters {
+                return Result::Err(
+                    error(ErrorKind::InvalidHandle, "reconstruction block shape differs"),
+                )
+            }
+            if block.instructions.len() > function.limits.max_values {
+                return Result::Err(
+                    error(ErrorKind::LimitExceeded, "reconstruction instruction limit exceeded"),
+                )
+            }
+            for parameter in block.parameters {
+                check_value(function, parameter)?;
+                let mut data = function.values[parameter.slot];
+                data.block = block.id;
+                data.position = -1;
+                function.values[parameter.slot] = data;
+            }
+            for position in 0..block.instructions.len() {
+                for result in block.instructions[position].results {
+                    check_value(function, result)?;
+                    let mut data = function.values[result.slot];
+                    data.block = block.id;
+                    data.position = position;
+                    function.values[result.slot] = data;
+                }
+            }
+            body.push(copy_block(block));
+        }
+        function.body.clear();
+        function.body.extend(body);
+        let output = verified(function)?;
+        self.engine.finished.set(true);
+        Result::Ok(output)
+    }
+}

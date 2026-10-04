@@ -1,0 +1,41 @@
+package main;
+
+use ecosystem::goir::cli;
+use std::env;
+use std::bytes;
+use std::fs;
+use std::io;
+use std::path;
+use std::process;
+
+fn run() -> Result[(), string] {
+    let all = env::args();
+    let arguments = Vec::new();
+    for index in 1..all.len() {
+        arguments.push(all[index]);
+    }
+    let request = cli::parse(arguments).map_err(|error| error.debug())?;
+    let source = if request.command == cli::Command::Help || request.command == cli::Command::Fuzz {
+        ""
+    } else {
+        fs::read_file_structured(request.input).map_err(|error| error.debug())?
+    };
+    let result = cli::execute(request, source).map_err(|error| error.debug())?;
+    if request.output != "" {
+        fs::create_dir_all(request.output).map_err(|error| error.debug())?;
+        for artifact in result.artifacts {
+            fs::write_file_structured(path::join(request.output, artifact.name), artifact.contents).map_err(
+                |error| error.debug(),
+            )?;
+        }
+    }
+    print(result.text);
+    Result::Ok(())
+}
+
+fn main() -> () {
+    if let Err(error) = run() {
+        let _ = io::write_stderr_structured(bytes::Bytes::from_string("goir: " + error + "\n"));
+        process::exit(1);
+    }
+}

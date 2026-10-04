@@ -59,7 +59,8 @@ pub fn go_type(ty: Type) -> string {
 }
 
 pub fn validate_identifier(name: string) -> Result[(), Error] {
-    if name.len() < 1 || name.len() > 128 || name == "_" {
+    if name.len() < 1 || name.len() > 128 || name == "_"
+        || name.starts_with("goirPanicNegativeShift_") {
         return Result::Err(error(ErrorKind::InvalidArgument, "invalid Go identifier"))
     }
     for index in 0..name.len() {

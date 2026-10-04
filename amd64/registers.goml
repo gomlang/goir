@@ -82,6 +82,29 @@ fn allocated_instruction(
                 + ", "
                 + place_at(operands[2].location, base),
         ),
+        Divide { op, dst, .. } => emit_division(lines, op, function.register_type(dst)?, serial),
+        CheckedShift { op, dst, .. } => emit_checked_shift(
+            lines,
+            op,
+            function.register_type(dst)?,
+            place_at(operands[2].location, base),
+            function.source().name(),
+            serial,
+        ),
+        BinaryStack { op, dst, slot, .. } => {
+            let offset = locals + slot.index() * 8;
+            lines.push(
+                "    " + typed_binary_opcode(op, function.register_type(dst)?) + f" {offset}(SP), "
+                    + place_at(operands[1].location, base),
+            );
+        },
+        FloatBinaryStack { op, slot, .. } => {
+            let offset = locals + slot.index() * 8;
+            lines.push(
+                "    " + float_opcode(op) + f" {offset}(SP), "
+                    + place_at(operands[1].location, base),
+            );
+        },
         BinaryImmediate { op, dst, value, .. } => lines.push(
             "    " + typed_binary_opcode(op, function.register_type(dst)?) + " $"
                 + value.to_string()
@@ -213,6 +236,14 @@ pub fn emit_with_options(function: ir::Function, options: regalloc::Options) -> 
     Compiled,
     ir::Error,
 ] {
+    emit_with_algorithm(function, options, regalloc::Algorithm::Global)
+}
+
+pub fn emit_with_algorithm(
+    function: ir::Function,
+    options: regalloc::Options,
+    algorithm: regalloc::Algorithm,
+) -> Result[Compiled, ir::Error] {
     if options.registers > 7 {
         return Result::Err(
             ir::error(
@@ -221,7 +252,10 @@ pub fn emit_with_options(function: ir::Function, options: regalloc::Options) -> 
             ),
         )
     }
-    emit_allocated_function(regalloc::allocate_with_options(mach::lower(function)?, options)?, true)
+    emit_allocated_function(
+        regalloc::allocate_with_algorithm(mach::lower(function)?, options, algorithm)?,
+        true,
+    )
 }
 
 pub fn emit_allocation(allocation: regalloc::Allocation) -> Result[Compiled, ir::Error] {
@@ -250,7 +284,7 @@ fn emit_allocated_lines(allocation: regalloc::Allocation, header: bool, lines: V
         )
     }
     let function = allocation.function().source();
-    let declaration = abi::declaration(function)?;
+    let declaration = scalar_declaration(function)?;
     let plan = abi::amd64_abi0(function)?;
     let base = outgoing_bytes(function)?;
     let stack_slots = base / 8 + allocation.stack_slots() + function.stack_slots().len();
@@ -349,6 +383,15 @@ pub fn emit_package_with_options(
     functions: Vec[ir::Function],
     options: regalloc::Options,
 ) -> Result[Package, ir::Error] {
+    emit_package_with_algorithm(name, functions, options, regalloc::Algorithm::Global)
+}
+
+pub fn emit_package_with_algorithm(
+    name: string,
+    functions: Vec[ir::Function],
+    options: regalloc::Options,
+    algorithm: regalloc::Algorithm,
+) -> Result[Package, ir::Error] {
     abi::validate_identifier(name)?;
     if functions.is_empty() || functions.len() > 256 {
         return Result::Err(
@@ -374,7 +417,7 @@ pub fn emit_package_with_options(
         }
         symbols.push(function.name());
         let compiled = emit_allocated_function(
-            regalloc::allocate_with_options(mach::lower(function)?, options)?,
+            regalloc::allocate_with_algorithm(mach::lower(function)?, options, algorithm)?,
             false,
         )?;
         assembly.push(compiled.assembly);
@@ -391,6 +434,15 @@ pub fn emit_module_with_options(name: string, module: ir::Module, options: regal
     Package,
     ir::Error,
 ] {
+    emit_module_with_algorithm(name, module, options, regalloc::Algorithm::Global)
+}
+
+pub fn emit_module_with_algorithm(
+    name: string,
+    module: ir::Module,
+    options: regalloc::Options,
+    algorithm: regalloc::Algorithm,
+) -> Result[Package, ir::Error] {
     ir::verify_module(module)?;
     for target in module.references() {
         abi::validate_identifier(target.name())?;
@@ -405,5 +457,5 @@ pub fn emit_module_with_options(name: string, module: ir::Module, options: regal
             )
         }
     }
-    emit_package_with_options(name, module.functions(), options)
+    emit_package_with_algorithm(name, module.functions(), options, algorithm)
 }

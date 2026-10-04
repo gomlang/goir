@@ -4,21 +4,6 @@ fn encode(value: Datum) -> i64 {
     value.bits()
 }
 
-fn binary_value(op: BinaryOp, left: i64, right: i64) -> i64 {
-    let shift = (right.to_u64() & 63).to_isize();
-    match op {
-        Add => (left.to_u64() + right.to_u64()).to_i64(),
-        Sub => (left.to_u64() - right.to_u64()).to_i64(),
-        Mul => (left.to_u64() * right.to_u64()).to_i64(),
-        And => left & right,
-        Or => left | right,
-        Xor => left ^ right,
-        Shl => (left.to_u64() << shift).to_i64(),
-        ShrU => (left.to_u64() >> shift).to_i64(),
-        ShrS => left >> shift,
-    }
-}
-
 fn compare_value(cc: IntCC, left: i64, right: i64) -> bool {
     match cc {
         Equal => left == right,
@@ -36,11 +21,11 @@ fn evaluate(function: Function, operation: Operation, values: Vec[i64], slots: V
 ] {
     let value = match operation {
         Constant(value) => encode(value),
-        Binary(op, left, right) => if function.values[left.slot].ty == Type::I32 {
-            binary_i32(op, values[left.slot], values[right.slot])
-        } else {
-            binary_value(op, values[left.slot], values[right.slot])
-        },
+        Binary(op, left, right) => evaluate_binary(
+            op,
+            datum_from_bits(function.values[left.slot].ty, values[left.slot]),
+            datum_from_bits(function.values[right.slot].ty, values[right.slot]),
+        )?.bits(),
         Compare(cc, left, right) => if (if function.values[left.slot].ty == Type::I32 {
             compare_i32(cc, values[left.slot], values[right.slot])
         } else {

@@ -1,0 +1,7 @@
+package goir;
+
+impl Function {
+    pub fn same_identity(self: Function, other: Function) -> bool {
+        ptr_eq(self.identity, other.identity)
+    }
+}

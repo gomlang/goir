@@ -209,6 +209,21 @@ impl Builder {
         self.ins(Operation::Constant(Datum::Bool(value)))
     }
 
+    pub fn checked_shift(self: Builder, op: BinaryOp, left: Value, right: Value) -> Result[
+        Value,
+        Error,
+    ] {
+        let checked = match op {
+            Shl | ShlChecked => BinaryOp::ShlChecked,
+            ShrU | ShrUChecked => BinaryOp::ShrUChecked,
+            ShrS | ShrSChecked => BinaryOp::ShrSChecked,
+            _ => return Result::Err(
+                error(ErrorKind::InvalidArgument, "checked_shift requires a shift operation"),
+            ),
+        };
+        self.binary(checked, left, right)
+    }
+
     pub fn binary(self: Builder, op: BinaryOp, left: Value, right: Value) -> Result[Value, Error] {
         self.ins(Operation::Binary(op, left, right))
     }

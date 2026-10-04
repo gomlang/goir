@@ -1,0 +1,438 @@
+package opt;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::analysis;
+
+struct SlotLiveness {
+    incoming: Vec[Vec[bool]],
+    outgoing: Vec[Vec[bool]],
+}
+
+fn boolean_rows(rows: isize, columns: isize, budget: Ref[isize]) -> Result[
+    Vec[Vec[bool]],
+    ir::Error,
+] {
+    let output = Vec::new();
+    for _ in 0..rows {
+        let row = Vec::new();
+        for _ in 0..columns {
+            spend(budget)?;
+            row.push(false);
+        }
+        output.push(row);
+    }
+    Result::Ok(output)
+}
+
+fn slot_liveness(blocks: Vec[ir::BlockData], slots: isize, budget: Ref[isize]) -> Result[
+    SlotLiveness,
+    ir::Error,
+] {
+    let initial = boolean_rows(blocks.len(), slots, budget)?;
+    let writes = boolean_rows(blocks.len(), slots, budget)?;
+    for block in blocks {
+        for instruction in block.instructions {
+            spend(budget)?;
+            match instruction.operation {
+                StackLoad(slot) => if !writes[block.id.index()][slot.index()] {
+                    initial[block.id.index()][slot.index()] = true;
+                },
+                StackStore(slot, _) => {
+                    writes[block.id.index()][slot.index()] = true;
+                },
+                _ => (),
+            }
+        }
+    }
+    let incoming = boolean_rows(blocks.len(), slots, budget)?;
+    let outgoing = boolean_rows(blocks.len(), slots, budget)?;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in blocks {
+            let edges = ir::successors(terminator(block)?);
+            for slot in 0..slots {
+                spend(budget)?;
+                let mut live = false;
+                for edge in edges {
+                    spend(budget)?;
+                    live = live || incoming[edge.target.index()][slot];
+                }
+                outgoing[block.id.index()][slot] = live;
+                let next = initial[block.id.index()][slot]
+                    || (live && !writes[block.id.index()][slot]);
+                if incoming[block.id.index()][slot] != next {
+                    incoming[block.id.index()][slot] = next;
+                    changed = true;
+                }
+            }
+        }
+    }
+    Result::Ok(SlotLiveness { incoming, outgoing })
+}
+
+fn zero_datum(ty: ir::Type) -> ir::Datum {
+    match ty {
+        I64 => ir::Datum::I64(0),
+        I32 => ir::Datum::I32(0),
+        F64 => ir::Datum::F64(0.0),
+        Bool => ir::Datum::Bool(false),
+    }
+}
+
+fn mapped_value(values: Vec[Option[ir::Value]], value: ir::Value) -> Result[ir::Value, ir::Error] {
+    values[value.index()].ok_or(
+        ir::error(ir::ErrorKind::InvalidHandle, "missing reconstruction value mapping"),
+    )
+}
+
+fn rebuilt_operation(
+    reconstruction: ir::Reconstruction,
+    operation: ir::Operation,
+    values: Vec[Option[ir::Value]],
+    budget: Ref[isize],
+) -> Result[ir::Operation, ir::Error] {
+    for _ in ir::operands(operation) {
+        spend(budget)?;
+    }
+    reconstruction.map_operation(operation, values)
+}
+
+fn mapped_values(values: Vec[Option[ir::Value]], input: Vec[ir::Value], budget: Ref[isize]) -> Result[
+    Vec[ir::Value],
+    ir::Error,
+] {
+    let output = Vec::new();
+    for value in input {
+        spend(budget)?;
+        output.push(mapped_value(values, value)?);
+    }
+    Result::Ok(output)
+}
+
+fn memory_edge(
+    edge: ir::Edge,
+    blocks: Vec[ir::Block],
+    values: Vec[Option[ir::Value]],
+    current: Vec[Option[ir::Value]],
+    live: SlotLiveness,
+    budget: Ref[isize],
+) -> Result[ir::Edge, ir::Error] {
+    let arguments = mapped_values(values, edge.arguments, budget)?;
+    for slot in 0..current.len() {
+        spend(budget)?;
+        if live.incoming[edge.target.index()][slot] {
+            arguments.push(
+                current[slot].ok_or(
+                    ir::error(ir::ErrorKind::InvalidState, "missing promoted slot definition"),
+                )?,
+            );
+        }
+    }
+    Result::Ok(ir::Edge { target: blocks[edge.target.index()], arguments })
+}
+
+fn promotion_fits(function: ir::Function, live: SlotLiveness, budget: Ref[isize]) -> Result[
+    bool,
+    ir::Error,
+] {
+    let limits = function.limits();
+    let mut count = 0;
+    for block in function.blocks() {
+        let mut parameters = block.parameters.len();
+        let mut instructions = 0;
+        count += parameters;
+        for slot in 0..function.stack_slots().len() {
+            spend(budget)?;
+            if live.incoming[block.id.index()][slot] {
+                count += 1;
+                if block.id.index() == 0 {
+                    instructions += 1;
+                } else {
+                    parameters += 1;
+                }
+            }
+        }
+        if parameters > limits.max_block_parameters {
+            return Result::Ok(false)
+        }
+        for instruction in block.instructions {
+            spend(budget)?;
+            match instruction.operation {
+                StackLoad(_) | StackStore(_, _) => (),
+                _ => {
+                    count += instruction.results.len();
+                    instructions += 1;
+                },
+            }
+        }
+        if instructions > limits.max_values {
+            return Result::Ok(false)
+        }
+    }
+    Result::Ok(count <= limits.max_values)
+}
+
+fn promote_slots(checked: ir::VerifiedFunction, budget: Ref[isize]) -> Result[
+    ir::VerifiedFunction,
+    ir::Error,
+] {
+    let function = checked.function();
+    let slots = function.stack_slots();
+    if slots.is_empty() {
+        return Result::Ok(checked)
+    }
+    let source = function.blocks();
+    let live = slot_liveness(source, slots.len(), budget)?;
+    if !promotion_fits(function, live, budget)? {
+        return local_memory(checked, budget)
+    }
+    let graph = analysis::analyze_verified(checked, budget)?.graph();
+    let reconstruction = ir::Reconstruction::new(checked)?;
+    reconstruction.remove_stack_slots()?;
+    let blocks = Vec::from_array([reconstruction.entry()]);
+    for index in 1..source.len() {
+        let types = Vec::new();
+        for parameter in source[index].parameters {
+            spend(budget)?;
+            types.push(function.value_type(parameter)?);
+        }
+        blocks.push(reconstruction.append_block(types)?);
+    }
+    let values = Vec::new();
+    for _ in 0..function.value_count() {
+        spend(budget)?;
+        values.push(Option::None);
+    }
+    let incoming: Vec[Vec[Option[ir::Value]]] = Vec::new();
+    let output: Vec[ir::BlockData] = Vec::new();
+    for block in source {
+        let index = block.id.index();
+        let parameters = reconstruction.parameters(blocks[index])?;
+        for p in 0..block.parameters.len() {
+            spend(budget)?;
+            values[block.parameters[p].index()] = Option::Some(parameters[p]);
+        }
+        let state = Vec::new();
+        let instructions = Vec::new();
+        for slot in slots {
+            spend(budget)?;
+            let value = if live.incoming[index][slot.index()] {
+                let ty = function.stack_slot_type(slot)?;
+                if index == 0 {
+                    let value = reconstruction.reserve_value(blocks[index], ty)?;
+                    instructions.push(
+                        ir::Instruction {
+                            results: Vec::from_array([value]),
+                            operation: ir::Operation::Constant(zero_datum(ty)),
+                        },
+                    );
+                    Option::Some(value)
+                } else {
+                    Option::Some(reconstruction.append_parameter(blocks[index], ty)?)
+                }
+            } else {
+                Option::None
+            };
+            state.push(value);
+        }
+        incoming.push(state);
+        output.push(
+            ir::BlockData {
+                id: blocks[index],
+                parameters: reconstruction.parameters(blocks[index])?,
+                instructions,
+                terminator: Option::None,
+            },
+        );
+        for instruction in block.instructions {
+            spend(budget)?;
+            match instruction.operation {
+                StackLoad(_) | StackStore(_, _) => (),
+                _ => for result in instruction.results {
+                    values[result.index()] = Option::Some(
+                        reconstruction.reserve_value(blocks[index], function.value_type(result)?)?,
+                    );
+                },
+            }
+        }
+    }
+    let outgoing: Vec[Vec[Option[ir::Value]]] = Vec::new();
+    for _ in source {
+        outgoing.push(Vec::new());
+    }
+    let order = graph.reverse_postorder();
+    let depths = Vec::new();
+    for index in 0..source.len() {
+        let mut depth = 0;
+        for candidate in 0..source.len() {
+            spend(budget)?;
+            if graph.dominates(candidate, index)? {
+                depth += 1;
+            }
+        }
+        depths.push(depth);
+    }
+    order.sort_by(|left, right| depths[left] - depths[right]);
+    for index in order {
+        let state = incoming[index];
+        for instruction in source[index].instructions {
+            spend(budget)?;
+            match instruction.operation {
+                StackLoad(slot) => {
+                    values[instruction.results[0].index()] = Option::Some(
+                        state[slot.index()].ok_or(
+                            ir::error(ir::ErrorKind::InvalidState, "uninitialized promoted slot"),
+                        )?,
+                    );
+                },
+                StackStore(slot, value) => {
+                    state[slot.index()] = Option::Some(mapped_value(values, value)?);
+                },
+                _ => output[index].instructions.push(
+                    ir::Instruction {
+                        results: mapped_values(values, instruction.results, budget)?,
+                        operation: rebuilt_operation(
+                            reconstruction,
+                            instruction.operation,
+                            values,
+                            budget,
+                        )?,
+                    },
+                ),
+            }
+        }
+        outgoing[index] = state;
+    }
+    for index in 0..source.len() {
+        spend(budget)?;
+        let term = match terminator(source[index])? {
+            Jump(edge) => ir::Terminator::Jump(
+                memory_edge(edge, blocks, values, outgoing[index], live, budget)?,
+            ),
+            Branch(condition, yes, no) => ir::Terminator::Branch(
+                mapped_value(values, condition)?,
+                memory_edge(yes, blocks, values, outgoing[index], live, budget)?,
+                memory_edge(no, blocks, values, outgoing[index], live, budget)?,
+            ),
+            Return(results) => ir::Terminator::Return(mapped_values(values, results, budget)?),
+        };
+        let mut block = output[index];
+        block.terminator = Option::Some(term);
+        output[index] = block;
+    }
+    match reconstruction.finish(output) {
+        Ok(output) => Result::Ok(output),
+        Err(failure) => if failure.kind == ir::ErrorKind::LimitExceeded {
+            local_memory(checked, budget)
+        } else {
+            Result::Err(failure)
+        },
+    }
+}
+
+fn local_memory(checked: ir::VerifiedFunction, budget: Ref[isize]) -> Result[
+    ir::VerifiedFunction,
+    ir::Error,
+] {
+    let function = checked.function();
+    let blocks = function.blocks();
+    let aliases = Vec::new();
+    let constants = Vec::new();
+    for _ in 0..function.value_count() {
+        spend(budget)?;
+        aliases.push(Option::None);
+        constants.push(Option::None);
+    }
+    for index in 0..blocks.len() {
+        let state: Vec[Option[ir::Value]] = Vec::new();
+        for _ in function.stack_slots() {
+            state.push(Option::None);
+        }
+        let instructions = Vec::new();
+        for instruction in blocks[index].instructions {
+            spend(budget)?;
+            let operation = resolve_operation(instruction.operation, aliases, budget)?;
+            match operation {
+                StackLoad(slot) => match state[slot.index()] {
+                    Option::Some(value) => {
+                        aliases[instruction.results[0].index()] = Option::Some(value);
+                    },
+                    Option::None => {
+                        state[slot.index()] = Option::Some(instruction.results[0]);
+                        let operation = if index == 0 {
+                            ir::Operation::Constant(zero_datum(function.stack_slot_type(slot)?))
+                        } else {
+                            operation
+                        };
+                        instructions.push(
+                            ir::Instruction { results: instruction.results, operation },
+                        );
+                    },
+                },
+                StackStore(slot, value) => {
+                    state[slot.index()] = Option::Some(value);
+                    instructions.push(ir::Instruction { results: instruction.results, operation });
+                },
+                _ => instructions.push(ir::Instruction { results: instruction.results, operation }),
+            }
+        }
+        let mut block = blocks[index];
+        block.instructions = instructions;
+        blocks[index] = block;
+    }
+    for index in 0..blocks.len() {
+        let block = blocks[index];
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            spend(budget)?;
+            instructions.push(
+                ir::Instruction {
+                    results: instruction.results,
+                    operation: resolve_operation(instruction.operation, aliases, budget)?,
+                },
+            );
+        }
+        blocks[index] = ir::BlockData {
+            id: block.id,
+            parameters: block.parameters,
+            instructions,
+            terminator: Option::Some(resolve_term(terminator(block)?, aliases, constants, budget)?),
+        };
+    }
+    let remaining = slot_liveness(blocks, function.stack_slots().len(), budget)?;
+    for index in 0..blocks.len() {
+        let needed = remaining.outgoing[index];
+        let source = blocks[index].instructions;
+        let kept = Vec::new();
+        for _ in source {
+            kept.push(true);
+        }
+        let mut position = source.len();
+        while position > 0 {
+            position -= 1;
+            spend(budget)?;
+            match source[position].operation {
+                StackLoad(slot) => {
+                    needed[slot.index()] = true;
+                },
+                StackStore(slot, _) => {
+                    kept[position] = needed[slot.index()];
+                    needed[slot.index()] = false;
+                },
+                _ => (),
+            }
+        }
+        let instructions = Vec::new();
+        for position in 0..source.len() {
+            spend(budget)?;
+            if kept[position] {
+                instructions.push(source[position]);
+            }
+        }
+        let mut block = blocks[index];
+        block.instructions = instructions;
+        blocks[index] = block;
+    }
+    ir::rewrite_verified(checked, blocks)
+}

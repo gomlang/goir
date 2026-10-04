@@ -33,50 +33,6 @@ fn integer_constant(operation: Option[ir::Operation]) -> Option[i64] {
     }
 }
 
-fn commutative(op: ir::BinaryOp) -> bool {
-    match op {
-        Add | Mul | And | Or | Xor => true,
-        _ => false,
-    }
-}
-
-fn lower_binary(
-    dst: Reg,
-    op: ir::BinaryOp,
-    left: Reg,
-    right: Reg,
-    constants: Vec[Option[ir::Operation]],
-    ty: ir::Type,
-) -> Instruction {
-    let mut input = left;
-    let mut constant = integer_constant(constants[right.slot]);
-    if constant == Option::None && commutative(op) {
-        constant = integer_constant(constants[left.slot]);
-        input = right;
-    }
-    match constant {
-        Some(value) => {
-            if op == ir::BinaryOp::Mul && (value == 3 || value == 5 || value == 9) {
-                return Instruction::Lea { dst, value: input, scale: (value - 1).to_isize() }
-            }
-            let immediate = match op {
-                Shl | ShrU | ShrS => value
-                    & if ty == ir::Type::I32 {
-                        31
-                    } else {
-                        63
-                    },
-                _ => value,
-            };
-            if immediate >= -2147483648 && immediate <= 2147483647 {
-                return Instruction::BinaryImmediate { dst, op, left: input, value: immediate }
-            }
-        },
-        None => (),
-    }
-    Instruction::Binary { dst, op, left, right }
-}
-
 pub fn lower(source: ir::Function) -> Result[Function, ir::Error] {
     lower_verified(ir::verified(source)?)
 }
@@ -276,7 +232,11 @@ fn lower_source(source: ir::Function) -> Result[Function, ir::Error] {
         };
         body.push(Block { index: block.id.index(), parameters, instructions, terminator });
     }
-    compact(Function { source_value: source, identity, body, types })
+    let selected = Vec::new();
+    for block in body {
+        selected.push(fold_private_stack_loads(block, uses));
+    }
+    compact(Function { source_value: source, identity, body: selected, types })
 }
 
 fn map_reg(reg: Reg, mapping: Vec[isize]) -> Reg {
@@ -316,6 +276,30 @@ fn map_instruction(instruction: Instruction, mapping: Vec[isize]) -> Instruction
             op,
             left: map_reg(left, mapping),
             right: map_reg(right, mapping),
+        },
+        Divide { dst, op, left, right } => Instruction::Divide {
+            dst: map_reg(dst, mapping),
+            op,
+            left: map_reg(left, mapping),
+            right: map_reg(right, mapping),
+        },
+        CheckedShift { dst, op, left, right } => Instruction::CheckedShift {
+            dst: map_reg(dst, mapping),
+            op,
+            left: map_reg(left, mapping),
+            right: map_reg(right, mapping),
+        },
+        BinaryStack { dst, op, left, slot } => Instruction::BinaryStack {
+            dst: map_reg(dst, mapping),
+            op,
+            left: map_reg(left, mapping),
+            slot,
+        },
+        FloatBinaryStack { dst, op, left, slot } => Instruction::FloatBinaryStack {
+            dst: map_reg(dst, mapping),
+            op,
+            left: map_reg(left, mapping),
+            slot,
         },
         BinaryImmediate { dst, op, left, value } => Instruction::BinaryImmediate {
             dst: map_reg(dst, mapping),

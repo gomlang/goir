@@ -1,0 +1,188 @@
+package fuzz;
+
+use ecosystem::goir as ir;
+
+pub struct Case {
+    pub seed: u64,
+    pub module: ir::Module,
+    pub entry: ir::FuncRef,
+    pub arguments: Vec[ir::Datum],
+    pub fuel: u64,
+}
+
+fn random(state: Ref[u64]) -> u64 {
+    let mut value = state.get();
+    value = value ^ (value << 13);
+    value = value ^ (value >> 7);
+    value = value ^ (value << 17);
+    state.set(value);
+    value
+}
+
+fn constant(builder: ir::Builder, ty: ir::Type, value: i64) -> Result[ir::Value, ir::Error] {
+    if ty == ir::Type::I32 {
+        builder.i32const(value.to_i32())
+    } else {
+        builder.iconst(value)
+    }
+}
+
+fn helper(target: ir::FuncRef, state: Ref[u64], ty: ir::Type) -> Result[ir::Function, ir::Error] {
+    let b = ir::Builder::for_function(target)?;
+    let input = b.parameters(b.entry())?[0];
+    let divisor = constant(b, ty, ((random(state) % 31) + 1).to_i64())?;
+    let shift = constant(b, ty, (random(state) % 80).to_i64())?;
+    let division = Vec::from_array(
+        [ir::BinaryOp::DivS, ir::BinaryOp::DivU, ir::BinaryOp::RemS, ir::BinaryOp::RemU],
+    );
+    let shifts = Vec::from_array(
+        [ir::BinaryOp::ShlChecked, ir::BinaryOp::ShrUChecked, ir::BinaryOp::ShrSChecked],
+    );
+    let quotient = b.binary(division[(random(state) % 4).to_isize()], input, divisor)?;
+    let shifted = b.binary(shifts[(random(state) % 3).to_isize()], input, shift)?;
+    let result = b.binary(ir::BinaryOp::Xor, quotient, shifted)?;
+    b.ret(Vec::from_array([result]))?;
+    b.finish()
+}
+
+pub fn generate(seed: u64) -> Result[Case, ir::Error] {
+    let state = Ref::new(seed ^ 0x9e3779b97f4a7c15);
+    if state.get() == 0 {
+        state.set(0xd1b54a32d192ed03);
+    }
+    let ty = if random(state) & 1 == 0 {
+        ir::Type::I32
+    } else {
+        ir::Type::I64
+    };
+    let module = ir::ModuleBuilder::new();
+    let helper_ref = module.declare(
+        f"Mix{seed}",
+        ir::Signature::new(Vec::from_array([ty]), Vec::from_array([ty]))?,
+    )?;
+    let entry = module.declare(
+        f"Fuzz{seed}",
+        ir::Signature::new(
+            Vec::from_array([ty, ir::Type::I64, ir::Type::F64, ir::Type::Bool]),
+            Vec::from_array([ty, ir::Type::F64]),
+        )?,
+    )?;
+    module.define(helper_ref, helper(helper_ref, state, ty)?)?;
+    let b = ir::Builder::for_function(entry)?;
+    let input = b.parameters(b.entry())?;
+    let integer_slot = b.stack_slot(ty)?;
+    let float_slot = b.stack_slot(ir::Type::F64)?;
+    let unused_slot = b.stack_slot(ty)?;
+    let exit = b.append_block(Vec::new())?;
+    let right = b.append_block(Vec::new())?;
+    let body = b.append_block(Vec::new())?;
+    let header = b.append_block(Vec::from_array([ir::Type::I64]))?;
+    let left = b.append_block(Vec::new())?;
+    let start = b.append_block(Vec::new())?;
+    let zero = b.iconst(0)?;
+    let one = b.iconst(1)?;
+    let mask = b.iconst(15)?;
+    let count = b.binary(ir::BinaryOp::And, input[1], mask)?;
+    let delta = constant(b, ty, random(state).to_i64())?;
+    let float_value = b.fconst(
+        float64_from_bits(
+            if seed % 3 == 0 {
+                0x8000000000000000
+            } else if seed % 3 == 1 {
+                0x7ff8000000000042
+            } else {
+                0x3ff8000000000000
+            },
+        ),
+    )?;
+    b.stack_store(integer_slot, input[0])?;
+    b.stack_store(float_slot, input[2])?;
+    b.stack_store(unused_slot, delta)?;
+    b.branch(
+        input[3],
+        ir::Edge { target: left, arguments: Vec::new() },
+        ir::Edge { target: right, arguments: Vec::new() },
+    )?;
+    b.switch_to(left)?;
+    let value = b.call(helper_ref, Vec::from_array([input[0]]))?[0];
+    b.stack_store(integer_slot, value)?;
+    b.stack_store(float_slot, float_value)?;
+    b.jump(start, Vec::new())?;
+    b.switch_to(right)?;
+    let value = b.binary(ir::BinaryOp::Add, input[0], delta)?;
+    b.stack_store(integer_slot, value)?;
+    b.jump(start, Vec::new())?;
+    b.switch_to(start)?;
+    b.jump(header, Vec::from_array([count]))?;
+    b.switch_to(header)?;
+    let counter = b.parameters(header)?[0];
+    let more = b.icmp(ir::IntCC::SignedLess, zero, counter)?;
+    b.branch(
+        more,
+        ir::Edge { target: body, arguments: Vec::new() },
+        ir::Edge { target: exit, arguments: Vec::new() },
+    )?;
+    b.switch_to(body)?;
+    let previous = b.stack_load(integer_slot)?;
+    let mixed = b.call(helper_ref, Vec::from_array([previous]))?[0];
+    let operations = Vec::from_array(
+        [
+            ir::BinaryOp::Add,
+            ir::BinaryOp::Sub,
+            ir::BinaryOp::Mul,
+            ir::BinaryOp::And,
+            ir::BinaryOp::Or,
+            ir::BinaryOp::Xor,
+            ir::BinaryOp::Shl,
+            ir::BinaryOp::ShrU,
+            ir::BinaryOp::ShrS,
+        ],
+    );
+    let next = b.binary(operations[(random(state) % 9).to_isize()], mixed, delta)?;
+    let flag = b.icmp(ir::IntCC::UnsignedLess, previous, next)?;
+    let selected = b.select(flag, next, previous)?;
+    b.stack_store(integer_slot, selected)?;
+    b.stack_store(unused_slot, previous)?;
+    let current_float = b.stack_load(float_slot)?;
+    let picked = b.select(input[3], current_float, input[2])?;
+    b.stack_store(float_slot, picked)?;
+    let remaining = b.binary(ir::BinaryOp::Sub, counter, one)?;
+    b.jump(header, Vec::from_array([remaining]))?;
+    b.switch_to(exit)?;
+    let result = b.stack_load(integer_slot)?;
+    let float_result = b.stack_load(float_slot)?;
+    b.ret(Vec::from_array([result, float_result]))?;
+    module.define(entry, b.finish()?)?;
+    let bits = random(state).to_i64();
+    let integer = if ty == ir::Type::I32 {
+        ir::Datum::I32(bits.to_i32())
+    } else {
+        ir::Datum::I64(bits)
+    };
+    let arguments = Vec::from_array(
+        [
+            integer,
+            ir::Datum::I64((random(state) % 32).to_i64()),
+            ir::Datum::F64(float64_from_bits(random(state))),
+            ir::Datum::Bool(random(state) & 1 == 0),
+        ],
+    );
+    Result::Ok(Case { seed, module: module.finish()?, entry, arguments, fuel: 100000 })
+}
+
+pub fn manifest(case: Case) -> string {
+    let lines = Vec::from_array(
+        [f"seed={case.seed}", "entry=" + case.entry.name(), f"fuel={case.fuel}"],
+    );
+    for value in case.arguments {
+        lines.push(
+            match value {
+                I64(value) => f"arg=i64:{value}",
+                I32(value) => f"arg=i32:{value}",
+                F64(value) => f"arg=f64bits:{float64_to_bits(value)}",
+                Bool(value) => f"arg=bool:{value}",
+            },
+        );
+    }
+    lines.join("\n") + "\n"
+}

@@ -1,0 +1,245 @@
+package cli;
+
+use ecosystem::goir as ir;
+use module::amd64;
+use module::filetest;
+use module::regalloc;
+use std::num;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    Help,
+    Check,
+    Dump,
+    Snapshot,
+    Compile,
+    Run,
+    Bench,
+    Fuzz,
+}
+
+pub struct Request {
+    pub command: Command,
+    pub input: string,
+    pub output: string,
+    pub package_name: string,
+    pub entry: string,
+    pub arguments: Vec[ir::Datum],
+    pub fuel: u64,
+    pub seed: u64,
+    pub samples: isize,
+    pub optimize: bool,
+    pub stage: filetest::Stage,
+    pub options: regalloc::Options,
+    pub algorithm: regalloc::Algorithm,
+    pub target: amd64::Target,
+}
+
+pub fn help() -> string {
+    "goir check INPUT\ngoir dump INPUT --stage verify|optimize|lower|allocate|compile\ngoir snapshot INPUT --out DIR [--entry NAME] [--arg i64:42]\ngoir compile INPUT --out DIR [--package generated]\ngoir run INPUT [--entry NAME] [--arg i64:42] [--fuel 100000]\ngoir bench INPUT [--samples 15] [--out DIR]\ngoir fuzz SEED --out DIR\nCompilation options: --algorithm global|linear --registers 0..7 --no-opt\nTarget options: --target linux-amd64-go1.26-abi0 --cpu sse2|avx|avx2\nArguments: i64:N, i32:N, bool:true|false, f64:N, f64bits:U64\n"
+}
+
+fn invalid(message: string) -> ir::Error {
+    ir::error(ir::ErrorKind::InvalidArgument, message)
+}
+
+fn prefix(value: string, start: string) -> Option[string] {
+    if value.starts_with(start) {
+        Option::Some(value.byte_slice(start.len(), value.len()))
+    } else {
+        Option::None
+    }
+}
+
+pub fn parse_datum(text: string) -> Result[ir::Datum, ir::Error] {
+    if let Some(value) = prefix(text, "i64:") {
+        return Result::Ok(
+            ir::Datum::I64(
+                num::parse_int_bits(value, 10, 64).map_err(|_| invalid("invalid i64 argument"))?,
+            ),
+        )
+    }
+    if let Some(value) = prefix(text, "i32:") {
+        return Result::Ok(
+            ir::Datum::I32(
+                num::parse_int_bits(value, 10, 32).map_err(|_| invalid("invalid i32 argument"))?.to_i32(),
+            ),
+        )
+    }
+    if let Some(value) = prefix(text, "f64bits:") {
+        return Result::Ok(
+            ir::Datum::F64(
+                float64_from_bits(
+                    num::parse_uint_bits(value, 10, 64).map_err(|_| invalid("invalid float bits"))?,
+                ),
+            ),
+        )
+    }
+    if let Some(value) = prefix(text, "f64:") {
+        return Result::Ok(
+            ir::Datum::F64(
+                num::parse_float64_structured(value).map_err(|_| invalid("invalid f64 argument"))?,
+            ),
+        )
+    }
+    match text {
+        "bool:true" => Result::Ok(ir::Datum::Bool(true)),
+        "bool:false" => Result::Ok(ir::Datum::Bool(false)),
+        _ => Result::Err(invalid("arguments need a supported scalar type prefix")),
+    }
+}
+
+pub fn datum_text(value: ir::Datum) -> string {
+    match value {
+        I64(value) => f"i64:{value}",
+        I32(value) => f"i32:{value}",
+        F64(value) => f"f64bits:{float64_to_bits(value)}",
+        Bool(value) => f"bool:{value}",
+    }
+}
+
+fn integer(text: string, label: string) -> Result[isize, ir::Error] {
+    num::parse_int_structured(text).map_err(|_| invalid("invalid " + label))
+}
+
+pub fn parse(arguments: Vec[string]) -> Result[Request, ir::Error] {
+    let mut request = Request {
+        command: Command::Help,
+        input: "",
+        output: "",
+        package_name: "generated",
+        entry: "",
+        arguments: Vec::new(),
+        fuel: 100000,
+        seed: 0,
+        samples: 15,
+        optimize: true,
+        stage: filetest::Stage::Verify,
+        options: regalloc::Options::standard(),
+        algorithm: regalloc::Algorithm::Global,
+        target: amd64::Target::standard(),
+    };
+    if arguments.is_empty() || arguments == Vec::from_array(["--help"])
+        || arguments == Vec::from_array(["help"]) {
+        return Result::Ok(request)
+    }
+    request.command = match arguments[0] {
+        "check" => Command::Check,
+        "dump" => Command::Dump,
+        "snapshot" => Command::Snapshot,
+        "compile" => Command::Compile,
+        "run" => Command::Run,
+        "bench" => Command::Bench,
+        "fuzz" => Command::Fuzz,
+        _ => return Result::Err(invalid("unknown command: " + arguments[0])),
+    };
+    if arguments.len() < 2 || arguments[1].starts_with("--") {
+        return Result::Err(invalid("command requires an input path or fuzz seed"))
+    }
+    request.input = arguments[1];
+    if request.command == Command::Fuzz {
+        request.seed = num::parse_uint_bits(request.input, 10, 64).map_err(
+            |_| invalid("invalid fuzz seed"),
+        )?;
+    }
+    let mut index = 2;
+    let seen = Vec::new();
+    while index < arguments.len() {
+        let option = arguments[index];
+        if option != "--arg" && seen.contains(option) {
+            return Result::Err(invalid("duplicate option: " + option))
+        }
+        seen.push(option);
+        if option == "--no-opt" {
+            request.optimize = false;
+            index += 1;
+            continue;
+        }
+        if index + 1 >= arguments.len() {
+            return Result::Err(invalid("option requires a value: " + option))
+        }
+        let value = arguments[index + 1];
+        match option {
+            "--out" => {
+                request.output = value;
+            },
+            "--package" => {
+                request.package_name = value;
+            },
+            "--entry" => {
+                request.entry = value;
+            },
+            "--arg" => request.arguments.push(parse_datum(value)?),
+            "--fuel" => {
+                request.fuel = num::parse_uint_bits(value, 10, 64).map_err(
+                    |_| invalid("invalid fuel"),
+                )?;
+            },
+            "--samples" => {
+                request.samples = integer(value, "samples")?;
+            },
+            "--registers" => {
+                request.options = regalloc::Options {
+                    registers: integer(value, "register count")?,
+                    ..request.options,
+                };
+            },
+            "--algorithm" => {
+                request.algorithm = match value {
+                    "global" => regalloc::Algorithm::Global,
+                    "linear" => regalloc::Algorithm::LinearScan,
+                    _ => return Result::Err(invalid("algorithm must be global or linear")),
+                };
+            },
+            "--stage" => {
+                request.stage = match value {
+                    "verify" => filetest::Stage::Verify,
+                    "optimize" => filetest::Stage::Optimize,
+                    "lower" => filetest::Stage::Lower,
+                    "allocate" => filetest::Stage::Allocate,
+                    "compile" => filetest::Stage::Compile,
+                    _ => return Result::Err(invalid("unknown dump stage")),
+                };
+            },
+            "--target" => {
+                if value != "linux-amd64-go1.26-abi0" {
+                    return Result::Err(
+                        ir::error(
+                            ir::ErrorKind::Unsupported,
+                            "unsupported target profile: " + value,
+                        ),
+                    )
+                }
+            },
+            "--cpu" => {
+                request.target = amd64::Target {
+                    cpu_features: match value {
+                        "sse2" => Vec::from_array([amd64::CpuFeature::SSE2]),
+                        "avx" => Vec::from_array([amd64::CpuFeature::SSE2, amd64::CpuFeature::AVX]),
+                        "avx2" => Vec::from_array(
+                            [
+                                amd64::CpuFeature::SSE2,
+                                amd64::CpuFeature::AVX,
+                                amd64::CpuFeature::AVX2,
+                            ],
+                        ),
+                        _ => return Result::Err(invalid("unknown CPU feature profile")),
+                    },
+                    ..request.target,
+                };
+            },
+            _ => return Result::Err(invalid("unknown option: " + option)),
+        }
+        index += 2;
+    }
+    if request.samples < 1 || request.samples > 1000 {
+        return Result::Err(invalid("samples must be in 1..1000"))
+    }
+    if (request.command == Command::Compile || request.command == Command::Fuzz
+        || request.command == Command::Snapshot)
+        && request.output == "" {
+        return Result::Err(invalid("compile and fuzz require --out DIR"))
+    }
+    request.target.validate_options(request.options)?;
+    Result::Ok(request)
+}

@@ -55,6 +55,13 @@ fn binary_name(name: string, line: isize) -> Result[ir::BinaryOp, ir::Error] {
         "ishl" => Result::Ok(ir::BinaryOp::Shl),
         "ushr" => Result::Ok(ir::BinaryOp::ShrU),
         "sshr" => Result::Ok(ir::BinaryOp::ShrS),
+        "sdiv" => Result::Ok(ir::BinaryOp::DivS),
+        "udiv" => Result::Ok(ir::BinaryOp::DivU),
+        "srem" => Result::Ok(ir::BinaryOp::RemS),
+        "urem" => Result::Ok(ir::BinaryOp::RemU),
+        "ishl_checked" => Result::Ok(ir::BinaryOp::ShlChecked),
+        "ushr_checked" => Result::Ok(ir::BinaryOp::ShrUChecked),
+        "sshr_checked" => Result::Ok(ir::BinaryOp::ShrSChecked),
         _ => Result::Err(syntax(line, "unknown operation " + name)),
     }
 }

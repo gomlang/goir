@@ -7,6 +7,7 @@ struct Planner {
     function: mach::Function,
     live: Liveness,
     canonical: Vec[Location],
+    placements: Vec[Vec[Placement]],
     homes: Vec[isize],
     slot_owners: Vec[Vec[mach::Reg]],
     limit: isize,
@@ -426,23 +427,39 @@ fn allocate_plan(
     homes: Vec[isize],
     slot_owners: Vec[Vec[mach::Reg]],
     limit: isize,
+    weights: Vec[isize],
+    placements: Vec[Vec[Placement]],
+    algorithm: Algorithm,
     budget: Ref[isize],
 ) -> Result[Vec[AllocatedBlock], ir::Error] {
-    let planner = Planner {
-        function,
-        live,
-        canonical,
-        homes,
-        slot_owners,
-        limit,
-        budget,
-        pool: pool_size(function, limit)?,
-        constants: constants_for(function),
-        weights: value_weights(function, budget)?,
-    };
+    let constants = constants_for(function);
+    let pool = pool_size(function, limit)?;
     let blocks = Vec::new();
     for block in function.blocks() {
         spend(budget)?;
+        let local = if algorithm == Algorithm::Global {
+            copy_vec(canonical)
+        } else {
+            canonical
+        };
+        if algorithm == Algorithm::Global {
+            for placement in placements[block.index] {
+                local[placement.reg.index()] = placement.location;
+            }
+        }
+        let planner = Planner {
+            function,
+            live,
+            canonical: local,
+            placements,
+            homes,
+            slot_owners,
+            limit,
+            budget,
+            pool,
+            constants,
+            weights,
+        };
         let state = state_for_block(planner, block)?;
         let instructions = Vec::new();
         for position in 0..block.instructions.len() {
@@ -476,7 +493,7 @@ fn allocate_plan(
                 moves.push(
                     Edit {
                         source: current_location(state, reg)?,
-                        destination: canonical[reg.index()],
+                        destination: placement_location(planner.placements[edge.target], reg)?,
                     },
                 );
             }
@@ -484,7 +501,10 @@ fn allocate_plan(
                 moves.push(
                     Edit {
                         source: current_location(state, copy.source)?,
-                        destination: canonical[copy.destination.index()],
+                        destination: placement_location(
+                            planner.placements[edge.target],
+                            copy.destination,
+                        )?,
                     },
                 );
             }

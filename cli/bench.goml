@@ -1,0 +1,102 @@
+package cli;
+
+use ecosystem::goir as ir;
+use module::amd64;
+use module::regalloc;
+
+fn percentile(samples: Vec[i64], percent: isize) -> i64 {
+    samples.sort_by(
+        |left, right| if left < right {
+            -1
+        } else if left > right {
+            1
+        } else {
+            0
+        },
+    );
+    let index = ((samples.len() * percent + 99) / 100) - 1;
+    samples[index]
+}
+
+fn benchmark(request: Request, module: ir::Module) -> Result[Output, ir::Error] {
+    if request.samples < 1 || request.samples > 1000 {
+        return Result::Err(invalid("samples must be in 1..1000"))
+    }
+    let rows = Vec::from_array(
+        [
+            "function\talgorithm\tregisters\tphase\tsamples\tp50_ns\tp95_ns\tframe_bytes\tinstructions\tspill_loads\tspill_stores\tweighted_loads\tweighted_stores\tsplit_values\tevictions\tanalysis_builds\tanalysis_hits\tretained_capacity",
+        ],
+    );
+    let phases = Vec::from_array(
+        [
+            "verify",
+            "optimize",
+            "analysis",
+            "lower",
+            "liveness",
+            "allocate",
+            "checker",
+            "emit",
+            "total",
+        ],
+    );
+    for function in module.functions() {
+        for algorithm in Vec::from_array(
+            [regalloc::Algorithm::LinearScan, regalloc::Algorithm::Global],
+        ) {
+            let context = amd64::CompilerContext::new();
+            let samples = Vec::new();
+            for _ in phases {
+                samples.push(Vec::new());
+            }
+            let mut last = Option::None;
+            for _ in 0..request.samples {
+                let result = context.compile_for_target_with_algorithm(
+                    function,
+                    request.optimize,
+                    request.options,
+                    request.target,
+                    algorithm,
+                )?;
+                let t = result.timings;
+                let values = Vec::from_array(
+                    [
+                        t.verify_ns,
+                        t.optimize_ns,
+                        t.analysis_ns,
+                        t.lowering_ns,
+                        t.liveness_ns,
+                        t.allocation_ns,
+                        t.checker_ns,
+                        t.emission_ns,
+                        t.total_ns,
+                    ],
+                );
+                for index in 0..values.len() {
+                    samples[index].push(values[index]);
+                }
+                last = Option::Some(result);
+            }
+            let result = last.ok_or(invalid("no benchmark samples"))?;
+            let stats = result.allocation.statistics();
+            let metrics = amd64::metrics(result.compiled);
+            let cache = context.analysis_statistics();
+            for index in 0..phases.len() {
+                let p50 = percentile(samples[index], 50);
+                let p95 = percentile(samples[index], 95);
+                rows.push(
+                    function.name() + "\t" + algorithm.debug() + f"\t{request.options.registers}\t"
+                        + phases[index]
+                        + f"\t{request.samples}\t{p50}\t{p95}\t{result.compiled.frame_bytes}\t{metrics.instructions}\t{stats.spill_loads}\t{stats.spill_stores}\t{stats.weighted_spill_loads}\t{stats.weighted_spill_stores}\t{stats.split_values}\t{stats.global_evictions + stats.regional_evictions}\t{cache.builds}\t{cache.cache_hits}\t{context.retained_capacity()}",
+                );
+            }
+        }
+    }
+    let report = (rows.join("\n") + "\n").replace("\t", char_from_u32(9).unwrap_or(' ').to_string());
+    Result::Ok(
+        Output {
+            text: report,
+            artifacts: Vec::from_array([Artifact { name: "pipeline-bench.tsv", contents: report }]),
+        },
+    )
+}

@@ -1,0 +1,391 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::analysis;
+use module::mach;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Algorithm {
+    LinearScan,
+    Global,
+}
+
+pub struct Placement {
+    pub reg: mach::Reg,
+    pub location: Location,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Statistics {
+    pub global_evictions: isize,
+    pub regional_evictions: isize,
+    pub split_values: isize,
+    pub spill_loads: isize,
+    pub spill_stores: isize,
+    pub weighted_spill_loads: isize,
+    pub weighted_spill_stores: isize,
+    pub edge_moves: isize,
+    pub rematerializations: isize,
+}
+
+fn priority_better(left: isize, right: isize, costs: Vec[isize]) -> bool {
+    costs[left] > costs[right] || (costs[left] == costs[right] && left < right)
+}
+
+fn priority_push(heap: Vec[isize], value: isize, costs: Vec[isize], queued: Vec[bool]) -> () {
+    if queued[value] {
+        return
+    }
+    queued[value] = true;
+    heap.push(value);
+    let mut index = heap.len() - 1;
+    while index > 0 {
+        let parent = (index - 1) / 2;
+        if !priority_better(heap[index], heap[parent], costs) {
+            break
+        }
+        let old = heap[parent];
+        heap[parent] = heap[index];
+        heap[index] = old;
+        index = parent;
+    }
+}
+
+fn priority_pop(heap: Vec[isize], costs: Vec[isize], queued: Vec[bool]) -> isize {
+    let value = heap[0];
+    let last = heap[heap.len() - 1];
+    heap.truncate(heap.len() - 1);
+    queued[value] = false;
+    if !heap.is_empty() {
+        heap[0] = last;
+        let mut index = 0;
+        while index * 2 + 1 < heap.len() {
+            let mut child = index * 2 + 1;
+            if child + 1 < heap.len() && priority_better(heap[child + 1], heap[child], costs) {
+                child = child + 1;
+            }
+            if !priority_better(heap[child], heap[index], costs) {
+                break
+            }
+            let old = heap[index];
+            heap[index] = heap[child];
+            heap[child] = old;
+            index = child;
+        }
+    }
+    value
+}
+
+fn reserve_home(
+    live: Liveness,
+    reg: mach::Reg,
+    homes: Vec[isize],
+    owners: Vec[Vec[mach::Reg]],
+    budget: Ref[isize],
+) -> Result[Location, ir::Error] {
+    if homes[reg.index()] >= 0 {
+        return Result::Ok(Location::Stack(homes[reg.index()]))
+    }
+    let mut slot = -1;
+    for index in 0..owners.len() {
+        if lane_available(live, owners[index], reg, budget)? {
+            slot = index;
+            break;
+        }
+    }
+    if slot < 0 {
+        slot = owners.len();
+        owners.push(Vec::new());
+    }
+    homes[reg.index()] = slot;
+    owners[slot].push(reg);
+    Result::Ok(Location::Stack(slot))
+}
+
+fn promotion_conflict(
+    live: Liveness,
+    left: mach::Reg,
+    right: mach::Reg,
+    spans: Vec[Option[Segment]],
+    budget: Ref[isize],
+) -> Result[bool, ir::Error] {
+    spend(budget)?;
+    if spans.is_empty() {
+        return interferes(live, left, right, budget)
+    }
+    match (spans[left.index()], spans[right.index()]) {
+        (Some(a), Some(b)) => Result::Ok(a.start <= b.end && b.start <= a.end),
+        _ => Result::Ok(false),
+    }
+}
+
+fn promote_ranges(
+    function: mach::Function,
+    live: Liveness,
+    registers: Vec[mach::Reg],
+    locations: Vec[Location],
+    costs: Vec[isize],
+    spans: Vec[Option[Segment]],
+    homes: Vec[isize],
+    owners: Vec[Vec[mach::Reg]],
+    limit: isize,
+    budget: Ref[isize],
+) -> Result[isize, ir::Error] {
+    let heap = Vec::new();
+    let queued = Vec::new();
+    for _ in 0..function.register_count() {
+        queued.push(false);
+    }
+    for reg in registers {
+        if let Location::Stack(_) = locations[reg.index()] {
+            priority_push(heap, reg.index(), costs, queued);
+        }
+    }
+    let mut evictions = 0;
+    while !heap.is_empty() {
+        spend(budget)?;
+        let index = priority_pop(heap, costs, queued);
+        let reg = function.register(index)?;
+        if costs[index] <= 0 {
+            continue;
+        }
+        if let Location::Register(_) = locations[index] {
+            continue;
+        }
+        let mut best = -1;
+        let mut lowest = costs[index];
+        let victims = Vec::new();
+        for lane in class_registers(reg.class(), limit) {
+            let conflicts = Vec::new();
+            let mut total = 0;
+            for other in registers {
+                spend(budget)?;
+                if locations[other.index()] == Location::Register(lane)
+                    && promotion_conflict(live, reg, other, spans, budget)? {
+                    total = total + costs[other.index()];
+                    conflicts.push(other);
+                    if total >= lowest {
+                        break;
+                    }
+                }
+            }
+            if total < lowest {
+                lowest = total;
+                best = lane;
+                victims.clear();
+                victims.extend(conflicts);
+            }
+            if lowest == 0 {
+                break;
+            }
+        }
+        if best < 0 {
+            continue;
+        }
+        for victim in victims {
+            locations[victim.index()] = reserve_home(live, victim, homes, owners, budget)?;
+            priority_push(heap, victim.index(), costs, queued);
+            evictions = evictions + 1;
+        }
+        locations[index] = Location::Register(best);
+    }
+    Result::Ok(evictions)
+}
+
+fn global_costs(function: mach::Function, live: Liveness, weights: Vec[isize], budget: Ref[isize]) -> Result[
+    Vec[isize],
+    ir::Error,
+] {
+    let constants = constants_for(function);
+    let costs = Vec::new();
+    for index in 0..function.register_count() {
+        let mut length = 1;
+        for piece in live.pieces[index] {
+            spend(budget)?;
+            length = length + piece.end - piece.start + 1;
+        }
+        costs.push(
+            if constants[index].is_some() {
+                1
+            } else {
+                1 + weights[index] * 1024 / length
+            },
+        );
+    }
+    Result::Ok(costs)
+}
+
+struct RegionCosts {
+    keys: Vec[isize],
+    uses: Vec[Vec[isize]],
+}
+
+fn region_costs(function: mach::Function, graph: analysis::Graph, budget: Ref[isize]) -> Result[
+    RegionCosts,
+    ir::Error,
+] {
+    let blocks = function.blocks();
+    let keys = Vec::new();
+    let leaders = Vec::new();
+    let depths = Vec::new();
+    for block in blocks {
+        keys.push(block.index + blocks.len());
+        depths.push(0);
+    }
+    for loop_data in graph.loops() {
+        for block in loop_data.blocks {
+            spend(budget)?;
+            if loop_data.depth > depths[block] {
+                keys[block] = loop_data.header;
+                depths[block] = loop_data.depth;
+            }
+        }
+    }
+    for key in keys {
+        if !leaders.contains(key) {
+            leaders.push(key);
+        }
+    }
+    if function.register_count() > 0 && leaders.len() > 1048576 / function.register_count() {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "global allocation region matrix exceeds limit"),
+        )
+    }
+    let uses = Vec::new();
+    for _ in leaders {
+        let values = Vec::new();
+        for _ in 0..function.register_count() {
+            spend(budget)?;
+            values.push(0);
+        }
+        uses.push(values);
+    }
+    for index in 0..keys.len() {
+        let mut selected = 0;
+        while leaders[selected] != keys[index] {
+            spend(budget)?;
+            selected = selected + 1;
+        }
+        keys[index] = selected;
+    }
+    for block in blocks {
+        let costs = uses[keys[block.index]];
+        for instruction in block.instructions {
+            for reg in instruction.uses() {
+                spend(budget)?;
+                costs[reg.index()] = costs[reg.index()] + 8;
+            }
+        }
+        for reg in block.terminator.uses() {
+            spend(budget)?;
+            costs[reg.index()] = costs[reg.index()] + 1;
+        }
+    }
+    Result::Ok(RegionCosts { keys, uses })
+}
+
+fn placements_for(
+    function: mach::Function,
+    live: Liveness,
+    canonical: Vec[Location],
+    homes: Vec[isize],
+    owners: Vec[Vec[mach::Reg]],
+    graph: analysis::Graph,
+    limit: isize,
+    algorithm: Algorithm,
+    budget: Ref[isize],
+) -> Result[(Vec[Vec[Placement]], isize), ir::Error] {
+    let output = Vec::new();
+    let mut has_spills = false;
+    for location in canonical {
+        if let Location::Stack(_) = location {
+            has_spills = true;
+        }
+    }
+    if algorithm == Algorithm::LinearScan || limit == 0 || function.blocks().len() == 1
+        || !has_spills {
+        for intervals in live.local_ranges {
+            let items = Vec::new();
+            for interval in intervals {
+                spend(budget)?;
+                items.push(
+                    Placement { reg: interval.reg, location: canonical[interval.reg.index()] },
+                );
+            }
+            output.push(items);
+        }
+        return Result::Ok((output, 0))
+    }
+    let constants = constants_for(function);
+    let mut evictions = 0;
+    let regional = if algorithm == Algorithm::Global {
+        Option::Some(region_costs(function, graph, budget)?)
+    } else {
+        Option::None
+    };
+    for block in function.blocks() {
+        let locations = copy_vec(canonical);
+        let regs = Vec::new();
+        let costs = Vec::new();
+        let spans = Vec::new();
+        for _ in 0..function.register_count() {
+            costs.push(0);
+            spans.push(Option::None);
+        }
+        for interval in live.local_ranges[block.index] {
+            spend(budget)?;
+            let index = interval.reg.index();
+            regs.push(interval.reg);
+            spans[index] = Option::Some(Segment { start: interval.start, end: interval.end });
+            if let Some(weights) = regional {
+                costs[index] = if constants[index].is_some() {
+                    1
+                } else {
+                    1
+                        + weights.uses[weights.keys[block.index]][index] * 1024
+                            / (interval.end - interval.start + 2)
+                };
+            }
+        }
+        if algorithm == Algorithm::Global && block.index != 0 {
+            evictions = evictions
+                + promote_ranges(
+                    function,
+                    live,
+                    regs,
+                    locations,
+                    costs,
+                    spans,
+                    homes,
+                    owners,
+                    limit,
+                    budget,
+                )?;
+        }
+        let placements = Vec::new();
+        for reg in regs {
+            placements.push(Placement { reg, location: locations[reg.index()] });
+        }
+        output.push(placements);
+    }
+    Result::Ok((output, evictions))
+}
+
+fn placement_location(placements: Vec[Placement], reg: mach::Reg) -> Result[Location, ir::Error] {
+    let mut low = 0;
+    let mut high = placements.len();
+    while low < high {
+        let middle = (low + high) / 2;
+        let candidate = placements[middle].reg.index();
+        if candidate < reg.index() {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if low < placements.len() && placements[low].reg == reg {
+        Result::Ok(placements[low].location)
+    } else {
+        Result::Err(ir::error(ir::ErrorKind::InvalidHandle, "value has no placement in this block"))
+    }
+}

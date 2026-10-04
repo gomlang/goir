@@ -23,6 +23,13 @@ impl BinaryOp {
             Shl => "ishl",
             ShrU => "ushr",
             ShrS => "sshr",
+            DivS => "sdiv",
+            DivU => "udiv",
+            RemS => "srem",
+            RemU => "urem",
+            ShlChecked => "ishl_checked",
+            ShrUChecked => "ushr_checked",
+            ShrSChecked => "sshr_checked",
         }
     }
 }

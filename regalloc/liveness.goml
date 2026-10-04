@@ -21,6 +21,7 @@ pub struct Liveness {
     outgoing: Vec[Vec[u64]],
     pieces: Vec[Vec[Segment]],
     hulls: Vec[Segment],
+    local_ranges: Vec[Vec[Interval]],
 }
 
 fn copy_vec[T](input: Vec[T]) -> Vec[T] {
@@ -214,7 +215,9 @@ fn analyze_with_workspace(function: mach::Function, budget: Ref[isize], workspac
     for _ in 0..count {
         pieces.push(Vec::new());
     }
+    let local_ranges = Vec::new();
     for block in blocks {
+        let local = Vec::new();
         let local_starts = workspace.local_starts;
         let local_ends = workspace.local_ends;
         local_starts.clear();
@@ -254,8 +257,10 @@ fn analyze_with_workspace(function: mach::Function, budget: Ref[isize], workspac
             }
             if local_starts[index] >= 0 {
                 pieces[index].push(Segment { start: local_starts[index], end: local_ends[index] });
+                local.push(Interval { reg, start: local_starts[index], end: local_ends[index] });
             }
         }
+        local_ranges.push(local);
     }
     let hulls = Vec::new();
     let ranges = Vec::new();
@@ -285,7 +290,7 @@ fn analyze_with_workspace(function: mach::Function, budget: Ref[isize], workspac
             }
         },
     );
-    Result::Ok(Liveness { function, ranges, incoming, outgoing, pieces, hulls })
+    Result::Ok(Liveness { function, ranges, incoming, outgoing, pieces, hulls, local_ranges })
 }
 
 fn interferes(live: Liveness, left: mach::Reg, right: mach::Reg, budget: Ref[isize]) -> Result[

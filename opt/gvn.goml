@@ -1,104 +1,28 @@
 package opt;
 
 use ecosystem::goir as ir;
+use ecosystem::goir::analysis;
 
 struct Available {
     value: ir::Value,
     block: isize,
 }
 
-struct Dominance {
-    sets: Vec[Vec[bool]],
-    order: Vec[isize],
-}
-
-fn dominance(blocks: Vec[ir::BlockData], budget: Ref[isize]) -> Result[Dominance, ir::Error] {
-    let count = blocks.len();
-    if count > 1048576 / count {
-        return Result::Err(
-            ir::error(ir::ErrorKind::LimitExceeded, "optimization dominance matrix limit exceeded"),
-        )
-    }
-    let reachable = Vec::new();
-    let predecessors: Vec[Vec[isize]] = Vec::new();
-    let sets: Vec[Vec[bool]] = Vec::new();
-    for _ in blocks {
+fn graph_for_blocks(blocks: Vec[ir::BlockData], budget: Ref[isize]) -> Result[
+    analysis::Graph,
+    ir::Error,
+] {
+    let adjacency = Vec::new();
+    for block in blocks {
         spend(budget)?;
-        reachable.push(false);
-        predecessors.push(Vec::new());
-        sets.push(Vec::new());
-    }
-    let pending = Vec::from_array([0]);
-    reachable[0] = true;
-    let mut cursor = 0;
-    while cursor < pending.len() {
-        let index = pending[cursor];
-        cursor = cursor + 1;
-        spend(budget)?;
-        for edge in ir::successors(terminator(blocks[index])?) {
-            let target = edge.target.index();
-            predecessors[target].push(index);
-            if !reachable[target] {
-                reachable[target] = true;
-                pending.push(target);
-            }
-        }
-    }
-    for index in 0..count {
-        for candidate in 0..count {
+        let destinations = Vec::new();
+        for edge in ir::successors(terminator(block)?) {
             spend(budget)?;
-            sets[index].push(
-                reachable[index] && reachable[candidate] && (index != 0 || candidate == 0),
-            );
+            destinations.push(edge.target.index());
         }
+        adjacency.push(destinations);
     }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for index in pending {
-            if index == 0 {
-                continue;
-            }
-            for candidate in pending {
-                spend(budget)?;
-                let mut dominates = true;
-                if candidate != index {
-                    for predecessor in predecessors[index] {
-                        spend(budget)?;
-                        if !sets[predecessor][candidate] {
-                            dominates = false;
-                            break;
-                        }
-                    }
-                }
-                if sets[index][candidate] != dominates {
-                    sets[index][candidate] = dominates;
-                    changed = true;
-                }
-            }
-        }
-    }
-    let depths = Vec::new();
-    for index in 0..count {
-        let mut depth = 0;
-        for candidate in 0..count {
-            spend(budget)?;
-            if sets[index][candidate] {
-                depth = depth + 1;
-            }
-        }
-        depths.push(depth);
-    }
-    pending.sort_by(
-        |left, right| {
-            if depths[left] == depths[right] {
-                left - right
-            } else {
-                depths[left] - depths[right]
-            }
-        },
-    );
-    Result::Ok(Dominance { sets, order: pending })
+    analysis::Graph::new(adjacency, budget)
 }
 
 fn expression_key(operation: ir::Operation) -> string {
@@ -147,9 +71,9 @@ fn number_values(
     constants: Vec[Option[ir::Datum]],
     budget: Ref[isize],
 ) -> Result[Vec[ir::BlockData], ir::Error] {
-    let dom = dominance(blocks, budget)?;
+    let graph = graph_for_blocks(blocks, budget)?;
     let expressions: HashMap[string, Vec[Available]] = HashMap::new();
-    for index in dom.order {
+    for index in graph.reverse_postorder() {
         let block = blocks[index];
         let instructions = Vec::new();
         for instruction in block.instructions {
@@ -163,7 +87,7 @@ fn number_values(
                     let mut found = Option::None;
                     for candidate in candidates {
                         spend(budget)?;
-                        if dom.sets[index][candidate.block] {
+                        if graph.dominates(candidate.block, index)? {
                             found = Option::Some(candidate.value);
                             break;
                         }

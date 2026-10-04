@@ -1,0 +1,190 @@
+package analysis;
+
+use ecosystem::goir as ir;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Use {
+    pub block: isize,
+    pub position: isize,
+    pub edge: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Definition {
+    pub block: isize,
+    pub position: isize,
+}
+
+pub struct Analysis {
+    source: ir::Function,
+    cfg: Graph,
+    references: Vec[Vec[Use]],
+    definitions: Vec[Definition],
+}
+
+impl Analysis {
+    pub fn function(self: Analysis) -> ir::Function {
+        self.source
+    }
+
+    pub fn graph(self: Analysis) -> Graph {
+        self.cfg
+    }
+
+    pub fn uses(self: Analysis, value: ir::Value) -> Result[Vec[Use], ir::Error] {
+        self.source.value_type(value)?;
+        Result::Ok(copy_vec(self.references[value.index()]))
+    }
+
+    pub fn definition(self: Analysis, value: ir::Value) -> Result[Definition, ir::Error] {
+        self.source.value_type(value)?;
+        Result::Ok(self.definitions[value.index()])
+    }
+}
+
+pub fn analyze(function: ir::Function, budget: Ref[isize]) -> Result[Analysis, ir::Error] {
+    analyze_verified(ir::verified(function)?, budget)
+}
+
+pub fn analyze_verified(function: ir::VerifiedFunction, budget: Ref[isize]) -> Result[
+    Analysis,
+    ir::Error,
+] {
+    build_analysis(function.function(), budget, Scratch::new())
+}
+
+fn add_use(references: Vec[Vec[Use]], values: Vec[ir::Value], site: Use, budget: Ref[isize]) -> Result[
+    (),
+    ir::Error,
+] {
+    for value in values {
+        spend(budget)?;
+        references[value.index()].push(site);
+    }
+    Result::Ok(())
+}
+
+fn build_analysis(function: ir::Function, budget: Ref[isize], scratch: Scratch) -> Result[
+    Analysis,
+    ir::Error,
+] {
+    let blocks = function.blocks();
+    let adjacency = Vec::new();
+    let references: Vec[Vec[Use]] = Vec::new();
+    let definitions = Vec::new();
+    for _ in 0..function.value_count() {
+        spend(budget)?;
+        references.push(Vec::new());
+        definitions.push(Definition { block: -1, position: -1 });
+    }
+    for block in blocks {
+        spend(budget)?;
+        let index = block.id.index();
+        for parameter in block.parameters {
+            spend(budget)?;
+            definitions[parameter.index()] = Definition { block: index, position: -1 };
+        }
+        for position in 0..block.instructions.len() {
+            spend(budget)?;
+            let instruction = block.instructions[position];
+            for result in instruction.results {
+                spend(budget)?;
+                definitions[result.index()] = Definition { block: index, position };
+            }
+            add_use(
+                references,
+                ir::operands(instruction.operation),
+                Use { block: index, position, edge: false },
+                budget,
+            )?;
+        }
+        let term = block.terminator.ok_or(
+            ir::error(ir::ErrorKind::ControlFlow, "analysis block is missing terminator"),
+        )?;
+        let position = block.instructions.len();
+        let values = match term {
+            Return(values) => values,
+            Branch(condition, _, _) => Vec::from_array([condition]),
+            _ => Vec::new(),
+        };
+        add_use(references, values, Use { block: index, position, edge: false }, budget)?;
+        let successors = Vec::new();
+        for edge in ir::successors(term) {
+            spend(budget)?;
+            successors.push(edge.target.index());
+            add_use(references, edge.arguments, Use { block: index, position, edge: true }, budget)?;
+        }
+        adjacency.push(successors);
+    }
+    let cfg = build_graph(adjacency, budget, scratch)?;
+    Result::Ok(Analysis { source: function, cfg, references, definitions })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Statistics {
+    pub builds: isize,
+    pub cache_hits: isize,
+    pub invalidations: isize,
+    pub retained_capacity: isize,
+}
+
+pub struct Context {
+    cached: Ref[Option[Analysis]],
+    builds: Ref[isize],
+    hits: Ref[isize],
+    invalidations: Ref[isize],
+    scratch: Scratch,
+}
+
+impl Context {
+    pub fn new() -> Context {
+        Context {
+            cached: Ref::new(Option::None),
+            builds: Ref::new(0),
+            hits: Ref::new(0),
+            invalidations: Ref::new(0),
+            scratch: Scratch::new(),
+        }
+    }
+
+    pub fn clear(self: Context) -> () {
+        if self.cached.get().is_some() {
+            self.invalidations.set(self.invalidations.get() + 1);
+        }
+        self.cached.set(Option::None);
+    }
+
+    pub fn statistics(self: Context) -> Statistics {
+        Statistics {
+            builds: self.builds.get(),
+            cache_hits: self.hits.get(),
+            invalidations: self.invalidations.get(),
+            retained_capacity: self.scratch.retained_capacity(),
+        }
+    }
+
+    pub fn analyze(self: Context, function: ir::Function, budget: Ref[isize]) -> Result[
+        Analysis,
+        ir::Error,
+    ] {
+        self.analyze_verified(ir::verified(function)?, budget)
+    }
+
+    pub fn analyze_verified(self: Context, function: ir::VerifiedFunction, budget: Ref[isize]) -> Result[
+        Analysis,
+        ir::Error,
+    ] {
+        spend(budget)?;
+        if let Some(previous) = self.cached.get() {
+            if previous.source.same_identity(function.function()) {
+                self.hits.set(self.hits.get() + 1);
+                return Result::Ok(previous)
+            }
+        }
+        let output = build_analysis(function.function(), budget, self.scratch)?;
+        self.clear();
+        self.cached.set(Option::Some(output));
+        self.builds.set(self.builds.get() + 1);
+        Result::Ok(output)
+    }
+}

@@ -1,0 +1,159 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+
+fn count_edits(edits: Vec[Edit], weight: isize, counts: Vec[isize], budget: Ref[isize]) -> Result[
+    (),
+    ir::Error,
+] {
+    for edit in edits {
+        spend(budget)?;
+        if edit.source == edit.destination {
+            continue;
+        }
+        match edit.source {
+            Stack(_) => {
+                counts[0] = counts[0] + 1;
+                counts[2] = counts[2] + weight;
+            },
+            Rematerialized { .. } => {
+                counts[5] = counts[5] + 1;
+            },
+            _ => (),
+        }
+        if let Location::Stack(_) = edit.destination {
+            counts[1] = counts[1] + 1;
+            counts[3] = counts[3] + weight;
+        }
+    }
+    Result::Ok(())
+}
+
+fn allocation_statistics(
+    function: mach::Function,
+    plan: Vec[AllocatedBlock],
+    placements: Vec[Vec[Placement]],
+    weights: Vec[isize],
+    global_evictions: isize,
+    regional_evictions: isize,
+    budget: Ref[isize],
+) -> Result[Statistics, ir::Error] {
+    let initial: Vec[Option[Location]] = Vec::new();
+    let split = Vec::new();
+    for _ in 0..function.register_count() {
+        initial.push(Option::None);
+        split.push(false);
+    }
+    for block in placements {
+        for item in block {
+            spend(budget)?;
+            match initial[item.reg.index()] {
+                Some(first) => {
+                    if first != item.location {
+                        split[item.reg.index()] = true;
+                    }
+                },
+                None => {
+                    initial[item.reg.index()] = Option::Some(item.location);
+                },
+            }
+        }
+    }
+    let mut split_values = 0;
+    for value in split {
+        if value {
+            split_values = split_values + 1;
+        }
+    }
+    let counts = Vec::from_array([0, 0, 0, 0, 0, 0]);
+    let machine = function.blocks();
+    for block in plan {
+        let weight = weights[block.index];
+        for instruction in block.instructions {
+            count_edits(instruction.before, weight, counts, budget)?;
+            count_edits(instruction.after, weight, counts, budget)?;
+            for binding in instruction.operands {
+                spend(budget)?;
+                if let Location::Stack(_) = binding.location {
+                    if binding.operand.kind == mach::OperandKind::Use {
+                        counts[0] = counts[0] + 1;
+                        counts[2] = counts[2] + weight;
+                    } else {
+                        counts[1] = counts[1] + 1;
+                        counts[3] = counts[3] + weight;
+                    }
+                }
+            }
+        }
+        count_edits(block.terminal_edits, weight, counts, budget)?;
+        let term_count = match machine[block.index].terminator {
+            Return(values) => values.len(),
+            Branch { .. } => 1,
+            CompareBranch { .. } => 2,
+            Jump(_) => 0,
+        };
+        for index in 0..term_count {
+            let binding = block.terminator_operands[index];
+            if let Location::Stack(_) = binding.location {
+                counts[0] = counts[0] + 1;
+                counts[2] = counts[2] + weight;
+            }
+        }
+        for edge in block.edges {
+            count_edits(edge.edits, weight, counts, budget)?;
+            counts[4] = counts[4] + edge.edits.len();
+        }
+    }
+    Result::Ok(
+        Statistics {
+            global_evictions,
+            regional_evictions,
+            split_values,
+            spill_loads: counts[0],
+            spill_stores: counts[1],
+            weighted_spill_loads: counts[2],
+            weighted_spill_stores: counts[3],
+            edge_moves: counts[4],
+            rematerializations: counts[5],
+        },
+    )
+}
+
+fn verify_placements(allocation: Allocation, budget: Ref[isize]) -> Result[(), ir::Error] {
+    let blocks = allocation.function().blocks();
+    if allocation.placements.len() != blocks.len() {
+        return Result::Err(checker_error("block placement count differs from machine CFG"))
+    }
+    for block in blocks {
+        let items = allocation.placements[block.index];
+        let mut previous = -1;
+        for item in items {
+            spend(budget)?;
+            allocation.machine.register_type(item.reg)?;
+            if item.reg.index() <= previous {
+                return Result::Err(checker_error("block placements are not distinct and ordered"))
+            }
+            previous = item.reg.index();
+            checker_lane(allocation, item.location)?;
+            match item.location {
+                Register(_) => {
+                    if location_class(item.location) != Option::Some(item.reg.class()) {
+                        return Result::Err(
+                            checker_error("block placement has wrong register class"),
+                        )
+                    }
+                },
+                Stack(_) => (),
+                _ => return Result::Err(checker_error("block placement is not a persistent home")),
+            }
+        }
+        for parameter in block.parameters {
+            let location = allocation.entry_location(block.index, parameter)?;
+            if block.index == 0 && location != allocation.location(parameter)? {
+                return Result::Err(checker_error("entry placement differs from parameter home"))
+            }
+        }
+    }
+    Result::Ok(())
+}

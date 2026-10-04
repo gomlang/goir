@@ -1,0 +1,290 @@
+package opt;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::analysis;
+
+fn contains_block(blocks: Vec[isize], block: isize, budget: Ref[isize]) -> Result[bool, ir::Error] {
+    for candidate in blocks {
+        spend(budget)?;
+        if candidate == block {
+            return Result::Ok(true)
+        }
+    }
+    Result::Ok(false)
+}
+
+fn hoisted_edge(
+    edge: ir::Edge,
+    source: isize,
+    natural_loop: analysis::Loop,
+    target: ir::Block,
+    blocks: Vec[ir::Block],
+    values: Vec[Option[ir::Value]],
+    budget: Ref[isize],
+) -> Result[ir::Edge, ir::Error] {
+    let destination = if edge.target.index() == natural_loop.header
+        && !contains_block(natural_loop.blocks, source, budget)? {
+        target
+    } else {
+        blocks[edge.target.index()]
+    };
+    Result::Ok(
+        ir::Edge { target: destination, arguments: mapped_values(values, edge.arguments, budget)? },
+    )
+}
+
+fn reconstruct_hoist(
+    checked: ir::VerifiedFunction,
+    natural_loop: analysis::Loop,
+    selected: Vec[Vec[bool]],
+    ordered: Vec[ir::Instruction],
+    budget: Ref[isize],
+) -> Result[ir::VerifiedFunction, ir::Error] {
+    let function = checked.function();
+    let source = function.blocks();
+    let limits = function.limits();
+    if source.len() >= limits.max_blocks
+        || source[natural_loop.header].parameters.len() > limits.max_values - function.value_count() {
+        return Result::Ok(checked)
+    }
+    let reconstruction = ir::Reconstruction::new(checked)?;
+    let blocks = Vec::from_array([reconstruction.entry()]);
+    for index in 1..source.len() {
+        let types = Vec::new();
+        for parameter in source[index].parameters {
+            spend(budget)?;
+            types.push(function.value_type(parameter)?);
+        }
+        blocks.push(reconstruction.append_block(types)?);
+    }
+    let types = Vec::new();
+    for parameter in source[natural_loop.header].parameters {
+        spend(budget)?;
+        types.push(function.value_type(parameter)?);
+    }
+    let preheader = reconstruction.append_block(types)?;
+    let values = Vec::new();
+    for _ in 0..function.value_count() {
+        spend(budget)?;
+        values.push(Option::None);
+    }
+    for index in 0..source.len() {
+        let block = source[index];
+        let parameters = reconstruction.parameters(blocks[index])?;
+        for position in 0..parameters.len() {
+            spend(budget)?;
+            values[block.parameters[position].index()] = Option::Some(parameters[position]);
+        }
+        for position in 0..block.instructions.len() {
+            spend(budget)?;
+            let destination = if selected[index][position] {
+                preheader
+            } else {
+                blocks[index]
+            };
+            for result in block.instructions[position].results {
+                spend(budget)?;
+                values[result.index()] = Option::Some(
+                    reconstruction.reserve_value(destination, function.value_type(result)?)?,
+                );
+            }
+        }
+    }
+    let output = Vec::new();
+    for index in 0..source.len() {
+        let block = source[index];
+        let instructions = Vec::new();
+        for position in 0..block.instructions.len() {
+            spend(budget)?;
+            if !selected[index][position] {
+                let instruction = block.instructions[position];
+                instructions.push(
+                    ir::Instruction {
+                        results: mapped_values(values, instruction.results, budget)?,
+                        operation: rebuilt_operation(
+                            reconstruction,
+                            instruction.operation,
+                            values,
+                            budget,
+                        )?,
+                    },
+                );
+            }
+        }
+        let term = match terminator(block)? {
+            Jump(edge) => ir::Terminator::Jump(
+                hoisted_edge(edge, index, natural_loop, preheader, blocks, values, budget)?,
+            ),
+            Branch(condition, yes, no) => ir::Terminator::Branch(
+                mapped_value(values, condition)?,
+                hoisted_edge(yes, index, natural_loop, preheader, blocks, values, budget)?,
+                hoisted_edge(no, index, natural_loop, preheader, blocks, values, budget)?,
+            ),
+            Return(results) => ir::Terminator::Return(mapped_values(values, results, budget)?),
+        };
+        output.push(
+            ir::BlockData {
+                id: blocks[index],
+                parameters: reconstruction.parameters(blocks[index])?,
+                instructions,
+                terminator: Option::Some(term),
+            },
+        );
+    }
+    let instructions = Vec::new();
+    for instruction in ordered {
+        spend(budget)?;
+        instructions.push(
+            ir::Instruction {
+                results: mapped_values(values, instruction.results, budget)?,
+                operation: rebuilt_operation(reconstruction, instruction.operation, values, budget)?,
+            },
+        );
+    }
+    let parameters = reconstruction.parameters(preheader)?;
+    output.push(
+        ir::BlockData {
+            id: preheader,
+            parameters,
+            instructions,
+            terminator: Option::Some(
+                ir::Terminator::Jump(
+                    ir::Edge { target: blocks[natural_loop.header], arguments: parameters },
+                ),
+            ),
+        },
+    );
+    match reconstruction.finish(output) {
+        Ok(output) => Result::Ok(output),
+        Err(failure) => if failure.kind == ir::ErrorKind::LimitExceeded {
+            Result::Ok(checked)
+        } else {
+            Result::Err(failure)
+        },
+    }
+}
+
+fn hoist_loop(
+    checked: ir::VerifiedFunction,
+    data: analysis::Analysis,
+    natural_loop: analysis::Loop,
+    budget: Ref[isize],
+) -> Result[ir::VerifiedFunction, ir::Error] {
+    let function = checked.function();
+    let blocks = function.blocks();
+    let graph = data.graph();
+    let selected = Vec::new();
+    let invariant = Vec::new();
+    for _ in 0..function.value_count() {
+        spend(budget)?;
+        invariant.push(false);
+    }
+    for block in blocks {
+        let row = Vec::new();
+        for _ in block.instructions {
+            spend(budget)?;
+            row.push(false);
+        }
+        selected.push(row);
+    }
+    let ordered = Vec::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in graph.reverse_postorder() {
+            if !contains_block(natural_loop.blocks, index, budget)? {
+                continue;
+            }
+            for position in 0..blocks[index].instructions.len() {
+                spend(budget)?;
+                let instruction = blocks[index].instructions[position];
+                if selected[index][position] || instruction.operation.has_effects()
+                    || instruction.results.len() != 1 {
+                    continue;
+                }
+                let mut movable = true;
+                for value in ir::operands(instruction.operation) {
+                    spend(budget)?;
+                    if invariant[value.index()] {
+                        continue;
+                    }
+                    let definition = data.definition(value)?;
+                    if contains_block(natural_loop.blocks, definition.block, budget)?
+                        || !graph.dominates(definition.block, natural_loop.header)? {
+                        movable = false;
+                        break;
+                    }
+                }
+                if movable {
+                    selected[index][position] = true;
+                    invariant[instruction.results[0].index()] = true;
+                    ordered.push(instruction);
+                    changed = true;
+                }
+            }
+        }
+    }
+    if ordered.is_empty() {
+        return Result::Ok(checked)
+    }
+    let outside: Vec[isize] = Vec::new();
+    for predecessor in graph.predecessors(natural_loop.header)? {
+        spend(budget)?;
+        if !contains_block(natural_loop.blocks, predecessor, budget)? {
+            let mut duplicate = false;
+            for previous in outside {
+                spend(budget)?;
+                duplicate = duplicate || previous == predecessor;
+            }
+            if !duplicate {
+                outside.push(predecessor);
+            }
+        }
+    }
+    if outside.len() == 1 {
+        let preheader = outside[0];
+        if let Jump(edge) = terminator(blocks[preheader])? {
+            if edge.target.index() == natural_loop.header {
+                for index in 0..blocks.len() {
+                    let instructions = Vec::new();
+                    for position in 0..blocks[index].instructions.len() {
+                        spend(budget)?;
+                        if !selected[index][position] {
+                            instructions.push(blocks[index].instructions[position]);
+                        }
+                    }
+                    if index == preheader {
+                        instructions.extend(ordered);
+                    }
+                    let mut block = blocks[index];
+                    block.instructions = instructions;
+                    blocks[index] = block;
+                }
+                return ir::rewrite_verified(checked, blocks)
+            }
+        }
+    }
+    reconstruct_hoist(checked, natural_loop, selected, ordered, budget)
+}
+
+fn hoist_invariants(checked: ir::VerifiedFunction, budget: Ref[isize]) -> Result[
+    ir::VerifiedFunction,
+    ir::Error,
+] {
+    let mut current = checked;
+    let context = analysis::Context::new();
+    let loops = context.analyze_verified(current, budget)?.graph().loops();
+    loops.sort_by(|left, right| right.depth - left.depth);
+    for natural_loop in loops {
+        spend(budget)?;
+        let data = context.analyze_verified(current, budget)?;
+        for updated in data.graph().loops() {
+            spend(budget)?;
+            if updated.header == natural_loop.header {
+                current = hoist_loop(current, data, updated, budget)?;
+                break;
+            }
+        }
+    }
+    Result::Ok(current)
+}

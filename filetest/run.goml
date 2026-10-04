@@ -5,6 +5,7 @@ use ecosystem::goir::amd64;
 use ecosystem::goir::opt;
 use ecosystem::goir::reader;
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum Stage {
     Verify,
     Optimize,

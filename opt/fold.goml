@@ -8,6 +8,21 @@ enum Replacement {
     Constant(ir::Datum),
 }
 
+fn safe_to_fold(operation: ir::Operation, constants: Vec[Option[ir::Datum]]) -> bool {
+    if !operation.has_effects() {
+        return true
+    }
+    if let ir::Operation::Binary(op, left, right) = operation {
+        if let (Some(a), Some(b)) = (constants[left.index()], constants[right.index()]) {
+            return match ir::evaluate_binary(op, a, b) {
+                Ok(_) => true,
+                Err(_) => false,
+            }
+        }
+    }
+    false
+}
+
 fn integer(constants: Vec[Option[ir::Datum]], value: ir::Value) -> Option[i64] {
     match constants[value.index()] {
         Option::Some(ir::Datum::I64(value)) => Option::Some(value),
@@ -29,20 +44,10 @@ fn fold_binary(
     let b = integer(constants, right);
     match (a, b) {
         (Option::Some(x), Option::Some(y)) => {
-            let shift = (y.to_u64() & 63).to_isize();
-            return constant_integer(
-                match op {
-                    Add => (x.to_u64() + y.to_u64()).to_i64(),
-                    Sub => (x.to_u64() - y.to_u64()).to_i64(),
-                    Mul => (x.to_u64() * y.to_u64()).to_i64(),
-                    And => x & y,
-                    Or => x | y,
-                    Xor => x ^ y,
-                    Shl => (x.to_u64() << shift).to_i64(),
-                    ShrU => (x.to_u64() >> shift).to_i64(),
-                    ShrS => x >> shift,
-                },
-            )
+            return match ir::evaluate_binary(op, ir::Datum::I64(x), ir::Datum::I64(y)) {
+                Ok(value) => Replacement::Constant(value),
+                Err(_) => Replacement::Keep,
+            }
         },
         _ => (),
     }
@@ -108,6 +113,7 @@ fn fold_binary(
                 _ => (),
             }
         },
+        DivS | DivU | RemS | RemU | ShlChecked | ShrUChecked | ShrSChecked => (),
     }
     Replacement::Keep
 }
@@ -195,21 +201,10 @@ fn fold_conversion(conversion: ir::IntConversion, value: Option[ir::Datum]) -> R
 fn fold_i32(op: ir::BinaryOp, left: ir::Value, right: ir::Value, constants: Vec[Option[ir::Datum]]) -> Replacement {
     match (constants[left.index()], constants[right.index()]) {
         (Option::Some(ir::Datum::I32(a)), Option::Some(ir::Datum::I32(b))) => {
-            let x = a.to_u32();
-            let y = b.to_u32();
-            let shift = (y & 31).to_isize();
-            let result = match op {
-                Add => x + y,
-                Sub => x - y,
-                Mul => x * y,
-                And => x & y,
-                Or => x | y,
-                Xor => x ^ y,
-                Shl => x << shift,
-                ShrU => x >> shift,
-                ShrS => (a >> shift).to_u32(),
-            };
-            Replacement::Constant(ir::Datum::I32(result.to_i32()))
+            match ir::evaluate_binary(op, ir::Datum::I32(a), ir::Datum::I32(b)) {
+                Ok(value) => Replacement::Constant(value),
+                Err(_) => Replacement::Keep,
+            }
         },
         _ => if left == right {
             match op {

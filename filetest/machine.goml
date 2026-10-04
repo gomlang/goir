@@ -9,6 +9,9 @@ fn machine_text(instruction: mach::Instruction) -> string {
         Immediate { dst, value } => f"{dst.debug()} = immediate {value}",
         FloatImmediate { dst, bits } => f"{dst.debug()} = float_bits {bits.to_u64()}",
         Binary { dst, op, left, right } => f"{dst.debug()} = {op.name()} {left.debug()}, {right.debug()}",
+        Divide { dst, op, left, right } | CheckedShift { dst, op, left, right } => f"{dst.debug()} = {op.name()} {left.debug()}, {right.debug()}",
+        BinaryStack { dst, op, left, slot } => f"{dst.debug()} = {op.name()}_stack {left.debug()}, slot{slot.index()}",
+        FloatBinaryStack { dst, op, left, slot } => f"{dst.debug()} = {op.name()}_stack {left.debug()}, slot{slot.index()}",
         BinaryImmediate { dst, op, left, value } => f"{dst.debug()} = {op.name()}_immediate {left.debug()}, {value}",
         Lea { dst, value, scale } => f"{dst.debug()} = lea {value.debug()} * {scale}",
         Compare { dst, cc, left, right } => f"{dst.debug()} = icmp {cc.name()} {left.debug()}, {right.debug()}",
@@ -27,13 +30,40 @@ fn edit_text(edit: regalloc::Edit) -> string {
     "edit " + edit.source.debug() + " -> " + edit.destination.debug()
 }
 
+fn terminator_text(term: mach::Terminator) -> string {
+    match term {
+        Jump(edge) => f"jump block{edge.target}",
+        Branch { condition, yes, no } => f"branch {condition.debug()}, block{yes.target}, block{no.target}",
+        CompareBranch { cc, left, right, yes, no } => f"compare_branch {cc.name()} {left.debug()}, {right.debug()}, block{yes.target}, block{no.target}",
+        Return(values) => {
+            let names = Vec::new();
+            for value in values {
+                names.push(value.debug());
+            }
+            "return " + names.join(", ")
+        },
+    }
+}
+
 fn stage_text(function: ir::Function, stage: Stage) -> Result[string, ir::Error] {
+    machine_stage(function, stage, regalloc::Options::standard(), regalloc::Algorithm::Global)
+}
+
+pub fn machine_stage(
+    function: ir::Function,
+    stage: Stage,
+    options: regalloc::Options,
+    algorithm: regalloc::Algorithm,
+) -> Result[string, ir::Error] {
     let machine = mach::lower(function)?;
     let lines = Vec::from_array(["machine " + function.name()]);
     match stage {
         Lower => {
             for block in machine.blocks() {
                 lines.push(f"block{block.index}:");
+                for parameter in block.parameters {
+                    lines.push("    parameter " + parameter.debug());
+                }
                 for instruction in block.instructions {
                     lines.push("    " + machine_text(instruction));
                     for operand in instruction.operands() {
@@ -43,6 +73,7 @@ fn stage_text(function: ir::Function, stage: Stage) -> Result[string, ir::Error]
                         lines.push("        clobber " + clobber.debug());
                     }
                 }
+                lines.push("    " + terminator_text(block.terminator));
                 for reg in block.terminator.uses() {
                     lines.push("    terminator use " + reg.debug());
                 }
@@ -57,15 +88,27 @@ fn stage_text(function: ir::Function, stage: Stage) -> Result[string, ir::Error]
             }
         },
         Allocate => {
-            let allocation = regalloc::allocate(machine)?;
+            let allocation = regalloc::allocate_with_algorithm(machine, options, algorithm)?;
             regalloc::check(allocation)?;
+            lines.push("algorithm " + algorithm.debug());
+            lines.push(
+                f"registers {allocation.register_count()} stack_slots {allocation.stack_slots()}",
+            );
             for block in allocation.blocks() {
                 lines.push(f"block{block.index}:");
+                for placement in allocation.block_locations(block.index)? {
+                    lines.push(
+                        "    home " + placement.reg.debug() + " @ " + placement.location.debug(),
+                    );
+                }
                 for instruction in block.instructions {
                     for edit in instruction.before {
                         lines.push("    before " + edit_text(edit));
                     }
                     lines.push("    " + machine_text(instruction.instruction));
+                    for clobber in instruction.instruction.clobbers() {
+                        lines.push("        clobber " + clobber.debug());
+                    }
                     for binding in instruction.operands {
                         lines.push(
                             "        " + binding.operand.debug() + " @ " + binding.location.debug(),
@@ -75,9 +118,15 @@ fn stage_text(function: ir::Function, stage: Stage) -> Result[string, ir::Error]
                         lines.push("    after " + edit_text(edit));
                     }
                 }
+                for edit in block.terminal_edits {
+                    lines.push("    terminal " + edit_text(edit));
+                }
+                lines.push(
+                    "    " + terminator_text(allocation.function().blocks()[block.index].terminator),
+                );
                 for binding in block.terminator_operands {
                     lines.push(
-                        "    terminator " + binding.operand.reg.debug() + " @ "
+                        "    terminator " + binding.operand.debug() + " @ "
                             + binding.location.debug(),
                     );
                 }

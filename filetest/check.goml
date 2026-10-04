@@ -1,0 +1,49 @@
+package filetest;
+
+use ecosystem::goir as ir;
+
+pub fn assert_ordered(output: Output, patterns: Vec[string]) -> Result[(), ir::Error] {
+    let mut position = 0;
+    for pattern in patterns {
+        if pattern == "" {
+            return Result::Err(
+                ir::error(ir::ErrorKind::InvalidArgument, "ordered pattern must not be empty"),
+            )
+        }
+        let rest = output.text.byte_slice(position, output.text.len());
+        let relative = rest.find(pattern).ok_or(
+            ir::error(ir::ErrorKind::InvalidState, "missing ordered filetest text: " + pattern),
+        )?;
+        position += relative + pattern.len();
+    }
+    Result::Ok(())
+}
+
+pub fn assert_exact(output: Output, expected: string) -> Result[(), ir::Error] {
+    if output.text == expected {
+        return Result::Ok(())
+    }
+    let actual_lines = output.text.split("\n");
+    let expected_lines = expected.split("\n");
+    let mut line = 0;
+    while line < actual_lines.len() && line < expected_lines.len()
+        && actual_lines[line] == expected_lines[line] {
+        line += 1;
+    }
+    let actual = if line < actual_lines.len() {
+        actual_lines[line]
+    } else {
+        "<end>"
+    };
+    let wanted = if line < expected_lines.len() {
+        expected_lines[line]
+    } else {
+        "<end>"
+    };
+    Result::Err(
+        ir::error(
+            ir::ErrorKind::InvalidState,
+            f"filetest line {line + 1}: expected " + wanted + "; actual " + actual,
+        ),
+    )
+}

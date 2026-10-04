@@ -2,6 +2,7 @@ package amd64;
 
 use ecosystem::goir as ir;
 use module::mach;
+use module::analysis;
 use module::opt;
 use module::regalloc;
 use std::time::{Instant};
@@ -11,6 +12,7 @@ pub struct PhaseTimings {
     pub verify_ns: i64,
     pub optimize_ns: i64,
     pub lowering_ns: i64,
+    pub analysis_ns: i64,
     pub liveness_ns: i64,
     pub allocation_ns: i64,
     pub checker_ns: i64,
@@ -23,11 +25,13 @@ pub struct Compilation {
     pub function: ir::Function,
     pub machine: mach::Function,
     pub allocation: regalloc::Allocation,
+    pub analysis: analysis::Analysis,
     pub timings: PhaseTimings,
 }
 
 pub struct CompilerContext {
     workspace: regalloc::Workspace,
+    analyses: analysis::Context,
     lines: Vec[string],
     completed: Ref[isize],
 }
@@ -36,6 +40,7 @@ impl CompilerContext {
     pub fn new() -> CompilerContext {
         CompilerContext {
             workspace: regalloc::Workspace::new(),
+            analyses: analysis::Context::new(),
             lines: Vec::new(),
             completed: Ref::new(0),
         }
@@ -43,6 +48,15 @@ impl CompilerContext {
 
     pub fn retained_capacity(self: CompilerContext) -> isize {
         self.lines.capacity() + self.workspace.retained_capacity()
+            + self.analyses.statistics().retained_capacity
+    }
+
+    pub fn analysis_statistics(self: CompilerContext) -> analysis::Statistics {
+        self.analyses.statistics()
+    }
+
+    pub fn clear_analysis(self: CompilerContext) -> () {
+        self.analyses.clear();
     }
 
     pub fn completed_functions(self: CompilerContext) -> isize {
@@ -59,6 +73,56 @@ impl CompilerContext {
         optimize: bool,
         options: regalloc::Options,
     ) -> Result[Compilation, ir::Error] {
+        self.compile_for_target_with_algorithm(
+            function,
+            optimize,
+            options,
+            Target::standard(),
+            regalloc::Algorithm::Global,
+        )
+    }
+
+    pub fn compile_for_target(
+        self: CompilerContext,
+        function: ir::Function,
+        optimize: bool,
+        options: regalloc::Options,
+        target: Target,
+    ) -> Result[Compilation, ir::Error] {
+        self.compile_for_target_with_algorithm(
+            function,
+            optimize,
+            options,
+            target,
+            regalloc::Algorithm::Global,
+        )
+    }
+
+    pub fn compile_with_algorithm(
+        self: CompilerContext,
+        function: ir::Function,
+        optimize: bool,
+        options: regalloc::Options,
+        algorithm: regalloc::Algorithm,
+    ) -> Result[Compilation, ir::Error] {
+        self.compile_for_target_with_algorithm(
+            function,
+            optimize,
+            options,
+            Target::standard(),
+            algorithm,
+        )
+    }
+
+    pub fn compile_for_target_with_algorithm(
+        self: CompilerContext,
+        function: ir::Function,
+        optimize: bool,
+        options: regalloc::Options,
+        target: Target,
+        algorithm: regalloc::Algorithm,
+    ) -> Result[Compilation, ir::Error] {
+        target.validate_options(options)?;
         let total = Instant::now();
         let phase = Instant::now();
         let verified = ir::verified(function)?;
@@ -71,9 +135,18 @@ impl CompilerContext {
         };
         let optimize_ns = phase.elapsed().as_nanoseconds();
         let phase = Instant::now();
+        let shared = self.analyses.analyze_verified(input, Ref::new(options.max_steps))?;
+        let analysis_ns = phase.elapsed().as_nanoseconds();
+        let phase = Instant::now();
         let machine = mach::lower_verified(input)?;
         let lowering_ns = phase.elapsed().as_nanoseconds();
-        let profiled = regalloc::allocate_profiled(machine, options, self.workspace)?;
+        let profiled = regalloc::allocate_profiled_with_graph(
+            machine,
+            options,
+            self.workspace,
+            algorithm,
+            shared.graph(),
+        )?;
         let phase = Instant::now();
         let compiled = emit_allocated_lines(profiled.allocation, true, self.lines)?;
         let emission_ns = phase.elapsed().as_nanoseconds();
@@ -84,10 +157,12 @@ impl CompilerContext {
                 function: input.function(),
                 machine,
                 allocation: profiled.allocation,
+                analysis: shared,
                 timings: PhaseTimings {
                     verify_ns,
                     optimize_ns,
                     lowering_ns,
+                    analysis_ns,
                     liveness_ns: profiled.liveness_ns,
                     allocation_ns: profiled.allocation_ns,
                     checker_ns: profiled.checker_ns,

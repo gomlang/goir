@@ -1,0 +1,149 @@
+package amd64;
+
+use ecosystem::goir as ir;
+use module::mach;
+use module::regalloc;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OperatingSystem {
+    Linux,
+    Windows,
+    MacOS,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Architecture {
+    Amd64,
+    Arm64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CallingConvention {
+    ABI0,
+    ABIInternal,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CpuFeature {
+    SSE2,
+    AVX,
+    AVX2,
+}
+
+pub struct Target {
+    pub operating_system: OperatingSystem,
+    pub architecture: Architecture,
+    pub calling_convention: CallingConvention,
+    pub go_major: isize,
+    pub go_minor: isize,
+    pub cpu_features: Vec[CpuFeature],
+    pub integer_registers: isize,
+    pub float_registers: isize,
+}
+
+impl Target {
+    pub fn standard() -> Target {
+        Target {
+            operating_system: OperatingSystem::Linux,
+            architecture: Architecture::Amd64,
+            calling_convention: CallingConvention::ABI0,
+            go_major: 1,
+            go_minor: 26,
+            cpu_features: Vec::from_array([CpuFeature::SSE2]),
+            integer_registers: 7,
+            float_registers: 7,
+        }
+    }
+
+    pub fn validate(self: Target) -> Result[(), ir::Error] {
+        if self.operating_system != OperatingSystem::Linux
+            || self.architecture != Architecture::Amd64 {
+            return Result::Err(ir::error(ir::ErrorKind::Unsupported, "target requires Linux amd64"))
+        }
+        if self.calling_convention != CallingConvention::ABI0 {
+            return Result::Err(ir::error(ir::ErrorKind::Unsupported, "target requires Go ABI0"))
+        }
+        if self.go_major != 1 || self.go_minor != 26 {
+            return Result::Err(ir::error(ir::ErrorKind::Unsupported, "target requires Go 1.26"))
+        }
+        if self.integer_registers < 0 || self.integer_registers > 7 || self.float_registers < 0
+            || self.float_registers > 7 {
+            return Result::Err(
+                ir::error(
+                    ir::ErrorKind::InvalidArgument,
+                    "target register pools require 0..7 registers",
+                ),
+            )
+        }
+        if !self.cpu_features.contains(CpuFeature::SSE2) {
+            return Result::Err(
+                ir::error(ir::ErrorKind::Unsupported, "amd64 scalar float backend requires SSE2"),
+            )
+        }
+        if self.cpu_features.contains(CpuFeature::AVX2)
+            && !self.cpu_features.contains(CpuFeature::AVX) {
+            return Result::Err(ir::error(ir::ErrorKind::InvalidArgument, "AVX2 requires AVX"))
+        }
+        let seen = Vec::new();
+        for feature in self.cpu_features {
+            if seen.contains(feature) {
+                return Result::Err(
+                    ir::error(ir::ErrorKind::InvalidArgument, "duplicate target CPU feature"),
+                )
+            }
+            seen.push(feature);
+        }
+        Result::Ok(())
+    }
+
+    pub fn validate_options(self: Target, options: regalloc::Options) -> Result[(), ir::Error] {
+        self.validate()?;
+        if options.max_steps < 1 || options.max_steps > 100000000 {
+            return Result::Err(
+                ir::error(ir::ErrorKind::InvalidArgument, "invalid allocator work budget"),
+            )
+        }
+        if options.registers < 0 || options.registers > self.integer_registers
+            || options.registers > self.float_registers {
+            return Result::Err(
+                ir::error(
+                    ir::ErrorKind::InvalidArgument,
+                    "allocator register count exceeds target register pool",
+                ),
+            )
+        }
+        Result::Ok(())
+    }
+
+    pub fn register_pool(self: Target, class: mach::RegClass) -> Result[Vec[string], ir::Error] {
+        self.validate()?;
+        let (base, count) = match class {
+            Integer => (0, self.integer_registers),
+            Float => (7, self.float_registers),
+        };
+        let output = Vec::new();
+        for index in 0..count {
+            output.push(physical(base + index));
+        }
+        Result::Ok(output)
+    }
+}
+
+pub fn emit_for_target(function: ir::Function, target: Target, options: regalloc::Options) -> Result[
+    Compiled,
+    ir::Error,
+] {
+    target.validate_options(options)?;
+    emit_with_options(function, options)
+}
+
+pub fn emit_module_for_target_with_algorithm(
+    name: string,
+    module: ir::Module,
+    target: Target,
+    options: regalloc::Options,
+    algorithm: regalloc::Algorithm,
+) -> Result[Package, ir::Error] {
+    target.validate_options(options)?;
+    emit_module_with_algorithm(name, module, options, algorithm)
+}

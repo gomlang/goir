@@ -1,0 +1,58 @@
+package fuzz;
+
+use ecosystem::goir as ir;
+
+pub fn inputs(case: Case) -> Vec[Vec[ir::Datum]] {
+    let result = Vec::new();
+    let ty = case.entry.signature().parameter_types()[0];
+    for index in 0..8 {
+        let integer = if index < 4 {
+            case.arguments[0]
+        } else if ty == ir::Type::I32 {
+            ir::Datum::I32(
+                if index % 2 == 0 {
+                    -2147483648
+                } else {
+                    2147483647
+                },
+            )
+        } else {
+            ir::Datum::I64(
+                if index % 2 == 0 {
+                    -9223372036854775808
+                } else {
+                    9223372036854775807
+                },
+            )
+        };
+        result.push(
+            Vec::from_array(
+                [
+                    integer,
+                    ir::Datum::I64(
+                        if index % 4 < 2 {
+                            0
+                        } else {
+                            15
+                        },
+                    ),
+                    if index < 4 {
+                        case.arguments[2]
+                    } else {
+                        ir::Datum::F64(
+                            float64_from_bits(
+                                if index % 2 == 0 {
+                                    0x8000000000000000
+                                } else {
+                                    0x7ff8000000000057
+                                },
+                            ),
+                        )
+                    },
+                    ir::Datum::Bool(index % 2 == 0),
+                ],
+            ),
+        );
+    }
+    result
+}

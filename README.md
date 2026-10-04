@@ -7,11 +7,13 @@ declarations that the ordinary Go toolchain assembles and links.
 
 The library implements typed SSA construction, block parameters, a verifier,
 a fuel-bounded interpreter with explicit call frames, scalar function modules,
-IR and module printing/reading, executable-edge SCCP and dominance-safe GVN,
+IR and module printing/reading, shared CFG/dominance/loop/use-def analysis,
+executable-edge SCCP, dominance-safe GVN, private-slot mem2reg and bounded LICM,
 integer and floating-point operations, private scalar stack slots, automatic SSA
 construction from variables, target instruction selection, and constrained
-register allocation with an independent dataflow checker. A reusable compilation
-context reports phase timings. There are no native adapters, cgo requirements
+global register allocation with an independent dataflow checker. A reusable compilation
+context caches analysis and reports phase timings. The CLI runs phase snapshots,
+seeded corpus generation and allocator comparisons. There are no native adapters, cgo requirements
 or ecosystem dependencies.
 
 The design draws on [Cranelift](https://github.com/bytecodealliance/wasmtime/tree/main/cranelift):
@@ -56,7 +58,7 @@ GoML 0.1.57 or newer.
 | Types | `Type::I64`, `Type::I32`, `Type::F64`, `Type::Bool` |
 | Handles | Function-specific `Value`, `Block` and `StackSlot`, with `index()` |
 | Constants | `iconst`, `i32const`, `fconst`, `bconst`, `Operation::Constant` |
-| Integer operations | `Add`, `Sub`, `Mul`, `And`, `Or`, `Xor`, `Shl`, `ShrU`, `ShrS` |
+| Integer operations | `Add`, `Sub`, `Mul`, `And`, `Or`, `Xor`, masked `Shl`/`ShrU`/`ShrS`, checked `ShlChecked`/`ShrUChecked`/`ShrSChecked`, `DivS`/`DivU`/`RemS`/`RemU` |
 | Integer comparisons | `icmp`: `Equal`, `NotEqual`, signed and unsigned less-than/less-or-equal |
 | Integer conversions | `convert`: `IntConversion::SignExtend`, `ZeroExtend`, `Truncate` |
 | Floating-point operations | `fbinary`: `FloatOp::Add`, `Sub`, `Mul`, `Div`; `fcmp`: `FloatCC::Equal`, `NotEqual`, `Less`, `LessEqual` |
@@ -124,6 +126,16 @@ negative counts; Go source shifts need explicit masking to match. `ShrS`
 sign-extends and `ShrU` zero-extends. Unsigned comparisons reinterpret the
 operands' bit patterns. `SignExtend` and `ZeroExtend` convert `I32` to `I64`;
 `Truncate` keeps the low 32 bits of an `I64`.
+
+`DivS` and `RemS` use signed truncation toward zero; `DivU` and `RemU`
+reinterpret both operands as unsigned bit patterns. Division by zero returns
+`ArithmeticTrap` in the interpreter and produces a recoverable Go panic in native
+execution. Signed minimum divided by -1 wraps to the signed minimum, with
+remainder zero. The checked shifts treat counts as signed integers: negative
+counts trap, and counts at least the operand width produce zero for left/logical
+right shifts and sign fill for arithmetic right shifts. The original masked
+shift operations retain their semantics. Dead trapping operations remain
+observable after optimization; successful constant operations can be folded.
 
 `F64` implements binary64 addition, subtraction, multiplication and division
 without fast-math identities, reassociation or contraction. Comparisons follow
@@ -209,10 +221,16 @@ cleanup repeats while the number of values, blocks or branches decreases.
 Block storage order need not follow dominance order.
 
 `Operation::effects()` reports memory reads, memory writes, potential traps and
-calls. Loads, stores and calls are conservatively retained and excluded from
-GVN; loads across a store or call are not merged. Calls remain even if they
-return no values or their results are unused. Scalar stack accesses are checked
-statically and non-trapping; calls conservatively report all four effects.
+calls. GVN excludes loads, stores and calls. Private scalar slots have no address
+or escape operation, so mem2reg can promote them across branches, loops and
+calls. Pruned slot liveness adds block parameters only where incoming contents
+are read before being overwritten. Zero initialization becomes typed entry
+constants, preserving F64 zero and NaN copy bits. Promotion removes slot accesses
+and dead stores; when value or parameter growth exceeds the function's limits,
+local forwarding and CFG-aware dead-store elimination retain slot storage.
+Calls remain even if they return no values or their results are unused.
+Scalar stack accesses are checked statically and non-trapping; calls
+conservatively report all four effects.
 Loops and divergence remain observable: dead arithmetic inside an infinite loop
 can disappear, but the loop remains.
 Optimization can change interpreter fuel consumption. Do not expect identical
@@ -220,7 +238,15 @@ fuel-exhaustion thresholds before and after optimization.
 
 `opt::simplify_with_options` accepts an `opt::Options` work budget. Exceeding the
 budget returns `LimitExceeded` and leaves the input unchanged. The optimizer
-does not reassociate arithmetic chains or move code out of loops.
+does not reassociate arithmetic chains. The pipeline runs scalar simplification
+to a fixed point, promotes private slots, simplifies again, performs LICM from
+inner natural loops outward, then simplifies again. LICM moves only existing
+pure, non-trapping operations whose operands are invariant; it does not move
+calls, loads/stores or potentially trapping integer operations. A unique jump
+predecessor serves as a preheader; otherwise checked reconstruction creates one
+and redirects incoming edges. Transformations that cannot fit the source's shape
+or verifier limits fall back or skip hoisting; exhaustion of the optimizer's
+shared work budget still returns `LimitExceeded`.
 
 `ir::rewrite(source, blocks)` is the checked reconstruction boundary for custom
 passes. It accepts edited block snapshots using existing source handles,
@@ -229,6 +255,31 @@ fresh handles, and verifies the result. Obtain rewritten slot handles from the
 new function; old slot handles belong to the source. Reconstruction can remove
 or reorder definitions and blocks but cannot introduce new handles. Missing or duplicate definitions,
 foreign handles, type errors and dominance violations return recoverable errors.
+
+`ir::Reconstruction::new(verified_function)` supports passes that introduce
+blocks, parameters, values and slots. It reserves fresh handles, retains the
+source signature, module references and limits, and verifies the complete
+replacement at `finish`. This is the reconstruction boundary used by mem2reg and
+LICM.
+
+## Shared analysis
+
+`analysis::analyze` and `analyze_verified` return CFG successor/predecessor
+snapshots, reachability, reverse postorder, dominance, natural loops, nesting
+weights and per-value definition/use sites, including edge arguments.
+`analysis::Graph::new` also accepts an indexed graph directly for machine passes.
+Indices and handles are checked and work is charged to a caller-supplied budget.
+Graphs allow unreachable nodes; verified SSA functions require every block to
+be reachable. Natural loops use dominance backedges, without assuming that block
+storage order follows control flow. Irreducible cycles do not receive a natural
+loop header or LICM treatment.
+
+`analysis::Context` caches the latest analysis by immutable function identity.
+Rewrites have fresh identities and invalidate that cached result; analysis of
+the same verified function can reuse it. `clear` releases the cached result and
+retains scratch capacity. `statistics` reports builds, hits, invalidations and
+retained capacity. Graphs and inspection vectors remain independent of later
+context use. Context copies share mutable storage and require serialized use.
 
 ## ABI and native output
 
@@ -248,7 +299,10 @@ one declaration file. Both lower SSA through `mach::lower` and
 Lowering selects encodable signed-32-bit immediate operations and constant
 shifts with the IR's masking rule, uses `LEA` for multiplication by 3, 5 or 9,
 and fuses eligible integer comparisons used only by a branch. Floating-point
-operations use SSE2 scalar instructions. These are explicit GoML matching
+operations use SSE2 scalar instructions. Selection separates pure matching from
+committing machine instructions. An adjacent private-slot load with one use can
+fold into an integer or float arithmetic memory operand when the opcode is legal;
+stores, calls and multiple uses prevent the fold. These are explicit GoML matching
 rules; there is no ISLE generator or general pattern-selection framework.
 
 The machine IR exposes use/def operands, early/late positions and Any, Register,
@@ -266,14 +320,19 @@ a cost combining next use and natural-loop use weights, splits lifetimes with
 explicit spill/reload edits, and rematerializes integer/float constants when
 spilled. Saved spill homes avoid repeated stores while still valid. A bounded
 edge-coalescing pass prioritizes loop edges and checks segment interference.
+The default `Algorithm::Global` starts with segmented linear allocation, uses a
+priority queue to promote valuable spilled ranges and evict lower-cost conflicts,
+then assigns regional homes using natural-loop costs and local interference.
+The same value can use a register in a hot loop and a stack home on a cold path.
 Live values survive calls, and live-through values and block parameters are
-reconciled at edges. This remains a block-local allocator with canonical entry
-homes, rather than a global priority-based splitting allocator. Parallel copies
+reconciled at edges using the destination block's home. `Algorithm::LinearScan`
+preserves the earlier whole-function-home baseline. Parallel copies
 use DX to break cycles and AX for memory copies.
 
 `Allocation.blocks()` exposes per-operand bindings and ordered before/after,
-terminal and edge edits; `Allocation.location(reg)` reports the canonical block-entry location,
-not necessarily every instruction's location. The emitter consumes these exact
+terminal and edge edits; `Allocation.location(reg)` reports the whole-function
+base home. `block_locations(block)` and `entry_location(block, reg)` report
+regional homes. Actual operand bindings can differ from either home. The emitter consumes these exact
 bindings and edits. `regalloc::verify` checks canonical location conflicts and
 runs an independent symbolic dataflow checker. `regalloc::check` validates the
 actual move stream, fixed/reused operands, call clobbers and simultaneous block
@@ -297,6 +356,22 @@ when a floating-point pool is present.
 `emit_module_with_options` accept these options. `amd64::emit_allocation`
 verifies and emits an already computed allocation.
 
+`allocate_with_algorithm`, `allocate_profiled_with_algorithm` and the amd64
+`emit_*_with_algorithm` APIs select either algorithm. `Allocation.statistics()`
+reports global/regional evictions, values split across blocks, spill edits,
+loop-weighted spill traffic, edge moves and rematerializations. Weights are
+heuristics rather than execution counts. The independent checker derives
+cross-block definition origins from machine IR and checks regional entry homes
+without trusting allocator liveness.
+
+`amd64::Target::standard()` selects Linux amd64, Go 1.26, ABI0, SSE2 and seven
+registers in each class. `validate` rejects unsupported OS/architecture/ABI/Go
+versions and inconsistent CPU feature lists. Integer and float pool caps can be
+configured independently; the current allocator option requests one count for
+both classes, which must fit both caps. AVX/AVX2 profiles still emit SSE2 scalar
+instructions. `emit_for_target`, `emit_module_for_target_with_algorithm` and
+context target methods validate this profile before producing output.
+
 ## Reusable compilation context
 
 `amd64::CompilerContext::new().compile(function)` verifies, optimizes, lowers,
@@ -304,13 +379,17 @@ allocates, checks and emits one function. Unlike `emit`, this entry point enable
 SSA optimization by default. `compile_with_options(function, optimize,
 regalloc_options)` selects optimization and allocation settings explicitly.
 The returned `Compilation` contains the optimized function, machine IR,
-allocation, `Compiled` output and `PhaseTimings` in nanoseconds for verification,
-optimization, lowering, liveness, allocation, checking, emission and total time.
+allocation, shared `Analysis`, `Compiled` output and `PhaseTimings` in nanoseconds
+for verification, optimization, analysis, lowering, liveness, allocation,
+checking, emission and total time.
 Optimization time includes verification of rewritten IR.
 
 Reuse a context for successive functions to retain liveness scratch-array and
-assembly-line capacities. It does not retain every temporary allocation or
-cache compiled functions. `completed_functions()` counts successful calls and
+assembly-line capacities and the latest identity-keyed analysis. It does not
+retain every temporary allocation or cache compiled functions. `compile_with_algorithm`
+and `compile_for_target_with_algorithm` select allocation and target settings.
+`analysis_statistics()` and `clear_analysis()` inspect or release the analysis
+cache. `completed_functions()` counts successful calls and
 `retained_capacity()` reports retained vector capacity. Results stay independent
 of subsequent compilations. Context copies share storage and require serialized
 use; they are not synchronized.
@@ -334,7 +413,8 @@ ABI0 support does not imply ABIInternal support. Go's
 [internal ABI](https://github.com/golang/go/blob/go1.26.0/src/cmd/compile/abi-internal.md)
 is version-dependent. Direct register-ABI output, Go object files, managed
 pointers, heap writes, GC maps for managed locals, closures, interfaces,
-panic/defer and JIT loading remain future work.
+general panic/defer lowering and JIT loading remain future work. Arithmetic traps
+are supported within the scalar boundary.
 
 The Go 1.26 runtime-boundary probe checks two concrete cases: a hand-written,
 no-call ABI0 leaf reads a heap pointer supplied by a typed Go prototype while
@@ -393,6 +473,40 @@ The example constructs `Sum(n)` and a two-value swap loop. Without an output
 directory it prints IR and assembly and checks `Sum(100) == 5050`; with a
 directory it writes the two Go package source files.
 
+The CLI accepts standalone function text or a complete module:
+
+```sh
+goml run --example cli -- check tests/data/loop.goir
+goml run --example cli -- run tests/data/loop.goir --arg i64:10
+goml run --example cli -- compile tests/data/loop.goir --out _artifact/generated
+goml run --example cli -- dump tests/data/loop.goir --stage allocate --registers 1 --algorithm global
+goml run --example cli -- snapshot tests/data/loop.goir --arg i64:10 --out tests/data/loop-stages
+goml run --example cli -- bench tests/data/loop.goir --samples 15 --out _artifact
+goml run --example cli -- fuzz 7 --out _artifact/seed-7
+```
+
+`compile` emits Go declarations, amd64 assembly, normalized module IR and a
+target manifest with input SHA-256 and required imports. `snapshot` emits verify,
+optimize, lower, allocate, compile and interpreter-run outputs; supply `--entry`
+for a multi-definition module and one typed `--arg` for each parameter. Lower,
+allocate and compile stages optimize by default; `--no-opt` selects original IR.
+`--package`, `--registers`, `--algorithm`, `--target` and `--cpu` select emission
+settings. Currently the only target profile is `linux-amd64-go1.26-abi0`.
+F64 arguments can use `f64bits:U64` to preserve NaNs and signed zero.
+
+`cli::parse` and `cli::execute` expose the command logic as library APIs;
+execution returns text and artifacts before the executable writes files.
+Compilation generates sources without invoking Go. Imported helpers must be
+provided when building the generated package; interpreter commands require a
+separate host harness to execute imports. Interpreter fuel does not bound native
+execution.
+
+`bench` compares both allocation algorithms with a reusable context and reports
+each phase's P50/P95, frames, instructions, spill traffic and analysis-cache
+statistics in `pipeline-bench.tsv`. Samples include validation and the first
+context use; optimization produces fresh function identities, so analysis hits
+are most visible with `--no-opt`. There are no timing thresholds.
+
 `goml test` includes public API and verifier regressions plus the example's
 native integration test. That test generates a temporary Go module under
 `_artifact/`, runs `go vet` and `go test`, and compares generated functions with
@@ -426,6 +540,26 @@ loads are checked by bits, including NaN payloads. Arithmetic NaN results are
 checked as NaN; other arithmetic results are checked by bits. Separate tests
 exercise mixed floating-point calls and runtime-boundary probes.
 
+The scalar extension suite checks signed/unsigned division and remainder,
+checked shifts, exceptional paths and private-load folding against an independent
+Go implementation in seven configurations. The allocator comparison checks
+I64/F64 hot/cold pressure with both algorithms and 0/1/7 pool registers. Its
+seven-register fixtures reduced heuristic weighted spill traffic from 293 to 50
+and 243 to 15; one-register traffic can increase, and compile-time cost is reported
+separately. These are fixture observations rather than general performance claims.
+
+`fuzz::generate(seed)` creates a reproducible, bounded module with a helper call,
+non-topological diamond/loop blocks, integer and F64 slots, dead stores, typed
+selection, division and both shift contracts. `fuzz::inputs` covers both branch
+directions, zero/15 loop iterations, integer boundaries, NaNs and signed zeros.
+The seeded native suite checks 25 seeds and eight inputs per seed across nine
+configurations: both allocators with 0/1/7 registers, optimized Global with 0/7
+registers and the reference stack backend. It retains complete module text,
+seed/entry/fuel and typed inputs on failure. Native mismatches trigger a bounded
+module reduction against the same backend; compile failures retain the source
+without being accepted as a reproduced miscompile. The reducer also preserves
+reference identities and signatures.
+
 `reader::read` accepts printed IR with single-token ASCII names;
 `read_with_references` additionally accepts a module reference table for calls.
 Slot declarations appear before blocks, for example `slot0: i64`.
@@ -434,9 +568,13 @@ imports, declarations and mutually recursive definitions.
 
 `filetest::run` and `run_module` provide verify, optimize, lower, allocate,
 compile and interpreter-run stages. Lowering output includes operand constraints
-and clobbers; allocation output includes physical bindings and edits.
-`assert_output` checks required and forbidden text. These are substring checks,
-not a full FileCheck pattern language. Module run stages use the default
+and clobbers, parameters, terminators and edge copies; allocation output includes
+regional homes, physical bindings, clobbers and before/after/terminal/edge edits.
+`assert_output` checks required/forbidden substrings, `assert_ordered` checks
+ordered occurrences and `assert_exact` compares complete output with a line
+diagnostic. They do not implement a full FileCheck pattern language. Generated
+six-phase goldens are under `tests/data/loop-stages/`; regenerate them with the
+snapshot command above. Module run stages use the default
 interpreter without a host callback, so executing an import requires a custom
 interpreter harness. Fixtures live in `tests/data/`.
 
@@ -459,7 +597,9 @@ and assembly-source bytes. A separate `_artifact/encoded-code.tsv` records
 linked ABI0 symbol sizes from `go tool nm`, including assembler-generated code.
 The typed suite additionally writes `_artifact/typed-phases.tsv` with three
 per-function samples from `CompilerContext`. The runtime probe writes
-`_artifact/runtime-boundary.txt`. These measurements establish observations,
+`_artifact/runtime-boundary.txt`. New reports include `global-allocation.tsv`
+with 21-sample allocator P50/P95, `scalar-native.txt`, `seeded-fuzz.tsv` and
+`pipeline-bench.tsv`. Reports use actual tab separators. These measurements establish observations,
 not performance guarantees or benchmark thresholds. Optional execution
 benchmarks write `_artifact/benchmarks.txt`:
 
@@ -480,8 +620,8 @@ CI pins the shared workflow at a published commit; that revision selects the
 checksum-pinned GoML release and sibling repository revisions and runs Go 1.26.x.
 It checks formatting, library/example tests, independent downstream verification,
 cached builds and the example program. The CI artifact includes the verification
-logs, `codegen.tsv`, `encoded-code.tsv`, `typed-phases.tsv` and
-`runtime-boundary.txt`. From the sibling verification checkout, run:
+logs, generated performance/corpus reports and retained native reproducers.
+From the sibling verification checkout, run:
 
 ```sh
 python3 ci/ecosystem.py verify --libraries .. --module goir --goml /absolute/path/to/goml
@@ -494,21 +634,22 @@ python3 ci/ecosystem.py verify --libraries .. --module goir --goml /absolute/pat
 | `model.goml`, `builder.goml`, `module.goml` | IR, signatures, modules, handles and checked construction |
 | `verify.goml`, `verified.goml` | Structural/type validation, dominance and verified-function capabilities |
 | `frontend.goml` | Variable-based SSA construction and completed-module body replacement |
-| `rewrite.goml`, `opt/` | Checked reconstruction, SCCP, GVN and effect-aware dead-code elimination |
+| `rewrite.goml`, `reconstruct.goml`, `opt/` | Checked reconstruction, SCCP, GVN, mem2reg, LICM and dead-code/store elimination |
+| `analysis/` | Shared CFG, dominance, natural loops, use-def sites and identity-keyed cache |
 | `interp.goml`, `numeric.goml`, `display.goml` | Scalar/slot execution, bit semantics and deterministic diagnostics |
 | `abi/layout.goml` | Go scalar layout, symbols and declarations |
 | `mach/` | Virtual-register instructions, explicit edge copies and SSA lowering |
-| `regalloc/` | Segmented liveness, next-use splitting, edge moves and symbolic allocation checks |
-| `amd64/registers.goml`, `amd64/context.goml` | Operand-driven emission, ABI0 calls and reusable compilation context |
-| `reader/`, `filetest/` | Bounded text IR reader, stage runner and failure-preserving reducer |
+| `regalloc/` | Segmented liveness, priority/region allocation, splitting, statistics and independent checks |
+| `amd64/registers.goml`, `amd64/context.goml`, `amd64/target.goml` | Operand emission, ABI0 calls, target validation and reusable context |
+| `reader/`, `filetest/`, `cli/`, `fuzz/` | Text IR, phase snapshots, command logic, seeded modules and reducers |
 | `amd64/emit.goml`, `amd64/metrics.goml` | Reference stack backend and source-code metrics |
 | `examples/basic/` | Consumer example and native differential validation |
 
-Further allocation work can compare global splitting strategies and measured
-compile-time costs against the current loop-weighted block-local allocator.
-Instruction selection can grow from the current explicit patterns; memory
-optimization can add alias-aware load/store reasoning without weakening effects.
-A GoML ANF adapter still needs a supported scalar subset and differential tests.
+The current work stays within the independent goir library. GoML compiler/ANF
+integration is deferred. Further native work can add richer pattern-selection
+rules, per-class allocation requests and broader measured global-allocation
+strategies. Arbitrary memory requires a new aliasing and effect contract beyond
+the current private slots.
 Managed references require a separate runtime-aware design for safepoints, stack maps,
 stack movement and write barriers. ABIInternal and Go object emission should
 be introduced with a pinned toolchain profile and independent ABI conformance

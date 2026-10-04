@@ -168,6 +168,17 @@ pub fn simplify_verified_with_options(function: ir::VerifiedFunction, options: O
         )
     }
     let budget = Ref::new(options.max_steps);
+    let function = simplify_fixed_point(function, budget)?;
+    let function = promote_slots(function, budget)?;
+    let function = simplify_fixed_point(function, budget)?;
+    let function = hoist_invariants(function, budget)?;
+    simplify_fixed_point(function, budget)
+}
+
+fn simplify_fixed_point(function: ir::VerifiedFunction, budget: Ref[isize]) -> Result[
+    ir::VerifiedFunction,
+    ir::Error,
+] {
     let mut current = function;
     let mut size = progress_size(current.function());
     loop {
@@ -215,7 +226,7 @@ fn simplify_once(checked: ir::VerifiedFunction, budget: Ref[isize]) -> Result[
             spend(budget)?;
             for instruction in block.instructions {
                 spend(budget)?;
-                if instruction.operation.has_effects() || instruction.results.len() != 1 {
+                if !safe_to_fold(instruction.operation, constants) || instruction.results.len() != 1 {
                     continue;
                 }
                 let index = instruction.results[0].index();
@@ -242,7 +253,7 @@ fn simplify_once(checked: ir::VerifiedFunction, budget: Ref[isize]) -> Result[
         let instructions = Vec::new();
         for instruction in block.instructions {
             spend(budget)?;
-            let operation = if !instruction.operation.has_effects()
+            let operation = if safe_to_fold(instruction.operation, constants)
                 && instruction.results.len() == 1 {
                 match constants[instruction.results[0].index()] {
                     Option::Some(value) => ir::Operation::Constant(value),
