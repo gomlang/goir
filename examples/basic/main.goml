@@ -1,0 +1,100 @@
+package main;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use std::env;
+use std::fs;
+use std::path;
+use std::testing;
+
+pub fn sum_function() -> Result[ir::Function, ir::Error] {
+    let builder = ir::Builder::new(
+        "Sum",
+        Vec::from_array([ir::Type::I64]),
+        Vec::from_array([ir::Type::I64]),
+    )?;
+    let n = builder.parameters(builder.entry())?[0];
+    let header = builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64]))?;
+    let body = builder.append_block(Vec::new())?;
+    let exit = builder.append_block(Vec::from_array([ir::Type::I64]))?;
+    let zero = builder.iconst(0)?;
+    let one = builder.iconst(1)?;
+    builder.jump(header, Vec::from_array([n, zero]))?;
+    builder.switch_to(header)?;
+    let parameters = builder.parameters(header)?;
+    let count = parameters[0];
+    let accumulator = parameters[1];
+    let more = builder.icmp(ir::IntCC::SignedLess, zero, count)?;
+    builder.branch(
+        more,
+        ir::Edge { target: body, arguments: Vec::new() },
+        ir::Edge { target: exit, arguments: Vec::from_array([accumulator]) },
+    )?;
+    builder.switch_to(body)?;
+    let next = builder.binary(ir::BinaryOp::Sub, count, one)?;
+    let sum = builder.binary(ir::BinaryOp::Add, accumulator, count)?;
+    builder.jump(header, Vec::from_array([next, sum]))?;
+    builder.switch_to(exit)?;
+    builder.ret(builder.parameters(exit)?)?;
+    builder.finish()
+}
+
+pub fn swap_function() -> Result[ir::Function, ir::Error] {
+    let builder = ir::Builder::new(
+        "Swap",
+        Vec::from_array([ir::Type::I64, ir::Type::I64, ir::Type::I64]),
+        Vec::from_array([ir::Type::I64, ir::Type::I64]),
+    )?;
+    let inputs = builder.parameters(builder.entry())?;
+    let header = builder.append_block(
+        Vec::from_array([ir::Type::I64, ir::Type::I64, ir::Type::I64]),
+    )?;
+    let exit = builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64]))?;
+    let zero = builder.iconst(0)?;
+    let one = builder.iconst(1)?;
+    builder.jump(header, inputs)?;
+    builder.switch_to(header)?;
+    let values = builder.parameters(header)?;
+    let more = builder.icmp(ir::IntCC::SignedLess, zero, values[2])?;
+    let next = builder.binary(ir::BinaryOp::Sub, values[2], one)?;
+    builder.branch(
+        more,
+        ir::Edge { target: header, arguments: Vec::from_array([values[1], values[0], next]) },
+        ir::Edge { target: exit, arguments: Vec::from_array([values[0], values[1]]) },
+    )?;
+    builder.switch_to(exit)?;
+    builder.ret(builder.parameters(exit)?)?;
+    builder.finish()
+}
+
+fn main() -> () {
+    let sum = testing::expect_ok(sum_function(), "build sum");
+    let swap = testing::expect_ok(swap_function(), "build swap");
+    let output = testing::expect_ok(
+        amd64::emit_package("generated", Vec::from_array([sum, swap])),
+        "emit amd64",
+    );
+    let args = env::args();
+    if args.len() == 2 {
+        let directory = args[1];
+        testing::assert_ok(fs::create_dir_all(directory));
+        testing::assert_ok(
+            fs::write_file_structured(path::join(directory, "generated_amd64.s"), output.assembly),
+        );
+        testing::assert_ok(
+            fs::write_file_structured(path::join(directory, "generated.go"), output.declarations),
+        );
+        println("wrote Go declarations and amd64 assembly to " + directory);
+    } else {
+        print(testing::expect_ok(ir::display(sum), "display"));
+        println("Sum(100) = 5050");
+        testing::assert(
+            testing::expect_ok(
+                ir::interpret(sum, Vec::from_array([ir::Datum::I64(100)]), 1000),
+                "interpret",
+            )
+                == Vec::from_array([ir::Datum::I64(5050)]),
+        );
+        print(output.assembly);
+    }
+}

@@ -1,0 +1,376 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::examples::basic as example;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn native_scalar(name: string, operation: Option[ir::BinaryOp], comparison: ir::IntCC) -> ir::Function {
+    let output = if operation.is_some() {
+        ir::Type::I64
+    } else {
+        ir::Type::Bool
+    };
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            name,
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([output]),
+        ),
+        "scalar",
+    );
+    let values = testing::expect_ok(builder.parameters(builder.entry()), "parameters");
+    let result = testing::expect_ok(
+        match operation {
+            Some(op) => builder.binary(op, values[0], values[1]),
+            None => builder.icmp(comparison, values[0], values[1]),
+        },
+        "operation",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([result])));
+    testing::expect_ok(builder.finish(), "scalar function")
+}
+
+fn native_identity(name: string, types: Vec[ir::Type]) -> ir::Function {
+    let builder = testing::expect_ok(ir::Builder::new(name, types, types), "identity");
+    testing::assert_ok(
+        builder.ret(testing::expect_ok(builder.parameters(builder.entry()), "parameters")),
+    );
+    testing::expect_ok(builder.finish(), "identity function")
+}
+
+fn native_select(name: string, ty: ir::Type) -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(name, Vec::from_array([ir::Type::Bool, ty, ty]), Vec::from_array([ty])),
+        "select",
+    );
+    let values = testing::expect_ok(builder.parameters(builder.entry()), "parameters");
+    let result = testing::expect_ok(
+        builder.select(values[0], values[1], values[2]),
+        "select instruction",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([result])));
+    testing::expect_ok(builder.finish(), "select function")
+}
+
+fn native_stack() -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "LargeStack",
+            Vec::from_array([ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "stack builder",
+    );
+    let mut sum = testing::expect_ok(builder.parameters(builder.entry()), "parameter")[0];
+    for index in 0..768 {
+        let value = testing::expect_ok(builder.iconst(index.to_i64()), "constant");
+        sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, sum, value), "add");
+    }
+    testing::assert_ok(builder.ret(Vec::from_array([sum])));
+    testing::expect_ok(builder.finish(), "large stack function")
+}
+
+fn literal(value: ir::Datum) -> string {
+    match value {
+        I64(integer) => integer.to_string(),
+        Bool(boolean) => if boolean {
+            "true"
+        } else {
+            "false"
+        },
+    }
+}
+
+fn add_differential(lines: Vec[string], function: ir::Function, cases: Vec[Vec[ir::Datum]]) -> () {
+    lines.push("func TestDifferential" + function.name() + "(t *testing.T) {");
+    for index in 0..cases.len() {
+        let arguments = cases[index];
+        let expected = testing::expect_ok(
+            ir::interpret(function, arguments, 100000),
+            "reference interpretation",
+        );
+        let inputs = Vec::new();
+        for value in arguments {
+            inputs.push(literal(value));
+        }
+        let names = Vec::new();
+        for position in 0..expected.len() {
+            names.push(f"got{position}");
+        }
+        lines.push("{");
+        let call = function.name() + "(" + inputs.join(", ") + ")";
+        lines.push(
+            if names.is_empty() {
+                call
+            } else {
+                names.join(", ") + " := " + call
+            },
+        );
+        for position in 0..expected.len() {
+            lines.push(
+                f"if got{position} != " + literal(expected[position])
+                    + f" {{ t.Fatalf(\"case {index}, result {position}: %v\", got{position}) }}",
+            );
+        }
+        lines.push("}");
+    }
+    lines.push("}");
+}
+
+fn integer_cases() -> Vec[Vec[ir::Datum]] {
+    let boundaries: Vec[i64] = Vec::from_array(
+        [
+            -9223372036854775808,
+            -9223372036854775807,
+            -65,
+            -64,
+            -1,
+            0,
+            1,
+            2,
+            63,
+            64,
+            65,
+            127,
+            255,
+            1024,
+            9223372036854775806,
+            9223372036854775807,
+        ],
+    );
+    let cases = Vec::new();
+    let mut state: u64 = 0x6a09e667f3bcc909;
+    for index in 0..128 {
+        let left = if index < 64 {
+            boundaries[index % boundaries.len()]
+        } else {
+            state.to_i64()
+        };
+        state = state ^ (state << 13);
+        state = state ^ (state >> 7);
+        state = state ^ (state << 17);
+        let right = if index < 64 {
+            boundaries[(index / 4) % boundaries.len()]
+        } else {
+            state.to_i64()
+        };
+        cases.push(Vec::from_array([ir::Datum::I64(left), ir::Datum::I64(right)]));
+    }
+    cases
+}
+
+fn run_go(directory: string, args: Vec[string]) -> string {
+    let output = testing::expect_ok(
+        process::Command::new("go").args(args).current_dir(directory).env("GOWORK", "off").env(
+            "GOTOOLCHAIN",
+            "local",
+        ).output_timeout_structured(time::Duration::from_seconds(90)),
+        "run Go toolchain",
+    );
+    let stdout = testing::expect_ok(output.stdout().to_string_utf8(), "Go stdout");
+    let stderr = testing::expect_ok(output.stderr().to_string_utf8(), "Go stderr");
+    if output.status().code().unwrap_or(-1) != 0 {
+        testing::fail("Go integration failed in " + directory + "\n" + stdout + stderr);
+    }
+    stdout
+}
+
+#[test]
+fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
+    let directory = path::join(
+        "_artifact",
+        "goir-native-" + hash::sha256(testing::expect_ok(rand::bytes(16), "unique artifact")),
+    );
+    testing::assert_ok(fs::create_dir_all(directory));
+    let version = run_go(directory, Vec::from_array(["env", "GOVERSION", "GOOS", "GOARCH"]));
+    testing::assert(version.contains("go1.26.") && version.contains("\nlinux\namd64\n"));
+    let functions = Vec::new();
+    let lines = Vec::from_array(["package generated", "import \"testing\""]);
+    let ops = Vec::from_array(
+        [
+            ir::BinaryOp::Add,
+            ir::BinaryOp::Sub,
+            ir::BinaryOp::Mul,
+            ir::BinaryOp::And,
+            ir::BinaryOp::Or,
+            ir::BinaryOp::Xor,
+            ir::BinaryOp::Shl,
+            ir::BinaryOp::ShrU,
+            ir::BinaryOp::ShrS,
+        ],
+    );
+    for index in 0..ops.len() {
+        let function = native_scalar(f"Op{index}", Option::Some(ops[index]), ir::IntCC::Equal);
+        functions.push(function);
+        add_differential(lines, function, integer_cases());
+    }
+    let comparisons = Vec::from_array(
+        [
+            ir::IntCC::Equal,
+            ir::IntCC::NotEqual,
+            ir::IntCC::SignedLess,
+            ir::IntCC::SignedLessEqual,
+            ir::IntCC::UnsignedLess,
+            ir::IntCC::UnsignedLessEqual,
+        ],
+    );
+    for index in 0..comparisons.len() {
+        let function = native_scalar(f"Cmp{index}", Option::None, comparisons[index]);
+        functions.push(function);
+        add_differential(lines, function, integer_cases());
+    }
+    let mixed = native_identity(
+        "Mixed",
+        Vec::from_array([ir::Type::Bool, ir::Type::I64, ir::Type::Bool]),
+    );
+    let single = native_identity("SingleBool", Vec::from_array([ir::Type::Bool]));
+    let empty = native_identity("Empty", Vec::new());
+    let pair = native_identity("BoolPair", Vec::from_array([ir::Type::Bool, ir::Type::Bool]));
+    let sink_builder = testing::expect_ok(
+        ir::Builder::new("SinkBool", Vec::from_array([ir::Type::Bool]), Vec::new()),
+        "sink",
+    );
+    testing::assert_ok(sink_builder.ret(Vec::new()));
+    let sink = testing::expect_ok(sink_builder.finish(), "sink function");
+    let constant_builder = testing::expect_ok(
+        ir::Builder::new("ConstantBool", Vec::new(), Vec::from_array([ir::Type::Bool])),
+        "constant",
+    );
+    let boolean = testing::expect_ok(constant_builder.bconst(true), "constant boolean");
+    testing::assert_ok(constant_builder.ret(Vec::from_array([boolean])));
+    let constant = testing::expect_ok(constant_builder.finish(), "constant function");
+    let many_types = Vec::new();
+    let many_arguments = Vec::new();
+    for index in 0..20 {
+        many_types.push(ir::Type::I64);
+        many_arguments.push(ir::Datum::I64(index.to_i64() * 17 - 100));
+    }
+    let many = native_identity("Many", many_types);
+    functions.extend(Vec::from_array([pair, sink, constant, many]));
+    add_differential(
+        lines,
+        pair,
+        Vec::from_array([Vec::from_array([ir::Datum::Bool(true), ir::Datum::Bool(false)])]),
+    );
+    add_differential(
+        lines,
+        sink,
+        Vec::from_array(
+            [Vec::from_array([ir::Datum::Bool(false)]), Vec::from_array([ir::Datum::Bool(true)])],
+        ),
+    );
+    add_differential(lines, constant, Vec::from_array([Vec::new()]));
+    add_differential(lines, many, Vec::from_array([many_arguments]));
+    let select_int = native_select("SelectInt", ir::Type::I64);
+    let select_bool = native_select("SelectBool", ir::Type::Bool);
+    let sum = testing::expect_ok(example::sum_function(), "sum");
+    let swap = testing::expect_ok(example::swap_function(), "swap");
+    let large = native_stack();
+    functions.extend(
+        Vec::from_array([mixed, single, empty, select_int, select_bool, sum, swap, large]),
+    );
+    let mixed_cases = Vec::new();
+    let boolean_cases = Vec::new();
+    let select_cases = Vec::new();
+    for boolean in Vec::from_array([false, true]) {
+        for other in Vec::from_array([false, true]) {
+            for n in Vec::from_array([-9223372036854775808, 0, 9223372036854775807]) {
+                mixed_cases.push(
+                    Vec::from_array(
+                        [ir::Datum::Bool(boolean), ir::Datum::I64(n), ir::Datum::Bool(other)],
+                    ),
+                );
+                select_cases.push(
+                    Vec::from_array(
+                        [ir::Datum::Bool(boolean), ir::Datum::I64(n), ir::Datum::I64(17)],
+                    ),
+                );
+            }
+            for last in Vec::from_array([false, true]) {
+                boolean_cases.push(
+                    Vec::from_array(
+                        [ir::Datum::Bool(boolean), ir::Datum::Bool(other), ir::Datum::Bool(last)],
+                    ),
+                );
+            }
+        }
+    }
+    add_differential(lines, mixed, mixed_cases);
+    add_differential(
+        lines,
+        single,
+        Vec::from_array(
+            [Vec::from_array([ir::Datum::Bool(false)]), Vec::from_array([ir::Datum::Bool(true)])],
+        ),
+    );
+    add_differential(lines, empty, Vec::from_array([Vec::new()]));
+    add_differential(lines, select_int, select_cases);
+    add_differential(lines, select_bool, boolean_cases);
+    let sum_cases = Vec::new();
+    let swap_cases = Vec::new();
+    for n in 0..32 {
+        sum_cases.push(Vec::from_array([ir::Datum::I64(n.to_i64())]));
+        swap_cases.push(
+            Vec::from_array([ir::Datum::I64(11), ir::Datum::I64(29), ir::Datum::I64(n.to_i64())]),
+        );
+    }
+    add_differential(lines, sum, sum_cases);
+    add_differential(lines, swap, swap_cases);
+    add_differential(
+        lines,
+        large,
+        Vec::from_array(
+            [
+                Vec::from_array([ir::Datum::I64(17)]),
+                Vec::from_array([ir::Datum::I64(9223372036854775807)]),
+            ],
+        ),
+    );
+    let output = testing::expect_ok(amd64::emit_package("generated", functions), "native output");
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "go.mod"),
+            "module goir-native-test\n\ngo 1.26.0\n",
+        ),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(path::join(directory, "generated.go"), output.declarations),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(path::join(directory, "generated_amd64.s"), output.assembly),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "differential_test.go"),
+            lines.join("\n") + "\n",
+        ),
+    );
+    let prefix = if fs::is_dir("examples/basic") {
+        "examples/basic/"
+    } else {
+        ""
+    };
+    let oracle = testing::expect_ok(
+        fs::read_file_structured(prefix + "tests/data/reference_test.go"),
+        "Go oracle",
+    );
+    testing::assert_ok(
+        fs::write_file_structured(path::join(directory, "reference_test.go"), oracle),
+    );
+    let _ = run_go(directory, Vec::from_array(["vet", "./..."]));
+    let output = run_go(
+        directory,
+        Vec::from_array(["test", "-count=1", "-timeout=60s", "-v", "./..."]),
+    );
+    testing::assert(output.contains("PASS"));
+    testing::assert_ok(fs::remove_dir_all(directory));
+}

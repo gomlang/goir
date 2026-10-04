@@ -1,0 +1,66 @@
+package goir;
+
+use std::testing;
+
+fn fixture_function() -> Function {
+    let builder = testing::expect_ok(
+        Builder::new("Fixture", Vec::new(), Vec::from_array([Type::I64])),
+        "builder",
+    );
+    let first = testing::expect_ok(builder.iconst(1), "first");
+    let second = testing::expect_ok(builder.binary(BinaryOp::Add, first, first), "second");
+    testing::assert_ok(builder.ret(Vec::from_array([second])));
+    testing::expect_ok(builder.finish(), "fixture")
+}
+
+#[test]
+fn verifier_checks_instruction_order_and_rejects_forged_operands() -> () {
+    let function = fixture_function();
+    let first = function.body[0].instructions[0].result;
+    let second = function.body[0].instructions[1].result;
+    function.body[0].instructions[0] = Instruction {
+        result: first,
+        operation: Operation::Binary(BinaryOp::Add, second, second),
+    };
+    testing::assert_eq(
+        testing::expect_err(verify(function), "forward use").kind,
+        ErrorKind::Dominance,
+    );
+    function.body[0].instructions[0] = Instruction {
+        result: first,
+        operation: Operation::Binary(
+            BinaryOp::Add,
+            Value { owner: function.identity, slot: 1000000 },
+            first,
+        ),
+    };
+    testing::assert_eq(
+        testing::expect_err(verify(function), "forged operand").kind,
+        ErrorKind::InvalidHandle,
+    );
+}
+
+#[test]
+fn verifier_rejects_duplicate_definitions_and_invalid_edges() -> () {
+    let function = fixture_function();
+    function.body[0].instructions[1] = function.body[0].instructions[0];
+    testing::assert_eq(
+        testing::expect_err(verify(function), "duplicate result").kind,
+        ErrorKind::InvalidHandle,
+    );
+    let function = fixture_function();
+    let mut block = function.body[0];
+    block.terminator = Option::Some(
+        Terminator::Jump(
+            Edge {
+                target: Block { slot: 1000000, owner: function.identity },
+                arguments: Vec::new(),
+            },
+        ),
+    );
+    function.body[0] = block;
+    testing::assert_eq(
+        testing::expect_err(verify(function), "invalid edge").kind,
+        ErrorKind::InvalidHandle,
+    );
+}

@@ -1,0 +1,49 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::examples::basic as example;
+use std::testing;
+
+#[test]
+fn loop_parameters_and_parallel_backedge_arguments() -> () {
+    let sum = testing::expect_ok(example::sum_function(), "sum");
+    for n in 0..101 {
+        let input = n.to_i64();
+        testing::assert(
+            testing::expect_ok(
+                ir::interpret(sum, Vec::from_array([ir::Datum::I64(input)]), 1000),
+                "sum execution",
+            )
+                == Vec::from_array([ir::Datum::I64(input * (input + 1) / 2)]),
+        );
+    }
+    testing::assert_eq(
+        testing::expect_err(
+            ir::interpret(sum, Vec::from_array([ir::Datum::I64(100)]), 10),
+            "bounded loop",
+        ).kind,
+        ir::ErrorKind::FuelExhausted,
+    );
+    testing::assert_err(ir::interpret(sum, Vec::from_array([ir::Datum::Bool(true)]), 100));
+    let swap = testing::expect_ok(example::swap_function(), "swap");
+    for n in 0..20 {
+        let expected = if n % 2 == 0 {
+            Vec::from_array([ir::Datum::I64(7), ir::Datum::I64(13)])
+        } else {
+            Vec::from_array([ir::Datum::I64(13), ir::Datum::I64(7)])
+        };
+        testing::assert(
+            testing::expect_ok(
+                ir::interpret(
+                    swap,
+                    Vec::from_array(
+                        [ir::Datum::I64(7), ir::Datum::I64(13), ir::Datum::I64(n.to_i64())],
+                    ),
+                    1000,
+                ),
+                "parallel edge copies",
+            )
+                == expected,
+        );
+    }
+}

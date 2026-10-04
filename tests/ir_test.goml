@@ -1,0 +1,260 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::abi;
+use ecosystem::goir::amd64;
+use std::testing;
+
+fn identity(name: string) -> ir::Builder {
+    testing::expect_ok(
+        ir::Builder::new(name, Vec::from_array([ir::Type::I64]), Vec::from_array([ir::Type::I64])),
+        "builder",
+    )
+}
+
+#[test]
+fn builder_rejects_foreign_handles_type_mismatches_and_closed_blocks() -> () {
+    let builder = identity("Identity");
+    let foreign = identity("Foreign");
+    let value = testing::expect_ok(builder.parameters(builder.entry()), "parameters")[0];
+    let other = testing::expect_ok(foreign.parameters(foreign.entry()), "foreign parameter")[0];
+    testing::assert_eq(
+        testing::expect_err(builder.binary(ir::BinaryOp::Add, value, other), "foreign value").kind,
+        ir::ErrorKind::WrongFunction,
+    );
+    testing::assert_eq(
+        testing::expect_err(builder.switch_to(foreign.entry()), "foreign block").kind,
+        ir::ErrorKind::WrongFunction,
+    );
+    let boolean = testing::expect_ok(builder.bconst(true), "boolean");
+    testing::assert_eq(
+        testing::expect_err(builder.binary(ir::BinaryOp::Add, value, boolean), "operand type").kind,
+        ir::ErrorKind::TypeMismatch,
+    );
+    testing::assert_err(builder.ret(Vec::from_array([boolean])));
+    testing::assert_err(builder.ret(Vec::new()));
+    testing::assert_ok(builder.ret(Vec::from_array([value])));
+    testing::assert_err(builder.iconst(1));
+    testing::assert_err(builder.ret(Vec::from_array([value])));
+    let function = testing::expect_ok(builder.finish(), "finish");
+    testing::assert_err(builder.finish());
+    testing::assert_err(builder.append_block(Vec::new()));
+    testing::assert_err(builder.switch_to(builder.entry()));
+    testing::assert(
+        testing::expect_ok(
+            ir::interpret(function, Vec::from_array([ir::Datum::I64(42)]), 10),
+            "interpret",
+        )
+            == Vec::from_array([ir::Datum::I64(42)]),
+    );
+}
+
+#[test]
+fn public_vectors_cannot_mutate_finished_functions() -> () {
+    let types = Vec::from_array([ir::Type::I64]);
+    let builder = testing::expect_ok(ir::Builder::new("Snapshot", types, types), "builder");
+    types[0] = ir::Type::Bool;
+    let parameters = testing::expect_ok(builder.parameters(builder.entry()), "parameters");
+    let value = parameters[0];
+    parameters.clear();
+    let returned = Vec::from_array([value]);
+    testing::assert_ok(builder.ret(returned));
+    returned.clear();
+    let function = testing::expect_ok(builder.finish(), "finish");
+    let blocks = function.blocks();
+    blocks[0].parameters.clear();
+    blocks[0].instructions.clear();
+    match blocks[0].terminator {
+        Some(ir::Terminator::Return(values)) => values.clear(),
+        _ => testing::assert(false),
+    }
+    let inputs = function.parameter_types();
+    inputs[0] = ir::Type::Bool;
+    testing::assert_ok(ir::verify(function));
+    testing::assert_eq(function.parameter_types()[0], ir::Type::I64);
+    testing::assert(
+        testing::expect_ok(
+            ir::interpret(function, Vec::from_array([ir::Datum::I64(-17)]), 1),
+            "snapshot",
+        )
+            == Vec::from_array([ir::Datum::I64(-17)]),
+    );
+}
+
+#[test]
+fn verifier_rejects_incomplete_unreachable_and_nondominating_blocks() -> () {
+    let incomplete = identity("Incomplete");
+    testing::assert_eq(
+        testing::expect_err(incomplete.finish(), "terminator").kind,
+        ir::ErrorKind::ControlFlow,
+    );
+    let unreachable = testing::expect_ok(incomplete.append_block(Vec::new()), "unreachable");
+    let p = testing::expect_ok(incomplete.parameters(incomplete.entry()), "parameter");
+    testing::assert_err(incomplete.jump(incomplete.entry(), p));
+    testing::assert_ok(incomplete.ret(p));
+    testing::assert_ok(incomplete.switch_to(unreachable));
+    let unused = testing::expect_ok(incomplete.iconst(0), "unreachable constant");
+    testing::assert_ok(incomplete.ret(Vec::from_array([unused])));
+    testing::assert(
+        testing::expect_err(incomplete.finish(), "unreachable block").message.contains(
+            "unreachable",
+        ),
+    );
+    let builder = identity("Dominance");
+    let left = testing::expect_ok(builder.append_block(Vec::new()), "left");
+    let right = testing::expect_ok(builder.append_block(Vec::new()), "right");
+    let condition = testing::expect_ok(builder.bconst(true), "condition");
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: left, arguments: Vec::new() },
+            ir::Edge { target: right, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(left));
+    let local = testing::expect_ok(builder.iconst(23), "local");
+    testing::assert_ok(builder.ret(Vec::from_array([local])));
+    testing::assert_ok(builder.switch_to(right));
+    testing::assert_ok(builder.ret(Vec::from_array([local])));
+    testing::assert_eq(
+        testing::expect_err(builder.finish(), "nondominating use").kind,
+        ir::ErrorKind::Dominance,
+    );
+}
+
+#[test]
+fn edge_arguments_and_resource_limits_are_checked() -> () {
+    let builder = identity("Edges");
+    let next = testing::expect_ok(builder.append_block(Vec::from_array([ir::Type::Bool])), "next");
+    let parameters = testing::expect_ok(builder.parameters(builder.entry()), "parameters");
+    testing::assert_err(builder.jump(next, parameters));
+    testing::assert_err(builder.jump(next, Vec::new()));
+    let foreign = identity("Other");
+    testing::assert_err(builder.jump(foreign.entry(), Vec::new()));
+    let limited = testing::expect_ok(
+        ir::Builder::with_limits(
+            "Limited",
+            Vec::new(),
+            Vec::new(),
+            ir::Limits { max_values: 1, max_blocks: 1, ..ir::Limits::standard() },
+        ),
+        "limited",
+    );
+    testing::assert_ok(limited.iconst(1));
+    testing::assert_eq(
+        testing::expect_err(limited.iconst(2), "value limit").kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+    testing::assert_err(limited.append_block(Vec::new()));
+    let budget = testing::expect_ok(
+        ir::Builder::with_limits(
+            "Budget",
+            Vec::new(),
+            Vec::new(),
+            ir::Limits { max_verify_steps: 1, ..ir::Limits::standard() },
+        ),
+        "budget",
+    );
+    testing::assert_ok(budget.ret(Vec::new()));
+    testing::assert_eq(
+        testing::expect_err(budget.finish(), "verification budget").kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+}
+
+#[test]
+fn abi_layout_handles_boolean_padding_and_multiple_results() -> () {
+    let types = Vec::from_array([ir::Type::Bool, ir::Type::I64, ir::Type::Bool]);
+    let builder = testing::expect_ok(ir::Builder::new("Mixed", types, types), "builder");
+    testing::assert_ok(
+        builder.ret(testing::expect_ok(builder.parameters(builder.entry()), "parameters")),
+    );
+    let function = testing::expect_ok(builder.finish(), "function");
+    let plan = testing::expect_ok(abi::amd64_abi0(function), "ABI");
+    testing::assert_eq(plan.parameters[0].offset, 0);
+    testing::assert_eq(plan.parameters[1].offset, 8);
+    testing::assert_eq(plan.parameters[2].offset, 16);
+    testing::assert_eq(plan.results[0].offset, 24);
+    testing::assert_eq(plan.results[1].offset, 32);
+    testing::assert_eq(plan.results[2].offset, 40);
+    testing::assert_eq(plan.argument_bytes, 41);
+    testing::assert_err(amd64::emit_package("type", Vec::from_array([function])));
+    testing::assert_err(amd64::emit_package("generated", Vec::from_array([function, function])));
+    let bad = identity("x\nTEXT");
+    testing::assert_ok(bad.ret(testing::expect_ok(bad.parameters(bad.entry()), "parameter")));
+    testing::assert_err(amd64::emit(testing::expect_ok(bad.finish(), "IR function")));
+}
+
+#[test]
+fn arithmetic_wraps_and_shifts_mask_counts() -> () {
+    let cases = Vec::from_array(
+        [
+            (ir::BinaryOp::Add, 9223372036854775807, 1, -9223372036854775808),
+            (ir::BinaryOp::Sub, -9223372036854775808, 1, 9223372036854775807),
+            (ir::BinaryOp::Mul, 9223372036854775807, 2, -2),
+            (ir::BinaryOp::Shl, 3, 65, 6),
+            (ir::BinaryOp::ShrS, -8, 65, -4),
+            (ir::BinaryOp::ShrU, -1, 63, 1),
+            (ir::BinaryOp::Shl, 1, -1, -9223372036854775808),
+        ],
+    );
+    for (op, left, right, expected) in cases {
+        let builder = testing::expect_ok(
+            ir::Builder::new("Arithmetic", Vec::new(), Vec::from_array([ir::Type::I64])),
+            "builder",
+        );
+        let a = testing::expect_ok(builder.iconst(left), "left");
+        let b = testing::expect_ok(builder.iconst(right), "right");
+        let result = testing::expect_ok(builder.binary(op, a, b), "binary");
+        testing::assert_ok(builder.ret(Vec::from_array([result])));
+        let function = testing::expect_ok(builder.finish(), "finish");
+        testing::assert(
+            testing::expect_ok(ir::interpret(function, Vec::new(), 4), "arithmetic")
+                == Vec::from_array([ir::Datum::I64(expected)]),
+        );
+        testing::assert_eq(
+            testing::expect_err(ir::interpret(function, Vec::new(), 3), "fuel").kind,
+            ir::ErrorKind::FuelExhausted,
+        );
+        testing::assert_err(ir::interpret(function, Vec::from_array([ir::Datum::Bool(true)]), 10));
+    }
+}
+
+#[test]
+fn infinite_loop_consumes_fuel_even_without_instructions() -> () {
+    let builder = testing::expect_ok(ir::Builder::new("Spin", Vec::new(), Vec::new()), "builder");
+    let header = testing::expect_ok(builder.append_block(Vec::new()), "loop");
+    testing::assert_ok(builder.jump(header, Vec::new()));
+    testing::assert_ok(builder.switch_to(header));
+    testing::assert_ok(builder.jump(header, Vec::new()));
+    let function = testing::expect_ok(builder.finish(), "loop function");
+    testing::assert_eq(
+        testing::expect_err(ir::interpret(function, Vec::new(), 1000), "execution limit").kind,
+        ir::ErrorKind::FuelExhausted,
+    );
+}
+
+#[test]
+fn native_names_and_frame_sizes_fail_before_output() -> () {
+    for name in Vec::from_array(["", "_", "9bad", "a/b", "a\nb", "函数", "func"]) {
+        testing::assert_err(abi::validate_identifier(name));
+    }
+    let builder = testing::expect_ok(
+        ir::Builder::with_limits(
+            "TooLarge",
+            Vec::new(),
+            Vec::new(),
+            ir::Limits { max_values: 5000, ..ir::Limits::standard() },
+        ),
+        "builder",
+    );
+    for _ in 0..4097 {
+        testing::assert_ok(builder.iconst(0));
+    }
+    testing::assert_ok(builder.ret(Vec::new()));
+    let function = testing::expect_ok(builder.finish(), "large IR");
+    testing::assert_eq(
+        testing::expect_err(amd64::emit(function), "frame cap").kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+}
