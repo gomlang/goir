@@ -1,0 +1,130 @@
+package amd64;
+
+use ecosystem::goir as ir;
+use module::mach;
+use module::regalloc;
+
+#[derive(Debug, PartialEq)]
+enum CopySource {
+    Location(regalloc::Location),
+    Temporary,
+}
+
+struct Move {
+    source: CopySource,
+    destination: regalloc::Location,
+}
+
+enum CopyStep {
+    Save(regalloc::Location),
+    Move(Move),
+}
+
+fn schedule_copies(input: Vec[Move]) -> Result[Vec[CopyStep], ir::Error] {
+    let mut work = 0;
+    for index in 0..input.len() {
+        for earlier in 0..index {
+            if input[index].destination == input[earlier].destination {
+                return Result::Err(
+                    ir::error(
+                        ir::ErrorKind::InvalidState,
+                        "parallel copy has duplicate destinations",
+                    ),
+                )
+            }
+        }
+    }
+    let pending = Vec::new();
+    for item in input {
+        if item.source != CopySource::Location(item.destination) {
+            pending.push(item);
+        }
+    }
+    let steps = Vec::new();
+    while !pending.is_empty() {
+        let mut ready = -1;
+        for index in 0..pending.len() {
+            let mut needed = false;
+            for item in pending {
+                work = work + 1;
+                if work > 10000000 {
+                    return Result::Err(
+                        ir::error(ir::ErrorKind::LimitExceeded, "parallel copy work limit exceeded"),
+                    )
+                }
+                if item.source == CopySource::Location(pending[index].destination) {
+                    needed = true;
+                    break;
+                }
+            }
+            if !needed {
+                ready = index;
+                break;
+            }
+        }
+        if ready >= 0 {
+            steps.push(CopyStep::Move(pending[ready]));
+            let _ = pending.remove(ready);
+        } else {
+            match pending[0].source {
+                Location(saved) => {
+                    steps.push(CopyStep::Save(saved));
+                    for index in 0..pending.len() {
+                        let item = pending[index];
+                        if item.source == CopySource::Location(saved) {
+                            pending[index] = Move {
+                                source: CopySource::Temporary,
+                                destination: item.destination,
+                            };
+                        }
+                    }
+                },
+                Temporary => {
+                    return Result::Err(
+                        ir::error(ir::ErrorKind::InvalidState, "unresolved parallel copy temporary"),
+                    )
+                },
+            }
+        }
+    }
+    Result::Ok(steps)
+}
+
+fn emit_move(lines: Vec[string], item: Move) -> () {
+    let source = match item.source {
+        Location(location) => place(location),
+        Temporary => "DX",
+    };
+    let destination = place(item.destination);
+    match (item.source, item.destination) {
+        (CopySource::Location(regalloc::Location::Stack(_)), regalloc::Location::Stack(_)) => {
+            lines.push("    MOVQ " + source + ", AX");
+            lines.push("    MOVQ AX, " + destination);
+        },
+        _ => lines.push("    MOVQ " + source + ", " + destination),
+    }
+}
+
+fn allocated_transfer(lines: Vec[string], allocation: regalloc::Allocation, edge: mach::Edge) -> Result[
+    (),
+    ir::Error,
+] {
+    let moves = Vec::new();
+    for item in edge.copies {
+        moves.push(
+            Move {
+                source: CopySource::Location(allocation.location(item.source)?),
+                destination: allocation.location(item.destination)?,
+            },
+        );
+    }
+    for step in schedule_copies(moves)? {
+        match step {
+            Save(location) => lines.push("    MOVQ " + place(location) + ", DX"),
+            Move(item) => emit_move(lines, item),
+        }
+    }
+    let target = edge.target;
+    lines.push(f"    JMP block{target}");
+    Result::Ok(())
+}

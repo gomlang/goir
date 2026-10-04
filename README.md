@@ -6,8 +6,9 @@ the Go assembler's ABI0 convention. It emits assembly function bodies and Go
 declarations that the ordinary Go toolchain assembles and links.
 
 The library implements typed SSA construction, block parameters, a verifier,
-a fuel-bounded interpreter, deterministic IR printing, ABI0 argument/result
-layout and amd64 assembly emission. There are no native adapters, cgo
+a fuel-bounded interpreter, deterministic IR printing, a virtual-register machine
+IR, liveness analysis, register allocation, ABI0 argument/result layout and amd64
+assembly emission. There are no native adapters, cgo
 requirements or ecosystem dependencies.
 
 The design draws on [Cranelift](https://github.com/bytecodealliance/wasmtime/tree/main/cranelift):
@@ -69,8 +70,10 @@ The verifier handles loops iteratively and bounds dominance work.
 
 Block arguments are simultaneous assignments. On a backedge such as
 `loop(b, a, n - 1)`, swapping two parameters preserves both old values.
-The interpreter gathers arguments before assigning them; native code stages
-them in temporary stack slots before updating destination slots.
+The interpreter gathers arguments before assigning them. The default native
+backend schedules parallel copies between assigned registers and spill slots,
+breaking cycles with a reserved scratch register. The reference stack backend
+stages arguments in temporary stack slots.
 
 Builders use shared mutable storage and are not synchronized. Copies refer to
 the same builder. A successful `finish` closes all copies and returns a
@@ -114,9 +117,30 @@ it ends at the last input, without adding input padding.
 
 `amd64::emit` returns assembly, a Go declaration, frame size and stack-slot
 count. `amd64::emit_package` combines 1..256 functions into one assembly file and
-one declaration file. Each SSA value has its own eight-byte stack slot;
-temporary slots implement parallel edge copies. AX, CX and DX are scratch
-registers. There is no optimizing register allocator or slot reuse yet.
+one declaration file. Both lower SSA through `mach::lower` and
+`regalloc::allocate`. The original implementation is available as
+`amd64::emit_stack` and `amd64::emit_stack_package` for comparison.
+
+The machine IR makes virtual register definitions, uses and edge copies explicit.
+`mach::Function` exposes copied block snapshots and function-specific `Reg`
+handles. `regalloc::analyze` computes fixed-point block liveness and conservative
+whole-function intervals, including loops and blocks stored out of control-flow
+order. `regalloc::allocate` uses deterministic linear scan and reuses expired
+spill slots. Each virtual register has one location for its entire interval;
+there is no interval splitting, eviction, copy coalescing or dead-code removal.
+`regalloc::verify` checks location bounds and interval conflicts.
+
+The amd64 allocator uses BX, SI, DI and R8–R11. AX, CX and DX remain reserved
+for instruction operands and parallel-copy scheduling; allocation never uses
+SP, BP, R14 or R15. Instructions currently pass operands through scratch
+registers, so allocation primarily reduces memory traffic and edge-copy work.
+Spilled values occupy eight-byte local stack slots. The frame size reports
+these locals, excluding assembler-added frame-pointer and stack-split code.
+
+`regalloc::allocate_with_options` accepts a register count and work budget.
+`amd64::emit_with_options` and `amd64::emit_package_with_options` accept the same
+options, restricted to 0..7 registers. Zero forces all values into reusable spill
+slots. `amd64::emit_allocation` emits an already computed allocation.
 
 The generated assembly uses normal Go stack-splitting prologues supplied by
 the assembler, preserves its frame-pointer convention and declares
@@ -142,11 +166,17 @@ boundary.
 | Parameters per block | 256 | 1,024 |
 | Inputs or results per signature | 256 | 1,024 |
 | Verifier work steps | 10,000,000 | 100,000,000 |
+| Allocation work steps | 10,000,000 | 100,000,000 |
+| Abstract allocation registers | 7 | 32 (amd64: 7) |
 
 The entry parameters also count toward block/value limits. Dominance uses
 O(blocks²) temporary storage. The amd64 emitter separately caps its local
 frame at 32,768 bytes and returns `LimitExceeded` before producing assembly
 when a function exceeds that bound.
+Liveness stores bitsets and limits blocks × ceil(values / 64) to 1,048,576
+words per matrix. Liveness and allocation share the allocation work budget;
+parallel-copy scheduling separately caps dependency-search work at 10,000,000
+steps per edge.
 
 ## Development and examples
 
@@ -168,11 +198,30 @@ directory it writes the two Go package source files.
 `goml test` includes public API and verifier regressions plus the example's
 native integration test. That test generates a temporary Go module under
 `_artifact/`, runs `go vet` and `go test`, and compares generated functions with
-the interpreter over more than 2,000 deterministic calls. A separately written
+the interpreter over more than 2,000 deterministic cases using the register,
+reference stack and single-register backends. A separately written
 Go oracle checks all integer operations/comparisons and exercises large frames,
 mixed boolean/integer signatures, multiple returns, Go wrappers exceeding the
 register argument budget, cyclic edge copies and concurrent Go callers with GC.
+A 12-value rotation additionally tests forced spills, and a diamond checks
+non-topological block layout and a value live through the join. A symbolic
+parallel-copy test exhausts all 256 source assignments to four mixed
+register/stack destinations.
 Temporary native files are removed on success and retained on failure.
+
+The native test writes `_artifact/codegen.tsv` with per-function frame size and
+`amd64::metrics` results for both main backends. Metrics count emitted body
+instructions, explicit stack reads/writes including ABI argument/result accesses,
+and assembly-source bytes. They do not measure encoded machine-code size or
+assembler-inserted instructions. Optional execution benchmarks write
+`_artifact/benchmarks.txt`:
+
+```sh
+GOIR_BENCHMARK=1 goml test --example basic native_go --timeout 180s
+```
+
+The benchmarks compare a bounded sum loop and a long arithmetic chain. Use
+repeated measurements on the target machine before drawing performance conclusions.
 
 `goml verify` copies the example into an independent module against an isolated
 registry snapshot, then repeats its interpreter/native checks. The standalone
@@ -191,11 +240,14 @@ the historical split manifests must remain unchanged.
 | `verify.goml` | Structural/type validation, reachability and dominance |
 | `interp.goml`, `display.goml` | Reference execution and deterministic diagnostics |
 | `abi/layout.goml` | Go scalar layout, symbols and declarations |
-| `amd64/emit.goml` | Leaf-function assembly and parallel copies |
+| `mach/` | Virtual-register instructions, explicit edge copies and SSA lowering |
+| `regalloc/` | Bounded liveness, linear scan, spill-slot reuse and allocation checks |
+| `amd64/registers.goml`, `amd64/copies.goml` | Allocated assembly and parallel-copy scheduling |
+| `amd64/emit.goml`, `amd64/metrics.goml` | Reference stack backend and source-code metrics |
 | `examples/basic/` | Consumer example and native differential validation |
 
-The next implementation stages are a machine IR with liveness/register
-allocation, local SSA simplification, and explicit call lowering. Managed
+The next implementation stages are local SSA simplification, fewer redundant
+register moves, improved spill decisions and explicit call lowering. Managed
 references require a separate runtime-aware design for safepoints, stack maps,
 stack movement and write barriers. ABIInternal and Go object emission should
 be introduced with a pinned toolchain profile and independent ABI conformance

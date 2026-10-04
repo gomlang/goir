@@ -97,11 +97,11 @@ fn transfer(lines: Vec[string], edge: ir::Edge, blocks: Vec[ir::BlockData], scra
     lines.push(f"    JMP block{target}");
 }
 
-pub fn emit(function: ir::Function) -> Result[Compiled, ir::Error] {
-    emit_function(function, true)
+pub fn emit_stack(function: ir::Function) -> Result[Compiled, ir::Error] {
+    emit_stack_function(function, true)
 }
 
-fn emit_function(function: ir::Function, header: bool) -> Result[Compiled, ir::Error] {
+fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled, ir::Error] {
     ir::verify(function)?;
     let declaration = abi::declaration(function)?;
     let plan = abi::amd64_abi0(function)?;
@@ -182,7 +182,7 @@ pub struct Package {
     pub declarations: string,
 }
 
-pub fn emit_package(name: string, functions: Vec[ir::Function]) -> Result[Package, ir::Error] {
+pub fn emit_stack_package(name: string, functions: Vec[ir::Function]) -> Result[Package, ir::Error] {
     abi::validate_identifier(name)?;
     if functions.is_empty() || functions.len() > 256 {
         return Result::Err(
@@ -199,7 +199,7 @@ pub fn emit_package(name: string, functions: Vec[ir::Function]) -> Result[Packag
             )
         }
         symbols.push(function.name());
-        let compiled = emit_function(function, false)?;
+        let compiled = emit_stack_function(function, false)?;
         assembly.push(compiled.assembly);
         declarations.push(compiled.declaration);
     }

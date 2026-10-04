@@ -1,0 +1,228 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+
+pub struct Interval {
+    pub reg: mach::Reg,
+    pub start: isize,
+    pub end: isize,
+}
+
+pub struct Liveness {
+    function: mach::Function,
+    ranges: Vec[Interval],
+    incoming: Vec[Vec[u64]],
+    outgoing: Vec[Vec[u64]],
+}
+
+fn copy_vec[T](input: Vec[T]) -> Vec[T] {
+    let output = Vec::new();
+    for value in input {
+        output.push(value);
+    }
+    output
+}
+
+fn bit_has(bits: Vec[u64], index: isize) -> bool {
+    (bits[index / 64] & ((1.to_u64()) << (index % 64))) != 0
+}
+
+fn bit_set(bits: Vec[u64], index: isize) -> () {
+    bits[index / 64] = bits[index / 64] | ((1.to_u64()) << (index % 64));
+}
+
+fn bit_row(words: isize) -> Vec[u64] {
+    let row = Vec::new();
+    for _ in 0..words {
+        row.push(0);
+    }
+    row
+}
+
+fn touch(starts: Vec[isize], ends: Vec[isize], reg: mach::Reg, position: isize) -> () {
+    let index = reg.index();
+    if starts[index] < 0 || starts[index] > position {
+        starts[index] = position;
+    }
+    if ends[index] < position {
+        ends[index] = position;
+    }
+}
+
+fn used(
+    uses: Vec[u64],
+    definitions: Vec[u64],
+    starts: Vec[isize],
+    ends: Vec[isize],
+    reg: mach::Reg,
+    position: isize,
+) -> () {
+    if !bit_has(definitions, reg.index()) {
+        bit_set(uses, reg.index());
+    }
+    touch(starts, ends, reg, position);
+}
+
+fn spend(budget: Ref[isize]) -> Result[(), ir::Error] {
+    if budget.get() <= 0 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "register allocation work limit exceeded"),
+        )
+    }
+    budget.set(budget.get() - 1);
+    Result::Ok(())
+}
+
+fn live_values(function: mach::Function, rows: Vec[Vec[u64]], block: isize) -> Result[
+    Vec[mach::Reg],
+    ir::Error,
+] {
+    if block < 0 || block >= rows.len() {
+        return Result::Err(ir::error(ir::ErrorKind::InvalidHandle, "invalid liveness block"))
+    }
+    let output = Vec::new();
+    for index in 0..function.register_count() {
+        if bit_has(rows[block], index) {
+            output.push(function.register(index)?);
+        }
+    }
+    Result::Ok(output)
+}
+
+impl Liveness {
+    pub fn intervals(self: Liveness) -> Vec[Interval] {
+        copy_vec(self.ranges)
+    }
+
+    pub fn live_in(self: Liveness, block: isize) -> Result[Vec[mach::Reg], ir::Error] {
+        live_values(self.function, self.incoming, block)
+    }
+
+    pub fn live_out(self: Liveness, block: isize) -> Result[Vec[mach::Reg], ir::Error] {
+        live_values(self.function, self.outgoing, block)
+    }
+}
+
+pub fn analyze(function: mach::Function) -> Result[Liveness, ir::Error] {
+    analyze_with_budget(function, Ref::new(10000000))
+}
+
+fn analyze_with_budget(function: mach::Function, budget: Ref[isize]) -> Result[Liveness, ir::Error] {
+    let blocks = function.blocks();
+    let count = function.register_count();
+    let words = (count + 63) / 64;
+    if blocks.len() * words > 1048576 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "liveness matrix limit exceeded"),
+        )
+    }
+    let starts = Vec::new();
+    let ends = Vec::new();
+    for _ in 0..count {
+        starts.push(-1);
+        ends.push(-1);
+    }
+    let uses = Vec::new();
+    let definitions = Vec::new();
+    let incoming = Vec::new();
+    let outgoing = Vec::new();
+    let block_starts = Vec::new();
+    let block_ends = Vec::new();
+    let targets: Vec[Vec[isize]] = Vec::new();
+    let mut position = 0;
+    for block in blocks {
+        let reads = bit_row(words);
+        let writes = bit_row(words);
+        block_starts.push(position);
+        for parameter in block.parameters {
+            spend(budget)?;
+            bit_set(writes, parameter.index());
+            touch(starts, ends, parameter, position);
+        }
+        position = position + 1;
+        for instruction in block.instructions {
+            spend(budget)?;
+            for reg in instruction.uses() {
+                used(reads, writes, starts, ends, reg, position);
+            }
+            let result = instruction.definition();
+            bit_set(writes, result.index());
+            touch(starts, ends, result, position + 1);
+            position = position + 2;
+        }
+        for reg in block.terminator.uses() {
+            used(reads, writes, starts, ends, reg, position);
+        }
+        let successors = Vec::new();
+        for edge in block.terminator.successors() {
+            successors.push(edge.target);
+        }
+        targets.push(successors);
+        block_ends.push(position);
+        position = position + 1;
+        uses.push(reads);
+        definitions.push(writes);
+        incoming.push(bit_row(words));
+        outgoing.push(bit_row(words));
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for reverse in 0..blocks.len() {
+            let block = blocks.len() - reverse - 1;
+            for word in 0..words {
+                spend(budget)?;
+                let mut after: u64 = 0;
+                for target in targets[block] {
+                    after = after | incoming[target][word];
+                }
+                let before = uses[block][word] | (after & ~definitions[block][word]);
+                if outgoing[block][word] != after || incoming[block][word] != before {
+                    outgoing[block][word] = after;
+                    incoming[block][word] = before;
+                    changed = true;
+                }
+            }
+        }
+    }
+    for block in blocks {
+        for index in 0..count {
+            spend(budget)?;
+            let reg = function.register(index)?;
+            if bit_has(incoming[block.index], index) {
+                touch(starts, ends, reg, block_starts[block.index]);
+            }
+            if bit_has(outgoing[block.index], index) {
+                touch(starts, ends, reg, block_ends[block.index]);
+            }
+        }
+    }
+    let ranges = Vec::new();
+    for index in 0..count {
+        if starts[index] < 0 {
+            return Result::Err(
+                ir::error(ir::ErrorKind::InvalidHandle, "machine register has no live interval"),
+            )
+        }
+        ranges.push(
+            Interval { reg: function.register(index)?, start: starts[index], end: ends[index] },
+        );
+    }
+    ranges.sort_by(
+        |left, right| {
+            if left.start < right.start {
+                -1
+            } else if left.start > right.start {
+                1
+            } else if left.reg.index() < right.reg.index() {
+                -1
+            } else if left.reg.index() > right.reg.index() {
+                1
+            } else {
+                0
+            }
+        },
+    );
+    Result::Ok(Liveness { function, ranges, incoming, outgoing })
+}

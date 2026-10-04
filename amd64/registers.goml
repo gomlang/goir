@@ -1,0 +1,208 @@
+package amd64;
+
+use ecosystem::goir as ir;
+use module::abi;
+use module::mach;
+use module::regalloc;
+
+fn physical(index: isize) -> string {
+    Vec::from_array(["BX", "SI", "DI", "R8", "R9", "R10", "R11"])[index]
+}
+
+fn place(location: regalloc::Location) -> string {
+    match location {
+        Register(index) => physical(index),
+        Stack(index) => (index * 8).to_string() + "(SP)",
+    }
+}
+
+fn read_reg(lines: Vec[string], allocation: regalloc::Allocation, reg: mach::Reg, scratch: string) -> Result[
+    (),
+    ir::Error,
+] {
+    lines.push("    MOVQ " + place(allocation.location(reg)?) + ", " + scratch);
+    Result::Ok(())
+}
+
+fn write_reg(lines: Vec[string], allocation: regalloc::Allocation, reg: mach::Reg, scratch: string) -> Result[
+    (),
+    ir::Error,
+] {
+    lines.push("    MOVQ " + scratch + ", " + place(allocation.location(reg)?));
+    Result::Ok(())
+}
+
+fn allocated_instruction(
+    lines: Vec[string],
+    allocation: regalloc::Allocation,
+    instruction: mach::Instruction,
+) -> Result[(), ir::Error] {
+    match instruction {
+        Immediate { value, .. } => lines.push("    MOVQ $" + value.to_string() + ", AX"),
+        Binary { op, left, right, .. } => {
+            read_reg(lines, allocation, left, "AX")?;
+            read_reg(lines, allocation, right, "CX")?;
+            lines.push("    " + binary_opcode(op) + " CX, AX");
+        },
+        Compare { cc, left, right, .. } => {
+            read_reg(lines, allocation, left, "AX")?;
+            read_reg(lines, allocation, right, "CX")?;
+            lines.push("    CMPQ AX, CX");
+            lines.push("    " + comparison_opcode(cc) + " AL");
+            lines.push("    MOVBQZX AL, AX");
+        },
+        Select { condition, yes, no, .. } => {
+            read_reg(lines, allocation, condition, "DX")?;
+            read_reg(lines, allocation, yes, "AX")?;
+            read_reg(lines, allocation, no, "CX")?;
+            lines.push("    CMPQ DX, $0");
+            lines.push("    CMOVQEQ CX, AX");
+        },
+    }
+    write_reg(lines, allocation, instruction.definition(), "AX")
+}
+
+pub fn emit(function: ir::Function) -> Result[Compiled, ir::Error] {
+    emit_with_options(function, regalloc::Options::standard())
+}
+
+pub fn emit_with_options(function: ir::Function, options: regalloc::Options) -> Result[
+    Compiled,
+    ir::Error,
+] {
+    if options.registers > 7 {
+        return Result::Err(
+            ir::error(
+                ir::ErrorKind::Unsupported,
+                "amd64 allocator supports at most seven registers",
+            ),
+        )
+    }
+    emit_allocation(regalloc::allocate_with_options(mach::lower(function)?, options)?)
+}
+
+pub fn emit_allocation(allocation: regalloc::Allocation) -> Result[Compiled, ir::Error] {
+    emit_allocated_function(allocation, true)
+}
+
+fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Result[
+    Compiled,
+    ir::Error,
+] {
+    regalloc::verify(allocation)?;
+    if allocation.register_count() > 7 {
+        return Result::Err(
+            ir::error(
+                ir::ErrorKind::Unsupported,
+                "amd64 allocator supports at most seven registers",
+            ),
+        )
+    }
+    let function = allocation.function().source();
+    let declaration = abi::declaration(function)?;
+    let plan = abi::amd64_abi0(function)?;
+    let stack_slots = allocation.stack_slots();
+    let frame_bytes = stack_slots * 8;
+    if frame_bytes > 32768 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "amd64 stack frame exceeds 32768 bytes"),
+        )
+    }
+    let name = function.name();
+    let argument_bytes = plan.argument_bytes;
+    let lines = Vec::new();
+    if header {
+        lines.push("#include \"funcdata.h\"");
+        lines.push("");
+    }
+    lines.push(f"TEXT ·{name}(SB), $" + frame_bytes.to_string() + f"-{argument_bytes}");
+    lines.push("    NO_LOCAL_POINTERS");
+    let blocks = allocation.function().blocks();
+    for index in 0..plan.parameters.len() {
+        let slot = plan.parameters[index];
+        let offset = slot.offset;
+        let opcode = match slot.ty {
+            I64 => "MOVQ",
+            Bool => "MOVBQZX",
+        };
+        lines.push(f"    {opcode} p{index}+{offset}(FP), AX");
+        write_reg(lines, allocation, blocks[0].parameters[index], "AX")?;
+    }
+    for block in blocks {
+        let index = block.index;
+        lines.push(f"block{index}:");
+        for instruction in block.instructions {
+            allocated_instruction(lines, allocation, instruction)?;
+        }
+        match block.terminator {
+            Return(values) => {
+                for position in 0..values.len() {
+                    read_reg(lines, allocation, values[position], "AX")?;
+                    let slot = plan.results[position];
+                    let offset = slot.offset;
+                    let opcode = match slot.ty {
+                        I64 => "MOVQ",
+                        Bool => "MOVB",
+                    };
+                    lines.push(f"    {opcode} AX, r{position}+{offset}(FP)");
+                }
+                lines.push("    RET");
+            },
+            Jump(edge) => allocated_transfer(lines, allocation, edge)?,
+            Branch { condition, yes, no } => {
+                read_reg(lines, allocation, condition, "AX")?;
+                lines.push("    CMPQ AX, $0");
+                lines.push(f"    JNE edge_yes{index}");
+                allocated_transfer(lines, allocation, no)?;
+                lines.push(f"edge_yes{index}:");
+                allocated_transfer(lines, allocation, yes)?;
+            },
+        }
+    }
+    Result::Ok(
+        Compiled { assembly: lines.join("\n") + "\n", declaration, frame_bytes, stack_slots },
+    )
+}
+
+pub fn emit_package(name: string, functions: Vec[ir::Function]) -> Result[Package, ir::Error] {
+    emit_package_with_options(name, functions, regalloc::Options::standard())
+}
+
+pub fn emit_package_with_options(
+    name: string,
+    functions: Vec[ir::Function],
+    options: regalloc::Options,
+) -> Result[Package, ir::Error] {
+    abi::validate_identifier(name)?;
+    if functions.is_empty() || functions.len() > 256 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "package requires 1..256 functions"),
+        )
+    }
+    if options.registers > 7 {
+        return Result::Err(
+            ir::error(
+                ir::ErrorKind::Unsupported,
+                "amd64 allocator supports at most seven registers",
+            ),
+        )
+    }
+    let symbols = Vec::new();
+    let assembly = Vec::from_array(["#include \"funcdata.h\"\n"]);
+    let declarations = Vec::from_array(["package " + name + "\n"]);
+    for function in functions {
+        if symbols.contains(function.name()) {
+            return Result::Err(
+                ir::error(ir::ErrorKind::InvalidArgument, "duplicate function symbol"),
+            )
+        }
+        symbols.push(function.name());
+        let compiled = emit_allocated_function(
+            regalloc::allocate_with_options(mach::lower(function)?, options)?,
+            false,
+        )?;
+        assembly.push(compiled.assembly);
+        declarations.push(compiled.declaration);
+    }
+    Result::Ok(Package { assembly: assembly.join("\n"), declarations: declarations.join("\n") })
+}

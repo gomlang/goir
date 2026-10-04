@@ -1,0 +1,170 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Location {
+    Register(isize),
+    Stack(isize),
+}
+
+pub struct Options {
+    pub registers: isize,
+    pub max_steps: isize,
+}
+
+impl Options {
+    pub fn standard() -> Options {
+        Options { registers: 7, max_steps: 10000000 }
+    }
+}
+
+pub struct Allocation {
+    machine: mach::Function,
+    locations: Vec[Location],
+    live: Liveness,
+    register_limit: isize,
+    slots: isize,
+    spilled_values: isize,
+}
+
+impl Allocation {
+    pub fn function(self: Allocation) -> mach::Function {
+        self.machine
+    }
+
+    pub fn location(self: Allocation, reg: mach::Reg) -> Result[Location, ir::Error] {
+        self.machine.register_type(reg)?;
+        Result::Ok(self.locations[reg.index()])
+    }
+
+    pub fn stack_slots(self: Allocation) -> isize {
+        self.slots
+    }
+
+    pub fn spill_count(self: Allocation) -> isize {
+        self.spilled_values
+    }
+
+    pub fn register_count(self: Allocation) -> isize {
+        self.register_limit
+    }
+
+    pub fn liveness(self: Allocation) -> Liveness {
+        self.live
+    }
+}
+
+pub fn allocate(function: mach::Function) -> Result[Allocation, ir::Error] {
+    allocate_with_options(function, Options::standard())
+}
+
+pub fn allocate_with_options(function: mach::Function, options: Options) -> Result[
+    Allocation,
+    ir::Error,
+] {
+    if options.registers < 0 || options.registers > 32 || options.max_steps < 1
+        || options.max_steps > 100000000 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::InvalidArgument, "invalid register allocation options"),
+        )
+    }
+    let budget = Ref::new(options.max_steps);
+    let live = analyze_with_budget(function, budget)?;
+    let register_ends = Vec::new();
+    for _ in 0..options.registers {
+        register_ends.push(-1);
+    }
+    let slot_ends = Vec::new();
+    let locations = Vec::new();
+    for _ in 0..function.register_count() {
+        locations.push(Location::Stack(-1));
+    }
+    let mut spilled_values = 0;
+    for interval in live.ranges {
+        let mut selected = -1;
+        for index in 0..register_ends.len() {
+            spend(budget)?;
+            if register_ends[index] < interval.start {
+                selected = index;
+                break;
+            }
+        }
+        if selected >= 0 {
+            register_ends[selected] = interval.end;
+            locations[interval.reg.index()] = Location::Register(selected);
+        } else {
+            let mut slot = -1;
+            for index in 0..slot_ends.len() {
+                spend(budget)?;
+                if slot_ends[index] < interval.start {
+                    slot = index;
+                    break;
+                }
+            }
+            if slot < 0 {
+                slot = slot_ends.len();
+                slot_ends.push(-1);
+            }
+            slot_ends[slot] = interval.end;
+            locations[interval.reg.index()] = Location::Stack(slot);
+            spilled_values = spilled_values + 1;
+        }
+    }
+    let allocation = Allocation {
+        machine: function,
+        locations,
+        live,
+        register_limit: options.registers,
+        slots: slot_ends.len(),
+        spilled_values,
+    };
+    verify(allocation)?;
+    Result::Ok(allocation)
+}
+
+pub fn verify(allocation: Allocation) -> Result[(), ir::Error] {
+    if allocation.locations.len() != allocation.machine.register_count()
+        || allocation.register_limit < 0
+        || allocation.register_limit > 32
+        || allocation.slots < 0
+        || allocation.slots > allocation.locations.len() {
+        return Result::Err(ir::error(ir::ErrorKind::InvalidArgument, "invalid allocation shape"))
+    }
+    let lane_ends = Vec::new();
+    for _ in 0..allocation.register_limit + allocation.slots {
+        lane_ends.push(-1);
+    }
+    for interval in allocation.live.ranges {
+        let location = allocation.location(interval.reg)?;
+        let lane = match location {
+            Register(index) => {
+                if index < 0 || index >= allocation.register_limit {
+                    return Result::Err(
+                        ir::error(ir::ErrorKind::InvalidHandle, "invalid physical register"),
+                    )
+                }
+                index
+            },
+            Stack(index) => {
+                if index < 0 || index >= allocation.slots {
+                    return Result::Err(
+                        ir::error(ir::ErrorKind::InvalidHandle, "invalid spill slot"),
+                    )
+                }
+                allocation.register_limit + index
+            },
+        };
+        if interval.start <= lane_ends[lane] {
+            return Result::Err(
+                ir::error(
+                    ir::ErrorKind::InvalidState,
+                    "overlapping live intervals share a location",
+                ),
+            )
+        }
+        lane_ends[lane] = interval.end;
+    }
+    Result::Ok(())
+}

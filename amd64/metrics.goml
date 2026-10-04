@@ -1,0 +1,29 @@
+package amd64;
+
+pub struct Metrics {
+    pub instructions: isize,
+    pub stack_reads: isize,
+    pub stack_writes: isize,
+    pub assembly_bytes: isize,
+}
+
+pub fn metrics(compiled: Compiled) -> Metrics {
+    let mut instructions = 0;
+    let mut stack_reads = 0;
+    let mut stack_writes = 0;
+    for line in compiled.assembly.split("\n") {
+        if line.starts_with("    ") && line != "    NO_LOCAL_POINTERS" {
+            instructions = instructions + 1;
+            let operands = line.split(",");
+            if operands.len() == 2 {
+                if operands[0].contains("(SP)") || operands[0].contains("(FP)") {
+                    stack_reads = stack_reads + 1;
+                }
+                if operands[1].contains("(SP)") || operands[1].contains("(FP)") {
+                    stack_writes = stack_writes + 1;
+                }
+            }
+        }
+    }
+    Metrics { instructions, stack_reads, stack_writes, assembly_bytes: compiled.assembly.len() }
+}

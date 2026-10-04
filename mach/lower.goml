@@ -1,0 +1,97 @@
+package mach;
+
+use ecosystem::goir as ir;
+
+fn reg(owner: Ref[()], value: ir::Value) -> Reg {
+    Reg { slot: value.index(), owner }
+}
+
+fn lower_edge(owner: Ref[()], edge: ir::Edge, blocks: Vec[ir::BlockData]) -> Edge {
+    let copies = Vec::new();
+    let target = edge.target.index();
+    for index in 0..edge.arguments.len() {
+        copies.push(
+            Copy {
+                source: reg(owner, edge.arguments[index]),
+                destination: reg(owner, blocks[target].parameters[index]),
+            },
+        );
+    }
+    Edge { target, copies }
+}
+
+pub fn lower(source: ir::Function) -> Result[Function, ir::Error] {
+    ir::verify(source)?;
+    let identity = Ref::new(());
+    let blocks = source.blocks();
+    let body = Vec::new();
+    let types = Vec::new();
+    for _ in 0..source.value_count() {
+        types.push(ir::Type::I64);
+    }
+    for block in blocks {
+        let parameters = Vec::new();
+        for value in block.parameters {
+            parameters.push(reg(identity, value));
+            types[value.index()] = source.value_type(value)?;
+        }
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            let dst = reg(identity, instruction.result);
+            types[dst.slot] = source.value_type(instruction.result)?;
+            instructions.push(
+                match instruction.operation {
+                    Constant(value) => Instruction::Immediate {
+                        dst,
+                        value: match value {
+                            I64(integer) => integer,
+                            Bool(boolean) => if boolean {
+                                1
+                            } else {
+                                0
+                            },
+                        },
+                    },
+                    Binary(op, left, right) => Instruction::Binary {
+                        dst,
+                        op,
+                        left: reg(identity, left),
+                        right: reg(identity, right),
+                    },
+                    Compare(cc, left, right) => Instruction::Compare {
+                        dst,
+                        cc,
+                        left: reg(identity, left),
+                        right: reg(identity, right),
+                    },
+                    Select(condition, yes, no) => Instruction::Select {
+                        dst,
+                        condition: reg(identity, condition),
+                        yes: reg(identity, yes),
+                        no: reg(identity, no),
+                    },
+                },
+            );
+        }
+        let term = block.terminator.ok_or(
+            ir::error(ir::ErrorKind::ControlFlow, "missing terminator"),
+        )?;
+        let terminator = match term {
+            Jump(edge) => Terminator::Jump(lower_edge(identity, edge, blocks)),
+            Branch(condition, yes, no) => Terminator::Branch {
+                condition: reg(identity, condition),
+                yes: lower_edge(identity, yes, blocks),
+                no: lower_edge(identity, no, blocks),
+            },
+            Return(values) => {
+                let output = Vec::new();
+                for value in values {
+                    output.push(reg(identity, value));
+                }
+                Terminator::Return(output)
+            },
+        };
+        body.push(Block { index: block.id.index(), parameters, instructions, terminator });
+    }
+    Result::Ok(Function { source_value: source, identity, body, types })
+}

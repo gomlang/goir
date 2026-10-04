@@ -1,0 +1,191 @@
+package mach;
+
+use ecosystem::goir as ir;
+
+#[derive(PartialEq, Eq, Hash)]
+pub struct Reg {
+    slot: isize,
+    owner: Ref[()],
+}
+
+impl Reg {
+    pub fn index(self: Reg) -> isize {
+        self.slot
+    }
+}
+
+impl Debug for Reg {
+    fn debug(self: Reg) -> string {
+        f"r{self.slot}"
+    }
+}
+
+pub enum Instruction {
+    Immediate {
+        dst: Reg,
+        value: i64,
+    },
+    Binary {
+        dst: Reg,
+        op: ir::BinaryOp,
+        left: Reg,
+        right: Reg,
+    },
+    Compare {
+        dst: Reg,
+        cc: ir::IntCC,
+        left: Reg,
+        right: Reg,
+    },
+    Select {
+        dst: Reg,
+        condition: Reg,
+        yes: Reg,
+        no: Reg,
+    },
+}
+
+impl Instruction {
+    pub fn definition(self: Instruction) -> Reg {
+        match self {
+            Immediate { dst, .. } | Binary { dst, .. } | Compare { dst, .. } | Select { dst, .. } => dst,
+        }
+    }
+
+    pub fn uses(self: Instruction) -> Vec[Reg] {
+        match self {
+            Immediate { .. } => Vec::new(),
+            Binary { left, right, .. } | Compare { left, right, .. } => Vec::from_array(
+                [left, right],
+            ),
+            Select { condition, yes, no, .. } => Vec::from_array([condition, yes, no]),
+        }
+    }
+}
+
+pub struct Copy {
+    pub source: Reg,
+    pub destination: Reg,
+}
+
+pub struct Edge {
+    pub target: isize,
+    pub copies: Vec[Copy],
+}
+
+pub enum Terminator {
+    Jump(Edge),
+    Branch {
+        condition: Reg,
+        yes: Edge,
+        no: Edge,
+    },
+    Return(Vec[Reg]),
+}
+
+impl Terminator {
+    pub fn successors(self: Terminator) -> Vec[Edge] {
+        match self {
+            Jump(edge) => Vec::from_array([copy_edge(edge)]),
+            Branch { yes, no, .. } => Vec::from_array([copy_edge(yes), copy_edge(no)]),
+            Return(_) => Vec::new(),
+        }
+    }
+
+    pub fn uses(self: Terminator) -> Vec[Reg] {
+        let values = match self {
+            Return(values) => copy_vec(values),
+            Branch { condition, .. } => Vec::from_array([condition]),
+            _ => Vec::new(),
+        };
+        for edge in self.successors() {
+            for value in edge.copies {
+                values.push(value.source);
+            }
+        }
+        values
+    }
+}
+
+pub struct Block {
+    pub index: isize,
+    pub parameters: Vec[Reg],
+    pub instructions: Vec[Instruction],
+    pub terminator: Terminator,
+}
+
+pub struct Function {
+    source_value: ir::Function,
+    identity: Ref[()],
+    body: Vec[Block],
+    types: Vec[ir::Type],
+}
+
+fn copy_vec[T](input: Vec[T]) -> Vec[T] {
+    let output = Vec::new();
+    for value in input {
+        output.push(value);
+    }
+    output
+}
+
+fn copy_edge(edge: Edge) -> Edge {
+    Edge { target: edge.target, copies: copy_vec(edge.copies) }
+}
+
+fn copy_term(term: Terminator) -> Terminator {
+    match term {
+        Jump(edge) => Terminator::Jump(copy_edge(edge)),
+        Branch { condition, yes, no } => Terminator::Branch {
+            condition,
+            yes: copy_edge(yes),
+            no: copy_edge(no),
+        },
+        Return(values) => Terminator::Return(copy_vec(values)),
+    }
+}
+
+impl Function {
+    pub fn source(self: Function) -> ir::Function {
+        self.source_value
+    }
+
+    pub fn register_count(self: Function) -> isize {
+        self.types.len()
+    }
+
+    pub fn register(self: Function, index: isize) -> Result[Reg, ir::Error] {
+        if index < 0 || index >= self.types.len() {
+            return Result::Err(ir::error(ir::ErrorKind::InvalidHandle, "invalid machine register"))
+        }
+        Result::Ok(Reg { slot: index, owner: self.identity })
+    }
+
+    pub fn register_type(self: Function, reg: Reg) -> Result[ir::Type, ir::Error] {
+        if !ptr_eq(reg.owner, self.identity) {
+            return Result::Err(
+                ir::error(
+                    ir::ErrorKind::WrongFunction,
+                    "register belongs to another machine function",
+                ),
+            )
+        }
+        self.register(reg.slot)?;
+        Result::Ok(self.types[reg.slot])
+    }
+
+    pub fn blocks(self: Function) -> Vec[Block] {
+        let blocks = Vec::new();
+        for block in self.body {
+            blocks.push(
+                Block {
+                    index: block.index,
+                    parameters: copy_vec(block.parameters),
+                    instructions: copy_vec(block.instructions),
+                    terminator: copy_term(block.terminator),
+                },
+            );
+        }
+        blocks
+    }
+}
