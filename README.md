@@ -224,13 +224,19 @@ The benchmarks compare a bounded sum loop and a long arithmetic chain. Use
 repeated measurements on the target machine before drawing performance conclusions.
 
 `goml verify` copies the example into an independent module against an isolated
-registry snapshot, then repeats its interpreter/native checks. The standalone
-CI workflow pins the released GoML archive checksum and Go 1.26.0.
+registry snapshot, then repeats its interpreter/native checks.
 
-This repository currently uses standalone CI. Central ecosystem registration must update
-`ecosystem/catalog.json`, the verifier's module list and
-`verification/ci/repositories.json` together with real published commit IDs;
-the historical split manifests must remain unchanged.
+The library is registered in the [ecosystem catalog](https://github.com/gomlang/ecosystem)
+and [shared verifier](https://github.com/gomlang/verification).
+CI pins the shared workflow at a published commit; that revision selects the
+checksum-pinned GoML release and sibling repository revisions and runs Go 1.26.x.
+It checks formatting, library/example tests, independent downstream verification,
+cached builds and the example program. The CI artifact includes the verification
+logs and `codegen.tsv`. From the sibling verification checkout, run:
+
+```sh
+python3 ci/ecosystem.py verify --libraries .. --module goir --goml /absolute/path/to/goml
+```
 
 ## Source map and next steps
 
