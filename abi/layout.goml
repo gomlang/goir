@@ -1,6 +1,6 @@
 package abi;
 
-use ecosystem::goir::{Error, ErrorKind, Function, Type, error};
+use ecosystem::goir::{Error, ErrorKind, Function, Signature, Type, error};
 
 #[derive(Debug, PartialEq)]
 pub struct Slot {
@@ -34,9 +34,13 @@ fn slots(types: Vec[Type], offset: Ref[isize]) -> Vec[Slot] {
 }
 
 pub fn amd64_abi0(function: Function) -> Result[Plan, Error] {
+    amd64_abi0_signature(function.signature())
+}
+
+pub fn amd64_abi0_signature(signature: Signature) -> Result[Plan, Error] {
     let offset = Ref::new(0);
-    let parameters = slots(function.parameter_types(), offset);
-    let result_types = function.result_types();
+    let parameters = slots(signature.parameter_types(), offset);
+    let result_types = signature.result_types();
     if !result_types.is_empty() {
         offset.set(align_up(offset.get(), 8));
     }

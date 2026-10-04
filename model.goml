@@ -110,17 +110,16 @@ impl Datum {
     }
 }
 
-#[derive(Debug)]
 pub enum Operation {
     Constant(Datum),
     Binary(BinaryOp, Value, Value),
     Compare(IntCC, Value, Value),
     Select(Value, Value, Value),
+    Call(FuncRef, Vec[Value]),
 }
 
-#[derive(Debug)]
 pub struct Instruction {
-    pub result: Value,
+    pub results: Vec[Value],
     pub operation: Operation,
 }
 
@@ -170,6 +169,7 @@ impl Limits {
 
 pub struct Function {
     identity: Ref[()],
+    module_identity: Option[Ref[()]],
     name_value: string,
     inputs: Vec[Type],
     outputs: Vec[Type],
@@ -198,11 +198,29 @@ fn copy_terminator(term: Terminator) -> Terminator {
     }
 }
 
+fn copy_operation(operation: Operation) -> Operation {
+    match operation {
+        Call(target, arguments) => Operation::Call(target, copy_vec(arguments)),
+        _ => operation,
+    }
+}
+
+fn copy_instruction(instruction: Instruction) -> Instruction {
+    Instruction {
+        results: copy_vec(instruction.results),
+        operation: copy_operation(instruction.operation),
+    }
+}
+
 fn copy_block(block: BlockData) -> BlockData {
+    let instructions = Vec::new();
+    for instruction in block.instructions {
+        instructions.push(copy_instruction(instruction));
+    }
     BlockData {
         id: block.id,
         parameters: copy_vec(block.parameters),
-        instructions: copy_vec(block.instructions),
+        instructions,
         terminator: block.terminator.map(|term| copy_terminator(term)),
     }
 }
@@ -263,6 +281,7 @@ pub fn operands(operation: Operation) -> Vec[Value] {
         Constant(_) => Vec::new(),
         Binary(_, left, right) | Compare(_, left, right) => Vec::from_array([left, right]),
         Select(condition, yes, no) => Vec::from_array([condition, yes, no]),
+        Call(_, arguments) => copy_vec(arguments),
     }
 }
 
@@ -281,24 +300,65 @@ fn require_type(function: Function, value: Value, ty: Type) -> Result[(), Error]
     Result::Ok(())
 }
 
-fn operation_type(function: Function, operation: Operation) -> Result[Type, Error] {
+fn operation_types(function: Function, operation: Operation) -> Result[Vec[Type], Error] {
     match operation {
-        Constant(value) => Result::Ok(value.value_type()),
+        Constant(value) => Result::Ok(Vec::from_array([value.value_type()])),
         Binary(_, left, right) => {
             require_type(function, left, Type::I64)?;
             require_type(function, right, Type::I64)?;
-            Result::Ok(Type::I64)
+            Result::Ok(Vec::from_array([Type::I64]))
         },
         Compare(_, left, right) => {
             require_type(function, left, Type::I64)?;
             require_type(function, right, Type::I64)?;
-            Result::Ok(Type::Bool)
+            Result::Ok(Vec::from_array([Type::Bool]))
         },
         Select(condition, yes, no) => {
             require_type(function, condition, Type::Bool)?;
             let ty = function.value_type(yes)?;
             require_type(function, no, ty)?;
-            Result::Ok(ty)
+            Result::Ok(Vec::from_array([ty]))
         },
+        Call(target, arguments) => {
+            let owner = function.module_identity.ok_or(
+                error(ErrorKind::WrongFunction, "call requires a module function builder"),
+            )?;
+            if !ptr_eq(owner, target.owner) {
+                return Result::Err(
+                    error(ErrorKind::WrongFunction, "call target belongs to another module"),
+                )
+            }
+            let inputs = target.signature().parameter_types();
+            if inputs.len() != arguments.len() {
+                return Result::Err(
+                    error(ErrorKind::TypeMismatch, "call argument count differs from signature"),
+                )
+            }
+            for index in 0..arguments.len() {
+                require_type(function, arguments[index], inputs[index])?;
+            }
+            Result::Ok(target.signature().result_types())
+        },
+    }
+}
+
+impl Operation {
+    pub fn has_effects(self: Operation) -> bool {
+        match self {
+            Call(_, _) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Debug for Operation {
+    fn debug(self: Operation) -> string {
+        operation_text(self)
+    }
+}
+
+impl Debug for Instruction {
+    fn debug(self: Instruction) -> string {
+        value_list(self.results) + " = " + operation_text(self.operation)
     }
 }

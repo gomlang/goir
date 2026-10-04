@@ -37,10 +37,26 @@ pub fn lower(source: ir::Function) -> Result[Function, ir::Error] {
         }
         let instructions = Vec::new();
         for instruction in block.instructions {
-            let dst = reg(identity, instruction.result);
-            types[dst.slot] = source.value_type(instruction.result)?;
+            let results = Vec::new();
+            for result in instruction.results {
+                let dst = reg(identity, result);
+                types[dst.slot] = source.value_type(result)?;
+                results.push(dst);
+            }
+            if let ir::Operation::Call(target, arguments) = instruction.operation {
+                let uses = Vec::new();
+                for argument in arguments {
+                    uses.push(reg(identity, argument));
+                }
+                instructions.push(Instruction::Call { target, arguments: uses, results });
+                continue;
+            }
+            let dst = results[0];
             instructions.push(
                 match instruction.operation {
+                    Call(_, _) => return Result::Err(
+                        ir::error(ir::ErrorKind::InvalidState, "call reached scalar lowering"),
+                    ),
                     Constant(value) => Instruction::Immediate {
                         dst,
                         value: match value {

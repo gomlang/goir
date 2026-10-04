@@ -1,0 +1,239 @@
+package goir;
+
+#[derive(PartialEq, Eq)]
+pub struct Signature {
+    inputs: Vec[Type],
+    outputs: Vec[Type],
+}
+
+impl Signature {
+    pub fn new(inputs: Vec[Type], outputs: Vec[Type]) -> Result[Signature, Error] {
+        if inputs.len() > 256 || outputs.len() > 256 {
+            return Result::Err(
+                error(ErrorKind::LimitExceeded, "module signature exceeds 256 values"),
+            )
+        }
+        Result::Ok(Signature { inputs: copy_vec(inputs), outputs: copy_vec(outputs) })
+    }
+
+    pub fn parameter_types(self: Signature) -> Vec[Type] {
+        copy_vec(self.inputs)
+    }
+
+    pub fn result_types(self: Signature) -> Vec[Type] {
+        copy_vec(self.outputs)
+    }
+}
+
+impl Function {
+    pub fn signature(self: Function) -> Signature {
+        Signature { inputs: copy_vec(self.inputs), outputs: copy_vec(self.outputs) }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub struct FuncRef {
+    owner: Ref[()],
+    slot: isize,
+    symbol: string,
+    sig: Signature,
+    imported: bool,
+}
+
+impl Debug for FuncRef {
+    fn debug(self: FuncRef) -> string {
+        self.symbol
+    }
+}
+
+impl FuncRef {
+    pub fn index(self: FuncRef) -> isize {
+        self.slot
+    }
+
+    pub fn name(self: FuncRef) -> string {
+        self.symbol
+    }
+
+    pub fn signature(self: FuncRef) -> Signature {
+        Signature { inputs: copy_vec(self.sig.inputs), outputs: copy_vec(self.sig.outputs) }
+    }
+
+    pub fn is_imported(self: FuncRef) -> bool {
+        self.imported
+    }
+}
+
+pub struct Module {
+    identity: Ref[()],
+    targets: Vec[FuncRef],
+    definitions: Vec[Option[Function]],
+}
+
+pub struct ModuleBuilder {
+    module: Module,
+    finished: Ref[bool],
+}
+
+fn check_reference(module: Module, target: FuncRef) -> Result[(), Error] {
+    if !ptr_eq(module.identity, target.owner) {
+        return Result::Err(
+            error(ErrorKind::WrongFunction, "function reference belongs to another module"),
+        )
+    }
+    if target.slot < 0 || target.slot >= module.targets.len()
+        || module.targets[target.slot] != target {
+        return Result::Err(error(ErrorKind::InvalidHandle, "invalid function reference"))
+    }
+    Result::Ok(())
+}
+
+impl ModuleBuilder {
+    pub fn new() -> ModuleBuilder {
+        ModuleBuilder {
+            module: Module { identity: Ref::new(()), targets: Vec::new(), definitions: Vec::new() },
+            finished: Ref::new(false),
+        }
+    }
+
+    fn require_open(self: ModuleBuilder) -> Result[(), Error] {
+        if self.finished.get() {
+            return Result::Err(error(ErrorKind::InvalidState, "module builder is already finished"))
+        }
+        Result::Ok(())
+    }
+
+    fn add(self: ModuleBuilder, name: string, signature: Signature, imported: bool) -> Result[
+        FuncRef,
+        Error,
+    ] {
+        self.require_open()?;
+        if name.len() == 0 || name.len() > 128 {
+            return Result::Err(
+                error(ErrorKind::InvalidArgument, "module symbol must contain 1..128 bytes"),
+            )
+        }
+        if self.module.targets.len() >= 256 {
+            return Result::Err(error(ErrorKind::LimitExceeded, "module exceeds 256 functions"))
+        }
+        for target in self.module.targets {
+            if target.name() == name {
+                return Result::Err(error(ErrorKind::InvalidArgument, "duplicate module symbol"))
+            }
+        }
+        let target = FuncRef {
+            owner: self.module.identity,
+            slot: self.module.targets.len(),
+            symbol: name,
+            sig: Signature {
+                inputs: copy_vec(signature.inputs),
+                outputs: copy_vec(signature.outputs),
+            },
+            imported,
+        };
+        self.module.targets.push(target);
+        self.module.definitions.push(Option::None);
+        Result::Ok(target)
+    }
+
+    pub fn declare(self: ModuleBuilder, name: string, signature: Signature) -> Result[
+        FuncRef,
+        Error,
+    ] {
+        self.add(name, signature, false)
+    }
+
+    pub fn import(self: ModuleBuilder, name: string, signature: Signature) -> Result[FuncRef, Error] {
+        self.add(name, signature, true)
+    }
+
+    pub fn define(self: ModuleBuilder, target: FuncRef, function: Function) -> Result[(), Error] {
+        self.require_open()?;
+        check_reference(self.module, target)?;
+        if target.imported || self.module.definitions[target.slot].is_some() {
+            return Result::Err(
+                error(
+                    ErrorKind::InvalidState,
+                    "cannot define an imported or already defined function",
+                ),
+            )
+        }
+        if function.name() != target.name() || function.signature() != target.signature() {
+            return Result::Err(
+                error(ErrorKind::TypeMismatch, "definition differs from declared name or signature"),
+            )
+        }
+        if let Some(owner) = function.module_identity {
+            if !ptr_eq(owner, self.module.identity) {
+                return Result::Err(
+                    error(ErrorKind::WrongFunction, "definition belongs to another module"),
+                )
+            }
+        }
+        verify(function)?;
+        self.module.definitions[target.slot] = Option::Some(function);
+        Result::Ok(())
+    }
+
+    pub fn finish(self: ModuleBuilder) -> Result[Module, Error] {
+        self.require_open()?;
+        verify_module(self.module)?;
+        self.finished.set(true);
+        Result::Ok(self.module)
+    }
+}
+
+impl Module {
+    pub fn references(self: Module) -> Vec[FuncRef] {
+        copy_vec(self.targets)
+    }
+
+    pub fn function(self: Module, target: FuncRef) -> Result[Option[Function], Error] {
+        check_reference(self, target)?;
+        Result::Ok(self.definitions[target.slot])
+    }
+
+    pub fn functions(self: Module) -> Vec[Function] {
+        let output = Vec::new();
+        for definition in self.definitions {
+            if let Some(function) = definition {
+                output.push(function);
+            }
+        }
+        output
+    }
+}
+
+pub fn verify_module(module: Module) -> Result[(), Error] {
+    if module.targets.is_empty() || module.targets.len() > 256
+        || module.targets.len() != module.definitions.len() {
+        return Result::Err(error(ErrorKind::LimitExceeded, "module requires 1..256 declarations"))
+    }
+    for target in module.targets {
+        check_reference(module, target)?;
+        match module.definitions[target.slot] {
+            Some(function) => {
+                if target.imported || function.name() != target.name()
+                    || function.signature() != target.signature() {
+                    return Result::Err(error(ErrorKind::TypeMismatch, "invalid module definition"))
+                }
+                verify(function)?;
+                for block in function.body {
+                    for instruction in block.instructions {
+                        if let Operation::Call(callee, _) = instruction.operation {
+                            check_reference(module, callee)?;
+                        }
+                    }
+                }
+            },
+            None => {
+                if !target.imported {
+                    return Result::Err(
+                        error(ErrorKind::InvalidState, "module contains an unresolved definition"),
+                    )
+                }
+            },
+        }
+    }
+    Result::Ok(())
+}

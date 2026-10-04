@@ -10,13 +10,13 @@ pub struct Compiled {
     pub stack_slots: isize,
 }
 
-fn load(lines: Vec[string], value: ir::Value, register: string) -> () {
-    let offset = value.index() * 8;
+fn load(lines: Vec[string], value: ir::Value, register: string, base: isize) -> () {
+    let offset = base + value.index() * 8;
     lines.push(f"    MOVQ {offset}(SP), {register}");
 }
 
-fn save(lines: Vec[string], value: ir::Value, register: string) -> () {
-    let offset = value.index() * 8;
+fn save(lines: Vec[string], value: ir::Value, register: string, base: isize) -> () {
+    let offset = base + value.index() * 8;
     lines.push(f"    MOVQ {register}, {offset}(SP)");
 }
 
@@ -45,7 +45,7 @@ fn comparison_opcode(cc: ir::IntCC) -> string {
     }
 }
 
-fn instruction(lines: Vec[string], value: ir::Instruction) -> () {
+fn instruction(lines: Vec[string], value: ir::Instruction, base: isize) -> Result[(), ir::Error] {
     match value.operation {
         Constant(datum) => {
             let integer = match datum {
@@ -59,31 +59,64 @@ fn instruction(lines: Vec[string], value: ir::Instruction) -> () {
             lines.push("    MOVQ $" + integer.to_string() + ", AX");
         },
         Binary(op, left, right) => {
-            load(lines, left, "AX");
-            load(lines, right, "CX");
+            load(lines, left, "AX", base);
+            load(lines, right, "CX", base);
             lines.push("    " + binary_opcode(op) + " CX, AX");
         },
         Compare(cc, left, right) => {
-            load(lines, left, "AX");
-            load(lines, right, "CX");
+            load(lines, left, "AX", base);
+            load(lines, right, "CX", base);
             lines.push("    CMPQ AX, CX");
             lines.push("    " + comparison_opcode(cc) + " AL");
             lines.push("    MOVBQZX AL, AX");
         },
         Select(condition, yes, no) => {
-            load(lines, condition, "DX");
-            load(lines, yes, "AX");
-            load(lines, no, "CX");
+            load(lines, condition, "DX", base);
+            load(lines, yes, "AX", base);
+            load(lines, no, "CX", base);
             lines.push("    CMPQ DX, $0");
             lines.push("    CMOVQEQ CX, AX");
         },
+        Call(target, arguments) => {
+            let plan = abi::amd64_abi0_signature(target.signature())?;
+            abi::validate_identifier(target.name())?;
+            for position in 0..arguments.len() {
+                load(lines, arguments[position], "AX", base);
+                let slot = plan.parameters[position];
+                let opcode = match slot.ty {
+                    I64 => "MOVQ",
+                    Bool => "MOVB",
+                };
+                let offset = slot.offset;
+                lines.push(f"    {opcode} AX, {offset}(SP)");
+            }
+            lines.push("    CALL ·" + target.name() + "(SB)");
+            for position in 0..value.results.len() {
+                let slot = plan.results[position];
+                let opcode = match slot.ty {
+                    I64 => "MOVQ",
+                    Bool => "MOVBQZX",
+                };
+                let offset = slot.offset;
+                lines.push(f"    {opcode} {offset}(SP), AX");
+                save(lines, value.results[position], "AX", base);
+            }
+            return Result::Ok(())
+        },
     }
-    save(lines, value.result, "AX");
+    save(lines, value.results[0], "AX", base);
+    Result::Ok(())
 }
 
-fn transfer(lines: Vec[string], edge: ir::Edge, blocks: Vec[ir::BlockData], scratch: isize) -> () {
+fn transfer(
+    lines: Vec[string],
+    edge: ir::Edge,
+    blocks: Vec[ir::BlockData],
+    scratch: isize,
+    base: isize,
+) -> () {
     for index in 0..edge.arguments.len() {
-        load(lines, edge.arguments[index], "AX");
+        load(lines, edge.arguments[index], "AX", base);
         let offset = scratch + index * 8;
         lines.push(f"    MOVQ AX, {offset}(SP)");
     }
@@ -91,7 +124,7 @@ fn transfer(lines: Vec[string], edge: ir::Edge, blocks: Vec[ir::BlockData], scra
     for index in 0..parameters.len() {
         let offset = scratch + index * 8;
         lines.push(f"    MOVQ {offset}(SP), AX");
-        save(lines, parameters[index], "AX");
+        save(lines, parameters[index], "AX", base);
     }
     let target = edge.target.index();
     lines.push(f"    JMP block{target}");
@@ -112,7 +145,8 @@ fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled,
             temporary_slots = block.parameters.len();
         }
     }
-    let stack_slots = function.value_count() + temporary_slots;
+    let base = outgoing_bytes(function)?;
+    let stack_slots = base / 8 + function.value_count() + temporary_slots;
     let frame_bytes = stack_slots * 8;
     if frame_bytes > 32768 {
         return Result::Err(
@@ -136,13 +170,13 @@ fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled,
             Bool => "MOVBQZX",
         };
         lines.push(f"    {opcode} p{index}+{offset}(FP), AX");
-        save(lines, blocks[0].parameters[index], "AX");
+        save(lines, blocks[0].parameters[index], "AX", base);
     }
     for block in blocks {
         let index = block.id.index();
         lines.push(f"block{index}:");
         for value in block.instructions {
-            instruction(lines, value);
+            instruction(lines, value, base)?;
         }
         let term = block.terminator.ok_or(
             ir::error(ir::ErrorKind::ControlFlow, "missing terminator"),
@@ -150,7 +184,7 @@ fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled,
         match term {
             Return(values) => {
                 for position in 0..values.len() {
-                    load(lines, values[position], "AX");
+                    load(lines, values[position], "AX", base);
                     let slot = plan.results[position];
                     let offset = slot.offset;
                     let opcode = match slot.ty {
@@ -161,14 +195,14 @@ fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled,
                 }
                 lines.push("    RET");
             },
-            Jump(edge) => transfer(lines, edge, blocks, function.value_count() * 8),
+            Jump(edge) => transfer(lines, edge, blocks, base + function.value_count() * 8, base),
             Branch(condition, yes, no) => {
-                load(lines, condition, "AX");
+                load(lines, condition, "AX", base);
                 lines.push("    CMPQ AX, $0");
                 lines.push(f"    JNE edge_yes{index}");
-                transfer(lines, no, blocks, function.value_count() * 8);
+                transfer(lines, no, blocks, base + function.value_count() * 8, base);
                 lines.push(f"edge_yes{index}:");
-                transfer(lines, yes, blocks, function.value_count() * 8);
+                transfer(lines, yes, blocks, base + function.value_count() * 8, base);
             },
         }
     }
@@ -204,4 +238,36 @@ pub fn emit_stack_package(name: string, functions: Vec[ir::Function]) -> Result[
         declarations.push(compiled.declaration);
     }
     Result::Ok(Package { assembly: assembly.join("\n"), declarations: declarations.join("\n") })
+}
+
+fn outgoing_bytes(function: ir::Function) -> Result[isize, ir::Error] {
+    let mut size = 0;
+    for block in function.blocks() {
+        for instruction in block.instructions {
+            if let ir::Operation::Call(target, _) = instruction.operation {
+                let plan = abi::amd64_abi0_signature(target.signature())?;
+                let bytes = (plan.argument_bytes + 7) / 8 * 8;
+                if bytes > size {
+                    size = bytes;
+                }
+            }
+        }
+    }
+    Result::Ok(size)
+}
+
+pub fn emit_stack_module(name: string, module: ir::Module) -> Result[Package, ir::Error] {
+    ir::verify_module(module)?;
+    for target in module.references() {
+        abi::validate_identifier(target.name())?;
+        if Vec::from_array(["init", "main", "int64", "bool"]).contains(target.name()) {
+            return Result::Err(
+                ir::error(
+                    ir::ErrorKind::InvalidArgument,
+                    "function name conflicts with generated Go declarations",
+                ),
+            )
+        }
+    }
+    emit_stack_package(name, module.functions())
 }

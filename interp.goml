@@ -37,8 +37,8 @@ fn compare_value(cc: IntCC, left: i64, right: i64) -> bool {
     }
 }
 
-fn evaluate(operation: Operation, values: Vec[i64]) -> i64 {
-    match operation {
+fn evaluate(operation: Operation, values: Vec[i64]) -> Result[i64, Error] {
+    let value = match operation {
         Constant(value) => encode(value),
         Binary(op, left, right) => binary_value(op, values[left.slot], values[right.slot]),
         Compare(cc, left, right) => if compare_value(cc, values[left.slot], values[right.slot]) {
@@ -51,7 +51,11 @@ fn evaluate(operation: Operation, values: Vec[i64]) -> i64 {
         } else {
             values[no.slot]
         },
-    }
+        Call(_, _) => return Result::Err(
+            error(ErrorKind::InvalidState, "scalar evaluation received a call"),
+        ),
+    };
+    Result::Ok(value)
 }
 
 fn spend_fuel(fuel: Ref[u64]) -> Result[(), Error] {
@@ -62,51 +66,143 @@ fn spend_fuel(fuel: Ref[u64]) -> Result[(), Error] {
     Result::Ok(())
 }
 
-pub fn interpret(function: Function, arguments: Vec[Datum], fuel: u64) -> Result[Vec[Datum], Error] {
-    verify(function)?;
-    if arguments.len() != function.inputs.len() {
+struct Frame {
+    function: Function,
+    values: Vec[i64],
+    block: isize,
+    position: isize,
+    destinations: Vec[Value],
+}
+
+fn check_data(types: Vec[Type], arguments: Vec[Datum]) -> Result[(), Error] {
+    if arguments.len() != types.len() {
         return Result::Err(
-            error(ErrorKind::TypeMismatch, "interpreter argument count differs from signature"),
+            error(ErrorKind::TypeMismatch, "interpreter value count differs from signature"),
         )
     }
-    let values: Vec[i64] = Vec::new();
+    for index in 0..arguments.len() {
+        if arguments[index].value_type() != types[index] {
+            return Result::Err(
+                error(ErrorKind::TypeMismatch, "interpreter value type differs from signature"),
+            )
+        }
+    }
+    Result::Ok(())
+}
+
+fn frame(function: Function, arguments: Vec[Datum], destinations: Vec[Value]) -> Result[
+    Frame,
+    Error,
+] {
+    check_data(function.inputs, arguments)?;
+    let values = Vec::new();
     for _ in function.values {
         values.push(0);
     }
     for index in 0..arguments.len() {
-        if arguments[index].value_type() != function.inputs[index] {
-            return Result::Err(
-                error(ErrorKind::TypeMismatch, "interpreter argument type differs from signature"),
-            )
-        }
         values[function.body[0].parameters[index].slot] = encode(arguments[index]);
     }
+    Result::Ok(Frame { function, values, block: 0, position: 0, destinations })
+}
+
+fn datum(ty: Type, value: i64) -> Datum {
+    match ty {
+        I64 => Datum::I64(value),
+        Bool => Datum::Bool(value != 0),
+    }
+}
+
+fn execute(
+    module: Option[Module],
+    initial: Function,
+    arguments: Vec[Datum],
+    fuel: u64,
+    max_depth: isize,
+    host: (FuncRef, Vec[Datum]) -> Result[Vec[Datum], Error],
+) -> Result[Vec[Datum], Error] {
+    if max_depth < 1 || max_depth > 4096 {
+        return Result::Err(
+            error(ErrorKind::InvalidArgument, "interpreter call depth must be 1..4096"),
+        )
+    }
+    let frames = Vec::from_array([frame(initial, arguments, Vec::new())?]);
     let remaining = Ref::new(fuel);
-    let mut current = 0;
+    let mut cells = initial.value_count();
     loop {
-        let block = function.body[current];
-        for instruction in block.instructions {
-            spend_fuel(remaining)?;
-            values[instruction.result.slot] = evaluate(instruction.operation, values);
-        }
+        let index = frames.len() - 1;
+        let mut current = frames[index];
+        let function = current.function;
+        let block = function.body[current.block];
         spend_fuel(remaining)?;
+        if current.position < block.instructions.len() {
+            let instruction = block.instructions[current.position];
+            current.position = current.position + 1;
+            frames[index] = current;
+            match instruction.operation {
+                Call(target, arguments) => {
+                    let module = module.ok_or(
+                        error(ErrorKind::InvalidState, "calls require interpret_module"),
+                    )?;
+                    let input = Vec::new();
+                    let types = target.signature().parameter_types();
+                    for position in 0..arguments.len() {
+                        input.push(datum(types[position], current.values[arguments[position].slot]));
+                    }
+                    match module.function(target)? {
+                        Some(callee) => {
+                            if frames.len() >= max_depth || callee.value_count() > 1048576 - cells {
+                                return Result::Err(
+                                    error(
+                                        ErrorKind::LimitExceeded,
+                                        "interpreter call stack exceeds limits",
+                                    ),
+                                )
+                            }
+                            cells = cells + callee.value_count();
+                            frames.push(frame(callee, input, instruction.results)?);
+                        },
+                        None => {
+                            let output = host(target, input)?;
+                            check_data(target.signature().result_types(), output)?;
+                            for position in 0..output.len() {
+                                current.values[instruction.results[position].slot] = encode(
+                                    output[position],
+                                );
+                            }
+                        },
+                    }
+                },
+                _ => {
+                    current.values[instruction.results[0].slot] = evaluate(
+                        instruction.operation,
+                        current.values,
+                    )?;
+                },
+            }
+            continue;
+        }
         let term = block.terminator.ok_or(error(ErrorKind::ControlFlow, "missing terminator"))?;
         let edge = match term {
             Return(results) => {
                 let output = Vec::new();
-                for index in 0..results.len() {
-                    let value = values[results[index].slot];
+                for position in 0..results.len() {
                     output.push(
-                        match function.outputs[index] {
-                            I64 => Datum::I64(value),
-                            Bool => Datum::Bool(value != 0),
-                        },
+                        datum(function.outputs[position], current.values[results[position].slot]),
                     );
                 }
-                return Result::Ok(output)
+                let _ = frames.pop();
+                cells = cells - function.value_count();
+                if frames.is_empty() {
+                    return Result::Ok(output)
+                }
+                let parent = frames[frames.len() - 1];
+                for position in 0..output.len() {
+                    parent.values[current.destinations[position].slot] = encode(output[position]);
+                }
+                continue;
             },
             Jump(edge) => edge,
-            Branch(condition, yes, no) => if values[condition.slot] != 0 {
+            Branch(condition, yes, no) => if current.values[condition.slot] != 0 {
                 yes
             } else {
                 no
@@ -114,12 +210,57 @@ pub fn interpret(function: Function, arguments: Vec[Datum], fuel: u64) -> Result
         };
         let incoming = Vec::new();
         for value in edge.arguments {
-            incoming.push(values[value.slot]);
+            incoming.push(current.values[value.slot]);
         }
         let parameters = function.body[edge.target.slot].parameters;
-        for index in 0..incoming.len() {
-            values[parameters[index].slot] = incoming[index];
+        for position in 0..incoming.len() {
+            current.values[parameters[position].slot] = incoming[position];
         }
-        current = edge.target.slot;
+        current.block = edge.target.slot;
+        current.position = 0;
+        frames[index] = current;
+    }
+}
+
+fn missing_host(target: FuncRef, arguments: Vec[Datum]) -> Result[Vec[Datum], Error] {
+    let _ = arguments;
+    Result::Err(error(ErrorKind::Unsupported, "no interpreter host callback for " + target.name()))
+}
+
+pub fn interpret(function: Function, arguments: Vec[Datum], fuel: u64) -> Result[Vec[Datum], Error] {
+    verify(function)?;
+    execute(Option::None, function, arguments, fuel, 1024, missing_host)
+}
+
+pub fn interpret_module(module: Module, target: FuncRef, arguments: Vec[Datum], fuel: u64) -> Result[
+    Vec[Datum],
+    Error,
+] {
+    interpret_module_with_host(module, target, arguments, fuel, 1024, missing_host)
+}
+
+pub fn interpret_module_with_host(
+    module: Module,
+    target: FuncRef,
+    arguments: Vec[Datum],
+    fuel: u64,
+    max_depth: isize,
+    host: (FuncRef, Vec[Datum]) -> Result[Vec[Datum], Error],
+) -> Result[Vec[Datum], Error] {
+    verify_module(module)?;
+    check_data(target.signature().parameter_types(), arguments)?;
+    if max_depth < 1 || max_depth > 4096 {
+        return Result::Err(
+            error(ErrorKind::InvalidArgument, "interpreter call depth must be 1..4096"),
+        )
+    }
+    match module.function(target)? {
+        Some(function) => execute(Option::Some(module), function, arguments, fuel, max_depth, host),
+        None => {
+            spend_fuel(Ref::new(fuel))?;
+            let output = host(target, arguments)?;
+            check_data(target.signature().result_types(), output)?;
+            Result::Ok(output)
+        },
     }
 }

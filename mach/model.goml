@@ -20,6 +20,48 @@ impl Debug for Reg {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum FixedReg {
+    AX,
+    CX,
+    DX,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OperandKind {
+    Use,
+    Def,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OperandPosition {
+    Early,
+    Late,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Constraint {
+    Any,
+    Register,
+    Fixed(FixedReg),
+    Reuse(isize),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Operand {
+    pub reg: Reg,
+    pub kind: OperandKind,
+    pub position: OperandPosition,
+    pub constraint: Constraint,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Clobber {
+    Register(isize),
+    Fixed(FixedReg),
+    Flags,
+}
+
 pub enum Instruction {
     Immediate {
         dst: Reg,
@@ -43,12 +85,89 @@ pub enum Instruction {
         yes: Reg,
         no: Reg,
     },
+    Call {
+        target: ir::FuncRef,
+        arguments: Vec[Reg],
+        results: Vec[Reg],
+    },
 }
 
 impl Instruction {
-    pub fn definition(self: Instruction) -> Reg {
+    pub fn definitions(self: Instruction) -> Vec[Reg] {
         match self {
-            Immediate { dst, .. } | Binary { dst, .. } | Compare { dst, .. } | Select { dst, .. } => dst,
+            Immediate { dst, .. } | Binary { dst, .. } | Compare { dst, .. } | Select { dst, .. } => Vec::from_array(
+                [dst],
+            ),
+            Call { results, .. } => copy_vec(results),
+        }
+    }
+
+    pub fn operands(self: Instruction) -> Vec[Operand] {
+        let uses = self.uses();
+        let constraints = match self {
+            Immediate { .. } => Vec::new(),
+            Binary { op, .. } => Vec::from_array(
+                [
+                    Constraint::Register,
+                    match op {
+                        Shl | ShrU | ShrS => Constraint::Fixed(FixedReg::CX),
+                        _ => Constraint::Any,
+                    },
+                ],
+            ),
+            Compare { .. } => Vec::from_array([Constraint::Register, Constraint::Any]),
+            Select { .. } => Vec::from_array(
+                [Constraint::Any, Constraint::Register, Constraint::Any],
+            ),
+            Call { .. } => {
+                let constraints = Vec::new();
+                for _ in uses {
+                    constraints.push(Constraint::Any);
+                }
+                constraints
+            },
+        };
+        let output = Vec::new();
+        for index in 0..uses.len() {
+            output.push(
+                Operand {
+                    reg: uses[index],
+                    kind: OperandKind::Use,
+                    position: OperandPosition::Early,
+                    constraint: constraints[index],
+                },
+            );
+        }
+        let constraint = match self {
+            Immediate { .. } => Constraint::Register,
+            Binary { .. } => Constraint::Reuse(0),
+            Compare { .. } => Constraint::Fixed(FixedReg::AX),
+            Select { .. } => Constraint::Reuse(1),
+            Call { .. } => Constraint::Any,
+        };
+        for reg in self.definitions() {
+            output.push(
+                Operand { reg, kind: OperandKind::Def, position: OperandPosition::Late, constraint },
+            );
+        }
+        output
+    }
+
+    pub fn clobbers(self: Instruction) -> Vec[Clobber] {
+        match self {
+            Immediate { .. } => Vec::new(),
+            Call { .. } => {
+                let output = Vec::new();
+                for index in 0..7 {
+                    output.push(Clobber::Register(index));
+                }
+                for register in Vec::from_array([FixedReg::AX, FixedReg::CX, FixedReg::DX]) {
+                    output.push(Clobber::Fixed(register));
+                }
+                output.push(Clobber::Flags);
+                output
+            },
+            _ => Vec::from_array([Clobber::Flags]),
         }
     }
 
@@ -59,6 +178,7 @@ impl Instruction {
                 [left, right],
             ),
             Select { condition, yes, no, .. } => Vec::from_array([condition, yes, no]),
+            Call { arguments, .. } => copy_vec(arguments),
         }
     }
 }
@@ -129,6 +249,17 @@ fn copy_vec[T](input: Vec[T]) -> Vec[T] {
     output
 }
 
+fn copy_instruction(instruction: Instruction) -> Instruction {
+    match instruction {
+        Call { target, arguments, results } => Instruction::Call {
+            target,
+            arguments: copy_vec(arguments),
+            results: copy_vec(results),
+        },
+        _ => instruction,
+    }
+}
+
 fn copy_edge(edge: Edge) -> Edge {
     Edge { target: edge.target, copies: copy_vec(edge.copies) }
 }
@@ -177,11 +308,15 @@ impl Function {
     pub fn blocks(self: Function) -> Vec[Block] {
         let blocks = Vec::new();
         for block in self.body {
+            let instructions = Vec::new();
+            for instruction in block.instructions {
+                instructions.push(copy_instruction(instruction));
+            }
             blocks.push(
                 Block {
                     index: block.index,
                     parameters: copy_vec(block.parameters),
-                    instructions: copy_vec(block.instructions),
+                    instructions,
                     terminator: copy_term(block.terminator),
                 },
             );

@@ -57,6 +57,7 @@ fn operation_text(operation: Operation) -> string {
         Binary(op, left, right) => op.name() + f" v{left.slot}, v{right.slot}",
         Compare(cc, left, right) => "icmp " + cc.name() + f" v{left.slot}, v{right.slot}",
         Select(condition, yes, no) => f"select v{condition.slot}, v{yes.slot}, v{no.slot}",
+        Call(target, arguments) => "call " + target.name() + "(" + value_list(arguments) + ")",
     }
 }
 
@@ -84,12 +85,16 @@ pub fn display(function: Function) -> Result[string, Error] {
         }
         lines.push(f"block{block.id.slot}(" + parameters.join(", ") + "):");
         for instruction in block.instructions {
-            lines.push(
-                f"    v{instruction.result.slot}: "
-                    + function.value_type(instruction.result)?.name()
-                    + " = "
-                    + operation_text(instruction.operation),
-            );
+            let results = Vec::new();
+            for result in instruction.results {
+                results.push(f"v{result.slot}: " + function.value_type(result)?.name());
+            }
+            let prefix = if results.is_empty() {
+                ""
+            } else {
+                results.join(", ") + " = "
+            };
+            lines.push("    " + prefix + operation_text(instruction.operation));
         }
         let term = block.terminator.ok_or(error(ErrorKind::ControlFlow, "missing terminator"))?;
         lines.push(

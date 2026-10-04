@@ -105,6 +105,9 @@ pub fn verify(function: Function) -> Result[(), Error] {
                 error(ErrorKind::InvalidHandle, "block ID does not match its position"),
             )
         }
+        if block.instructions.len() > function.limits.max_values {
+            return Result::Err(error(ErrorKind::LimitExceeded, "too many instructions"))
+        }
         if block.parameters.len() > function.limits.max_block_parameters {
             return Result::Err(error(ErrorKind::LimitExceeded, "too many block parameters"))
         }
@@ -123,12 +126,26 @@ pub fn verify(function: Function) -> Result[(), Error] {
         for position in 0..block.instructions.len() {
             charge(remaining)?;
             let instruction = block.instructions[position];
-            check_definition(function, definitions, instruction.result, block.id, position)?;
-            require_type(
-                function,
-                instruction.result,
-                operation_type(function, instruction.operation)?,
-            )?;
+            let types = operation_types(function, instruction.operation)?;
+            if instruction.results.len() != types.len() {
+                return Result::Err(
+                    error(
+                        ErrorKind::TypeMismatch,
+                        "instruction result count differs from operation",
+                    ),
+                )
+            }
+            for result in 0..instruction.results.len() {
+                charge(remaining)?;
+                check_definition(
+                    function,
+                    definitions,
+                    instruction.results[result],
+                    block.id,
+                    position,
+                )?;
+                require_type(function, instruction.results[result], types[result])?;
+            }
         }
         let term = block.terminator.ok_or(
             error(ErrorKind::ControlFlow, f"block{index} has no terminator"),

@@ -1,0 +1,206 @@
+package opt;
+
+use ecosystem::goir as ir;
+
+struct Available {
+    value: ir::Value,
+    block: isize,
+}
+
+struct Dominance {
+    sets: Vec[Vec[bool]],
+    order: Vec[isize],
+}
+
+fn dominance(blocks: Vec[ir::BlockData], budget: Ref[isize]) -> Result[Dominance, ir::Error] {
+    let count = blocks.len();
+    if count > 1048576 / count {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "optimization dominance matrix limit exceeded"),
+        )
+    }
+    let reachable = Vec::new();
+    let predecessors: Vec[Vec[isize]] = Vec::new();
+    let sets: Vec[Vec[bool]] = Vec::new();
+    for _ in blocks {
+        spend(budget)?;
+        reachable.push(false);
+        predecessors.push(Vec::new());
+        sets.push(Vec::new());
+    }
+    let pending = Vec::from_array([0]);
+    reachable[0] = true;
+    let mut cursor = 0;
+    while cursor < pending.len() {
+        let index = pending[cursor];
+        cursor = cursor + 1;
+        spend(budget)?;
+        for edge in ir::successors(terminator(blocks[index])?) {
+            let target = edge.target.index();
+            predecessors[target].push(index);
+            if !reachable[target] {
+                reachable[target] = true;
+                pending.push(target);
+            }
+        }
+    }
+    for index in 0..count {
+        for candidate in 0..count {
+            spend(budget)?;
+            sets[index].push(
+                reachable[index] && reachable[candidate] && (index != 0 || candidate == 0),
+            );
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in pending {
+            if index == 0 {
+                continue;
+            }
+            for candidate in pending {
+                spend(budget)?;
+                let mut dominates = true;
+                if candidate != index {
+                    for predecessor in predecessors[index] {
+                        spend(budget)?;
+                        if !sets[predecessor][candidate] {
+                            dominates = false;
+                            break;
+                        }
+                    }
+                }
+                if sets[index][candidate] != dominates {
+                    sets[index][candidate] = dominates;
+                    changed = true;
+                }
+            }
+        }
+    }
+    let depths = Vec::new();
+    for index in 0..count {
+        let mut depth = 0;
+        for candidate in 0..count {
+            spend(budget)?;
+            if sets[index][candidate] {
+                depth = depth + 1;
+            }
+        }
+        depths.push(depth);
+    }
+    pending.sort_by(
+        |left, right| {
+            if depths[left] == depths[right] {
+                left - right
+            } else {
+                depths[left] - depths[right]
+            }
+        },
+    );
+    Result::Ok(Dominance { sets, order: pending })
+}
+
+fn expression_key(operation: ir::Operation) -> string {
+    let normalized = match operation {
+        Binary(op, left, right) => {
+            let commutative = match op {
+                Add | Mul | And | Or | Xor => true,
+                _ => false,
+            };
+            if commutative && left.index() > right.index() {
+                ir::Operation::Binary(op, right, left)
+            } else {
+                operation
+            }
+        },
+        Compare(cc, left, right) => if (cc == ir::IntCC::Equal || cc == ir::IntCC::NotEqual)
+            && left.index() > right.index() {
+            ir::Operation::Compare(cc, right, left)
+        } else {
+            operation
+        },
+        _ => operation,
+    };
+    match normalized {
+        Constant(ir::Datum::I64(value)) => f"i64:{value}",
+        Constant(ir::Datum::Bool(value)) => if value {
+            "bool:true"
+        } else {
+            "bool:false"
+        },
+        Binary(op, left, right) => f"binary:{op.debug()}:{left.index()}:{right.index()}",
+        Compare(cc, left, right) => f"compare:{cc.debug()}:{left.index()}:{right.index()}",
+        Select(condition, yes, no) => f"select:{condition.index()}:{yes.index()}:{no.index()}",
+        Call(_, _) => "effectful",
+    }
+}
+
+fn number_values(
+    blocks: Vec[ir::BlockData],
+    aliases: Vec[Option[ir::Value]],
+    constants: Vec[Option[ir::Datum]],
+    budget: Ref[isize],
+) -> Result[Vec[ir::BlockData], ir::Error] {
+    let dom = dominance(blocks, budget)?;
+    let expressions: HashMap[string, Vec[Available]] = HashMap::new();
+    for index in dom.order {
+        let block = blocks[index];
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            spend(budget)?;
+            let operation = resolve_operation(instruction.operation, aliases, budget)?;
+            if !operation.has_effects() && instruction.results.len() == 1 {
+                let result = instruction.results[0];
+                if aliases[result.index()].is_none() {
+                    let key = expression_key(operation);
+                    let candidates = expressions.get(key).unwrap_or(Vec::new());
+                    let mut found = Option::None;
+                    for candidate in candidates {
+                        spend(budget)?;
+                        if dom.sets[index][candidate.block] {
+                            found = Option::Some(candidate.value);
+                            break;
+                        }
+                    }
+                    match found {
+                        Option::Some(value) => {
+                            aliases[result.index()] = Option::Some(value);
+                        },
+                        Option::None => {
+                            candidates.push(Available { value: result, block: index });
+                            expressions.insert(key, candidates);
+                        },
+                    }
+                }
+            }
+            instructions.push(ir::Instruction { results: instruction.results, operation });
+        }
+        blocks[index] = ir::BlockData {
+            id: block.id,
+            parameters: block.parameters,
+            instructions,
+            terminator: block.terminator,
+        };
+    }
+    for index in 0..blocks.len() {
+        let block = blocks[index];
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            spend(budget)?;
+            instructions.push(
+                ir::Instruction {
+                    results: instruction.results,
+                    operation: resolve_operation(instruction.operation, aliases, budget)?,
+                },
+            );
+        }
+        blocks[index] = ir::BlockData {
+            id: block.id,
+            parameters: block.parameters,
+            instructions,
+            terminator: Option::Some(resolve_term(terminator(block)?, aliases, constants, budget)?),
+        };
+    }
+    Result::Ok(blocks)
+}

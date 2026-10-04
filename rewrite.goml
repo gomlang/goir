@@ -35,6 +35,13 @@ fn rewritten_operation(source: Function, values: Vec[Option[Value]], operation: 
                 rewritten_value(source, values, no)?,
             ),
         ),
+        Call(target, arguments) => {
+            let output = Vec::new();
+            for argument in arguments {
+                output.push(rewritten_value(source, values, argument)?);
+            }
+            Result::Ok(Operation::Call(target, output))
+        },
     }
 }
 
@@ -87,21 +94,29 @@ pub fn rewrite(source: Function, body: Vec[BlockData]) -> Result[Function, Error
             return Result::Err(error(ErrorKind::InvalidHandle, "rewrite repeats a block"))
         }
         if block.parameters.len() > source.limits.max_block_parameters
-            || block.instructions.len() > source.values.len()
-            || block.parameters.len() + block.instructions.len()
-                > source.values.len() - definitions.len() {
-            return Result::Err(
-                error(ErrorKind::LimitExceeded, "rewrite exceeds source value limits"),
-            )
+            || block.instructions.len() > source.limits.max_values {
+            return Result::Err(error(ErrorKind::LimitExceeded, "rewrite exceeds source limits"))
         }
         let target = Block { slot: index, owner: identity };
         blocks[block.id.slot] = Option::Some(target);
         let old_values = copy_vec(block.parameters);
-        for instruction in block.instructions {
-            old_values.push(instruction.result);
+        let positions = Vec::new();
+        for _ in block.parameters {
+            positions.push(-1);
         }
-        for position in 0..old_values.len() {
-            let old = old_values[position];
+        for position in 0..block.instructions.len() {
+            for result in block.instructions[position].results {
+                old_values.push(result);
+                positions.push(position);
+            }
+        }
+        if old_values.len() > source.values.len() - definitions.len() {
+            return Result::Err(
+                error(ErrorKind::LimitExceeded, "rewrite exceeds source value limits"),
+            )
+        }
+        for index in 0..old_values.len() {
+            let old = old_values[index];
             check_value(source, old)?;
             if values[old.slot].is_some() {
                 return Result::Err(error(ErrorKind::InvalidHandle, "rewrite repeats a definition"))
@@ -111,11 +126,7 @@ pub fn rewrite(source: Function, body: Vec[BlockData]) -> Result[Function, Error
                 ValueData {
                     ty: source.values[old.slot].ty,
                     block: target,
-                    position: if position < block.parameters.len() {
-                        -1
-                    } else {
-                        position - block.parameters.len()
-                    },
+                    position: positions[index],
                 },
             );
         }
@@ -128,9 +139,13 @@ pub fn rewrite(source: Function, body: Vec[BlockData]) -> Result[Function, Error
         }
         let instructions = Vec::new();
         for instruction in block.instructions {
+            let results = Vec::new();
+            for result in instruction.results {
+                results.push(rewritten_value(source, values, result)?);
+            }
             instructions.push(
                 Instruction {
-                    result: rewritten_value(source, values, instruction.result)?,
+                    results,
                     operation: rewritten_operation(source, values, instruction.operation)?,
                 },
             );
@@ -171,6 +186,7 @@ pub fn rewrite(source: Function, body: Vec[BlockData]) -> Result[Function, Error
     }
     let function = Function {
         identity,
+        module_identity: source.module_identity,
         name_value: source.name_value,
         inputs: copy_vec(source.inputs),
         outputs: copy_vec(source.outputs),

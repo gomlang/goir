@@ -9,10 +9,15 @@ fn physical(index: isize) -> string {
     Vec::from_array(["BX", "SI", "DI", "R8", "R9", "R10", "R11"])[index]
 }
 
-fn place(location: regalloc::Location) -> string {
+fn place_at(location: regalloc::Location, base: isize) -> string {
     match location {
         Register(index) => physical(index),
-        Stack(index) => (index * 8).to_string() + "(SP)",
+        Fixed(register) => match register {
+            AX => "AX",
+            CX => "CX",
+            DX => "DX",
+        },
+        Stack(index) => (base + index * 8).to_string() + "(SP)",
     }
 }
 
@@ -24,81 +29,111 @@ fn move_operand(lines: Vec[string], source: string, destination: string) -> () {
 
 fn register_location(location: regalloc::Location) -> bool {
     match location {
-        Register(_) => true,
+        Register(_) | Fixed(_) => true,
         Stack(_) => false,
     }
 }
 
-fn commutative(op: ir::BinaryOp) -> bool {
-    match op {
-        Add | Mul | And | Or | Xor => true,
-        _ => false,
+fn emit_edits(lines: Vec[string], edits: Vec[regalloc::Edit], base: isize) -> Result[(), ir::Error] {
+    for edit in edits {
+        if edit.source == edit.destination {
+            continue;
+        }
+        if !register_location(edit.source) && !register_location(edit.destination) {
+            return Result::Err(
+                ir::error(
+                    ir::ErrorKind::InvalidState,
+                    "allocated memory copy requires an explicit scratch edit",
+                ),
+            )
+        }
+        move_operand(lines, place_at(edit.source, base), place_at(edit.destination, base));
     }
+    Result::Ok(())
 }
 
 fn allocated_instruction(
     lines: Vec[string],
-    allocation: regalloc::Allocation,
-    instruction: mach::Instruction,
+    instruction: regalloc::AllocatedInstruction,
+    base: isize,
 ) -> Result[(), ir::Error] {
-    let destination = allocation.location(instruction.definition())?;
-    let output = place(destination);
-    let mut accumulator = if register_location(destination) {
-        output
-    } else {
-        "AX"
-    };
-    match instruction {
-        Immediate { value, .. } => lines.push("    MOVQ $" + value.to_string() + ", " + accumulator),
-        Binary { op, left, right, .. } => {
-            let left = allocation.location(left)?;
-            let right = allocation.location(right)?;
-            match op {
-                Shl | ShrU | ShrS => {
-                    move_operand(lines, place(right), "CX");
-                    move_operand(lines, place(left), accumulator);
-                    lines.push("    " + binary_opcode(op) + " CX, " + accumulator);
-                },
-                _ => {
-                    let mut source = place(right);
-                    if destination == right && register_location(destination) && commutative(op) {
-                        source = place(left);
-                    } else {
-                        if destination == right && destination != left {
-                            accumulator = "AX";
-                        }
-                        move_operand(lines, place(left), accumulator);
-                    }
-                    lines.push("    " + binary_opcode(op) + " " + source + ", " + accumulator);
-                },
-            }
+    emit_edits(lines, instruction.before, base)?;
+    let operands = instruction.operands;
+    match instruction.instruction {
+        Immediate { value, .. } => {
+            lines.push(
+                "    MOVQ $" + value.to_string() + ", " + place_at(operands[0].location, base),
+            );
         },
-        Compare { cc, left, right, .. } => {
-            let left = allocation.location(left)?;
-            let right = allocation.location(right)?;
-            let mut operand = place(left);
-            if !register_location(left) && !register_location(right) {
-                move_operand(lines, operand, "AX");
-                operand = "AX";
-            }
-            lines.push("    CMPQ " + operand + ", " + place(right));
+        Binary { op, .. } => {
+            lines.push(
+                "    " + binary_opcode(op) + " " + place_at(operands[1].location, base) + ", "
+                    + place_at(operands[2].location, base),
+            );
+        },
+        Compare { cc, .. } => {
+            lines.push(
+                "    CMPQ " + place_at(operands[0].location, base) + ", "
+                    + place_at(operands[1].location, base),
+            );
             lines.push("    " + comparison_opcode(cc) + " AL");
-            lines.push("    MOVBQZX AL, " + accumulator);
+            lines.push("    MOVBQZX AL, AX");
         },
-        Select { condition, yes, no, .. } => {
-            let condition = allocation.location(condition)?;
-            let yes = allocation.location(yes)?;
-            let no = allocation.location(no)?;
-            lines.push("    CMPQ " + place(condition) + ", $0");
-            if destination == no && register_location(destination) {
-                lines.push("    CMOVQNE " + place(yes) + ", " + accumulator);
-            } else {
-                move_operand(lines, place(yes), accumulator);
-                lines.push("    CMOVQEQ " + place(no) + ", " + accumulator);
+        Select { .. } => {
+            lines.push("    CMPQ " + place_at(operands[0].location, base) + ", $0");
+            lines.push(
+                "    CMOVQEQ " + place_at(operands[2].location, base) + ", "
+                    + place_at(operands[3].location, base),
+            );
+        },
+        Call { target, arguments, results } => {
+            abi::validate_identifier(target.name())?;
+            let plan = abi::amd64_abi0_signature(target.signature())?;
+            for index in 0..arguments.len() {
+                let location = operands[index].location;
+                let source = if register_location(location) {
+                    place_at(location, base)
+                } else {
+                    "AX"
+                };
+                move_operand(lines, place_at(location, base), source);
+                let slot = plan.parameters[index];
+                let opcode = match slot.ty {
+                    I64 => "MOVQ",
+                    Bool => "MOVB",
+                };
+                let offset = slot.offset;
+                lines.push(f"    {opcode} " + source + f", {offset}(SP)");
+            }
+            lines.push("    CALL ·" + target.name() + "(SB)");
+            for index in 0..results.len() {
+                let location = operands[arguments.len() + index].location;
+                let destination = if register_location(location) {
+                    place_at(location, base)
+                } else {
+                    "AX"
+                };
+                let slot = plan.results[index];
+                let opcode = match slot.ty {
+                    I64 => "MOVQ",
+                    Bool => "MOVBQZX",
+                };
+                let offset = slot.offset;
+                lines.push(f"    {opcode} {offset}(SP), " + destination);
+                move_operand(lines, destination, place_at(location, base));
             }
         },
     }
-    move_operand(lines, accumulator, output);
+    emit_edits(lines, instruction.after, base)
+}
+
+fn emit_allocated_edge(lines: Vec[string], edge: regalloc::AllocatedEdge, base: isize) -> Result[
+    (),
+    ir::Error,
+] {
+    emit_edits(lines, edge.edits, base)?;
+    let target = edge.edge.target;
+    lines.push(f"    JMP block{target}");
     Result::Ok(())
 }
 
@@ -141,7 +176,8 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
     let function = allocation.function().source();
     let declaration = abi::declaration(function)?;
     let plan = abi::amd64_abi0(function)?;
-    let stack_slots = allocation.stack_slots();
+    let base = outgoing_bytes(function)?;
+    let stack_slots = base / 8 + allocation.stack_slots();
     let frame_bytes = stack_slots * 8;
     if frame_bytes > 32768 {
         return Result::Err(
@@ -158,6 +194,7 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
     lines.push(f"TEXT ·{name}(SB), $" + frame_bytes.to_string() + f"-{argument_bytes}");
     lines.push("    NO_LOCAL_POINTERS");
     let blocks = allocation.function().blocks();
+    let allocated = allocation.blocks();
     for index in 0..plan.parameters.len() {
         let slot = plan.parameters[index];
         let offset = slot.offset;
@@ -167,29 +204,29 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
         };
         let destination = allocation.location(blocks[0].parameters[index])?;
         let register = if register_location(destination) {
-            place(destination)
+            place_at(destination, base)
         } else {
             "AX"
         };
         lines.push(f"    {opcode} p{index}+{offset}(FP), " + register);
-        move_operand(lines, register, place(destination));
+        move_operand(lines, register, place_at(destination, base));
     }
-    for block in blocks {
+    for block in allocated {
         let index = block.index;
         lines.push(f"block{index}:");
         for instruction in block.instructions {
-            allocated_instruction(lines, allocation, instruction)?;
+            allocated_instruction(lines, instruction, base)?;
         }
-        match block.terminator {
+        match blocks[index].terminator {
             Return(values) => {
                 for position in 0..values.len() {
-                    let source = allocation.location(values[position])?;
+                    let source = block.terminator_operands[position].location;
                     let register = if register_location(source) {
-                        place(source)
+                        place_at(source, base)
                     } else {
                         "AX"
                     };
-                    move_operand(lines, place(source), register);
+                    move_operand(lines, place_at(source, base), register);
                     let slot = plan.results[position];
                     let offset = slot.offset;
                     let opcode = match slot.ty {
@@ -200,13 +237,15 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
                 }
                 lines.push("    RET");
             },
-            Jump(edge) => allocated_transfer(lines, allocation, edge)?,
-            Branch { condition, yes, no } => {
-                lines.push("    CMPQ " + place(allocation.location(condition)?) + ", $0");
+            Jump(_) => emit_allocated_edge(lines, block.edges[0], base)?,
+            Branch { .. } => {
+                lines.push(
+                    "    CMPQ " + place_at(block.terminator_operands[0].location, base) + ", $0",
+                );
                 lines.push(f"    JNE edge_yes{index}");
-                allocated_transfer(lines, allocation, no)?;
+                emit_allocated_edge(lines, block.edges[1], base)?;
                 lines.push(f"edge_yes{index}:");
-                allocated_transfer(lines, allocation, yes)?;
+                emit_allocated_edge(lines, block.edges[0], base)?;
             },
         }
     }
@@ -256,4 +295,27 @@ pub fn emit_package_with_options(
         declarations.push(compiled.declaration);
     }
     Result::Ok(Package { assembly: assembly.join("\n"), declarations: declarations.join("\n") })
+}
+
+pub fn emit_module(name: string, module: ir::Module) -> Result[Package, ir::Error] {
+    emit_module_with_options(name, module, regalloc::Options::standard())
+}
+
+pub fn emit_module_with_options(name: string, module: ir::Module, options: regalloc::Options) -> Result[
+    Package,
+    ir::Error,
+] {
+    ir::verify_module(module)?;
+    for target in module.references() {
+        abi::validate_identifier(target.name())?;
+        if Vec::from_array(["init", "main", "int64", "bool"]).contains(target.name()) {
+            return Result::Err(
+                ir::error(
+                    ir::ErrorKind::InvalidArgument,
+                    "function name conflicts with generated Go declarations",
+                ),
+            )
+        }
+    }
+    emit_package_with_options(name, module.functions(), options)
 }

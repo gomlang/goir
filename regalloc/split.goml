@@ -1,0 +1,439 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+
+struct Planner {
+    function: mach::Function,
+    live: Liveness,
+    canonical: Vec[Location],
+    homes: Vec[isize],
+    slot_owners: Vec[Vec[mach::Reg]],
+    limit: isize,
+    budget: Ref[isize],
+}
+
+struct BlockState {
+    current: Vec[Option[Location]],
+    lanes: Vec[Option[mach::Reg]],
+    uses: Vec[Vec[isize]],
+    cursors: Vec[isize],
+}
+
+fn current_location(state: BlockState, reg: mach::Reg) -> Result[Location, ir::Error] {
+    match state.current[reg.index()] {
+        Some(location) => Result::Ok(location),
+        None => Result::Err(
+            ir::error(ir::ErrorKind::InvalidState, "value has no allocated location"),
+        ),
+    }
+}
+
+fn next_use(state: BlockState, reg: mach::Reg, position: isize, later: bool) -> isize {
+    let points = state.uses[reg.index()];
+    let mut cursor = state.cursors[reg.index()];
+    while cursor < points.len()
+        && (points[cursor] < position || (later && points[cursor] == position)) {
+        cursor = cursor + 1;
+    }
+    if !later {
+        state.cursors[reg.index()] = cursor;
+    }
+    if cursor < points.len() {
+        points[cursor]
+    } else {
+        -1
+    }
+}
+
+fn spill_home(planner: Planner, reg: mach::Reg) -> Result[Location, ir::Error] {
+    if planner.homes[reg.index()] >= 0 {
+        return Result::Ok(Location::Stack(planner.homes[reg.index()]))
+    }
+    let mut selected = -1;
+    for slot in 0..planner.slot_owners.len() {
+        if lane_available(planner.live, planner.slot_owners[slot], reg, planner.budget)? {
+            selected = slot;
+            break;
+        }
+    }
+    if selected < 0 {
+        selected = planner.slot_owners.len();
+        planner.slot_owners.push(Vec::new());
+    }
+    planner.slot_owners[selected].push(reg);
+    planner.homes[reg.index()] = selected;
+    Result::Ok(Location::Stack(selected))
+}
+
+fn spill_register(planner: Planner, state: BlockState, reg: mach::Reg, edits: Vec[Edit]) -> Result[
+    (),
+    ir::Error,
+] {
+    let source = current_location(state, reg)?;
+    let home = spill_home(planner, reg)?;
+    move_value(edits, source, home);
+    state.current[reg.index()] = Option::Some(home);
+    match source {
+        Register(index) => {
+            state.lanes[index] = Option::None;
+        },
+        _ => (),
+    }
+    Result::Ok(())
+}
+
+fn evict_lane(planner: Planner, state: BlockState, index: isize, position: isize, edits: Vec[Edit]) -> Result[
+    (),
+    ir::Error,
+] {
+    match state.lanes[index] {
+        Some(reg) => {
+            if next_use(state, reg, position, false) >= 0 {
+                spill_register(planner, state, reg, edits)?;
+            } else {
+                state.current[reg.index()] = Option::None;
+                state.lanes[index] = Option::None;
+            }
+        },
+        None => (),
+    }
+    Result::Ok(())
+}
+
+fn choose_lane(
+    planner: Planner,
+    state: BlockState,
+    reg: mach::Reg,
+    position: isize,
+    edits: Vec[Edit],
+) -> Result[Location, ir::Error] {
+    if planner.limit == 0 {
+        return Result::Ok(Location::Fixed(mach::FixedReg::AX))
+    }
+    let preferred = match planner.canonical[reg.index()] {
+        Register(index) => index,
+        _ => -1,
+    };
+    if preferred >= 0 {
+        match state.lanes[preferred] {
+            None => return Result::Ok(Location::Register(preferred)),
+            _ => (),
+        }
+    }
+    let mut selected = 0;
+    let mut farthest = -1;
+    for index in 0..planner.limit {
+        spend(planner.budget)?;
+        match state.lanes[index] {
+            None => return Result::Ok(Location::Register(index)),
+            Some(owner) => {
+                let next = next_use(state, owner, position, false);
+                if next < 0 {
+                    evict_lane(planner, state, index, position, edits)?;
+                    return Result::Ok(Location::Register(index))
+                }
+                if next > farthest {
+                    farthest = next;
+                    selected = index;
+                }
+            },
+        }
+    }
+    evict_lane(planner, state, selected, position, edits)?;
+    Result::Ok(Location::Register(selected))
+}
+
+fn set_location(state: BlockState, reg: mach::Reg, location: Location) -> () {
+    state.current[reg.index()] = Option::Some(location);
+    match location {
+        Register(index) => {
+            state.lanes[index] = Option::Some(reg);
+        },
+        _ => (),
+    }
+}
+
+fn expire(state: BlockState, position: isize, later: bool) -> () {
+    for index in 0..state.lanes.len() {
+        match state.lanes[index] {
+            Some(reg) => {
+                if next_use(state, reg, position, later) < 0 {
+                    state.lanes[index] = Option::None;
+                    state.current[reg.index()] = Option::None;
+                }
+            },
+            None => (),
+        }
+    }
+}
+
+fn state_for_block(planner: Planner, block: mach::Block) -> Result[BlockState, ir::Error] {
+    let current: Vec[Option[Location]] = Vec::new();
+    let uses: Vec[Vec[isize]] = Vec::new();
+    let cursors = Vec::new();
+    for _ in 0..planner.function.register_count() {
+        spend(planner.budget)?;
+        current.push(Option::None);
+        uses.push(Vec::new());
+        cursors.push(0);
+    }
+    let lanes = Vec::new();
+    for _ in 0..planner.limit {
+        lanes.push(Option::None);
+    }
+    let state = BlockState { current, lanes, uses, cursors };
+    for reg in planner.live.live_in(block.index)? {
+        set_location(state, reg, planner.canonical[reg.index()]);
+    }
+    for reg in block.parameters {
+        set_location(state, reg, planner.canonical[reg.index()]);
+    }
+    for index in 0..block.instructions.len() {
+        for reg in block.instructions[index].uses() {
+            spend(planner.budget)?;
+            state.uses[reg.index()].push(index);
+        }
+    }
+    for reg in block.terminator.uses() {
+        state.uses[reg.index()].push(block.instructions.len());
+    }
+    for reg in planner.live.live_out(block.index)? {
+        state.uses[reg.index()].push(block.instructions.len() + 1);
+    }
+    Result::Ok(state)
+}
+
+fn call_plan(planner: Planner, state: BlockState, instruction: mach::Instruction, position: isize) -> Result[
+    AllocatedInstruction,
+    ir::Error,
+] {
+    let before = Vec::new();
+    let after = Vec::new();
+    for index in 0..state.lanes.len() {
+        match state.lanes[index] {
+            Some(reg) => {
+                if next_use(state, reg, position, true) >= 0 {
+                    spill_register(planner, state, reg, before)?;
+                }
+            },
+            None => (),
+        }
+    }
+    let operands = Vec::new();
+    let descriptors = instruction.operands();
+    for operand in descriptors {
+        if operand.kind == mach::OperandKind::Use {
+            operands.push(Binding { operand, location: current_location(state, operand.reg)? });
+        }
+    }
+    for index in 0..state.lanes.len() {
+        match state.lanes[index] {
+            Some(reg) => {
+                state.current[reg.index()] = Option::None;
+            },
+            None => (),
+        }
+        state.lanes[index] = Option::None;
+    }
+    for operand in descriptors {
+        if operand.kind == mach::OperandKind::Def {
+            let mut location = Option::None;
+            match planner.canonical[operand.reg.index()] {
+                Register(index) => {
+                    match state.lanes[index] {
+                        None => {
+                            location = Option::Some(Location::Register(index));
+                        },
+                        _ => (),
+                    }
+                },
+                _ => (),
+            }
+            if location == Option::None {
+                for index in 0..planner.limit {
+                    match state.lanes[index] {
+                        None => {
+                            location = Option::Some(Location::Register(index));
+                            break;
+                        },
+                        _ => (),
+                    }
+                }
+            }
+            let assigned = match location {
+                Some(value) => value,
+                None => spill_home(planner, operand.reg)?,
+            };
+            operands.push(Binding { operand, location: assigned });
+            set_location(state, operand.reg, assigned);
+        }
+    }
+    Result::Ok(AllocatedInstruction { instruction, operands, before, after })
+}
+
+fn instruction_plan(
+    planner: Planner,
+    state: BlockState,
+    instruction: mach::Instruction,
+    position: isize,
+) -> Result[AllocatedInstruction, ir::Error] {
+    expire(state, position, false);
+    match instruction {
+        Call { .. } => return call_plan(planner, state, instruction, position),
+        _ => (),
+    }
+    let before = Vec::new();
+    let after = Vec::new();
+    let descriptors = instruction.operands();
+    let places: Vec[Option[Location]] = Vec::new();
+    for _ in descriptors {
+        places.push(Option::None);
+    }
+    for index in 0..descriptors.len() {
+        let operand = descriptors[index];
+        if operand.kind == mach::OperandKind::Use
+            && operand.constraint == mach::Constraint::Register {
+            let source = current_location(state, operand.reg)?;
+            let location = match source {
+                Register(_) => source,
+                _ => choose_lane(planner, state, operand.reg, position, before)?,
+            };
+            places[index] = Option::Some(location);
+            match location {
+                Register(_) => {
+                    move_value(before, source, location);
+                    set_location(state, operand.reg, location);
+                },
+                _ => (),
+            }
+        }
+    }
+    let mut destination = Location::Stack(-1);
+    let mut result = Option::None;
+    for index in 0..descriptors.len() {
+        let operand = descriptors[index];
+        if operand.kind == mach::OperandKind::Def {
+            result = Option::Some(operand.reg);
+            let location = match operand.constraint {
+                Reuse(input) => {
+                    let reused = match places[input] {
+                        Some(value) => value,
+                        None => current_location(state, descriptors[input].reg)?,
+                    };
+                    let previous = descriptors[input].reg;
+                    if next_use(state, previous, position, true) >= 0
+                        && current_location(state, previous)? == reused {
+                        spill_register(planner, state, previous, before)?;
+                    }
+                    reused
+                },
+                Fixed(register) => Location::Fixed(register),
+                _ => choose_lane(planner, state, operand.reg, position, before)?,
+            };
+            places[index] = Option::Some(location);
+            destination = match location {
+                Fixed(_) => {
+                    let candidate = choose_lane(planner, state, operand.reg, position, before)?;
+                    match candidate {
+                        Fixed(_) => spill_home(planner, operand.reg)?,
+                        _ => candidate,
+                    }
+                },
+                _ => location,
+            };
+            move_value(after, location, destination);
+        }
+    }
+    let operands = Vec::new();
+    for index in 0..descriptors.len() {
+        let operand = descriptors[index];
+        let location = match places[index] {
+            Some(location) => location,
+            None => match operand.constraint {
+                Fixed(register) => Location::Fixed(register),
+                _ => current_location(state, operand.reg)?,
+            },
+        };
+        operands.push(Binding { operand, location });
+    }
+    for binding in operands {
+        if binding.operand.kind == mach::OperandKind::Use {
+            match binding.location {
+                Fixed(_) => move_value(
+                    before,
+                    current_location(state, binding.operand.reg)?,
+                    binding.location,
+                ),
+                _ => (),
+            }
+        }
+    }
+    expire(state, position, true);
+    match result {
+        Some(reg) => set_location(state, reg, destination),
+        None => (),
+    }
+    Result::Ok(AllocatedInstruction { instruction, operands, before, after })
+}
+
+fn allocate_plan(
+    function: mach::Function,
+    live: Liveness,
+    canonical: Vec[Location],
+    homes: Vec[isize],
+    slot_owners: Vec[Vec[mach::Reg]],
+    limit: isize,
+    budget: Ref[isize],
+) -> Result[Vec[AllocatedBlock], ir::Error] {
+    let planner = Planner { function, live, canonical, homes, slot_owners, limit, budget };
+    let blocks = Vec::new();
+    for block in function.blocks() {
+        spend(budget)?;
+        let state = state_for_block(planner, block)?;
+        let instructions = Vec::new();
+        for position in 0..block.instructions.len() {
+            spend(budget)?;
+            instructions.push(
+                instruction_plan(planner, state, block.instructions[position], position)?,
+            );
+        }
+        let terminator_operands = Vec::new();
+        for reg in block.terminator.uses() {
+            terminator_operands.push(
+                Binding {
+                    operand: mach::Operand {
+                        reg,
+                        kind: mach::OperandKind::Use,
+                        position: mach::OperandPosition::Early,
+                        constraint: mach::Constraint::Any,
+                    },
+                    location: current_location(state, reg)?,
+                },
+            );
+        }
+        let edges = Vec::new();
+        for edge in block.terminator.successors() {
+            let moves = Vec::new();
+            for reg in live.live_in(edge.target)? {
+                moves.push(
+                    Edit {
+                        source: current_location(state, reg)?,
+                        destination: canonical[reg.index()],
+                    },
+                );
+            }
+            for copy in edge.copies {
+                moves.push(
+                    Edit {
+                        source: current_location(state, copy.source)?,
+                        destination: canonical[copy.destination.index()],
+                    },
+                );
+            }
+            edges.push(AllocatedEdge { edge, edits: parallel_edits(moves, budget)? });
+        }
+        blocks.push(AllocatedBlock { index: block.index, instructions, terminator_operands, edges });
+    }
+    Result::Ok(blocks)
+}

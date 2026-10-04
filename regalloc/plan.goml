@@ -1,0 +1,78 @@
+package regalloc;
+
+use module::mach;
+
+pub struct Binding {
+    pub operand: mach::Operand,
+    pub location: Location,
+}
+
+pub struct Edit {
+    pub source: Location,
+    pub destination: Location,
+}
+
+pub struct AllocatedInstruction {
+    pub instruction: mach::Instruction,
+    pub operands: Vec[Binding],
+    pub before: Vec[Edit],
+    pub after: Vec[Edit],
+}
+
+pub struct AllocatedEdge {
+    pub edge: mach::Edge,
+    pub edits: Vec[Edit],
+}
+
+pub struct AllocatedBlock {
+    pub index: isize,
+    pub instructions: Vec[AllocatedInstruction],
+    pub terminator_operands: Vec[Binding],
+    pub edges: Vec[AllocatedEdge],
+}
+
+fn copy_plan(input: Vec[AllocatedBlock]) -> Vec[AllocatedBlock] {
+    let output = Vec::new();
+    for block in input {
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            let operation = match instruction.instruction {
+                Call { target, arguments, results } => mach::Instruction::Call {
+                    target,
+                    arguments: copy_vec(arguments),
+                    results: copy_vec(results),
+                },
+                other => other,
+            };
+            instructions.push(
+                AllocatedInstruction {
+                    instruction: operation,
+                    operands: copy_vec(instruction.operands),
+                    before: copy_vec(instruction.before),
+                    after: copy_vec(instruction.after),
+                },
+            );
+        }
+        let edges = Vec::new();
+        for edge in block.edges {
+            edges.push(
+                AllocatedEdge {
+                    edge: mach::Edge {
+                        target: edge.edge.target,
+                        copies: copy_vec(edge.edge.copies),
+                    },
+                    edits: copy_vec(edge.edits),
+                },
+            );
+        }
+        output.push(
+            AllocatedBlock {
+                index: block.index,
+                instructions,
+                terminator_operands: copy_vec(block.terminator_operands),
+                edges,
+            },
+        );
+    }
+    output
+}

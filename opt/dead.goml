@@ -52,7 +52,14 @@ fn eliminate(blocks: Vec[ir::BlockData], count: isize, budget: Ref[isize]) -> Re
         }
         for instruction in block.instructions {
             spend(budget)?;
-            dependencies[instruction.result.index()] = ir::operands(instruction.operation);
+            let operands = ir::operands(instruction.operation);
+            for result in instruction.results {
+                spend(budget)?;
+                dependencies[result.index()] = operands;
+            }
+            if instruction.operation.has_effects() {
+                roots.extend(operands);
+            }
         }
         let term = terminator(block)?;
         match term {
@@ -103,7 +110,12 @@ fn eliminate(blocks: Vec[ir::BlockData], count: isize, budget: Ref[isize]) -> Re
         let instructions = Vec::new();
         for instruction in block.instructions {
             spend(budget)?;
-            if live[instruction.result.index()] {
+            let mut needed = instruction.operation.has_effects();
+            for result in instruction.results {
+                spend(budget)?;
+                needed = needed || live[result.index()];
+            }
+            if needed {
                 instructions.push(instruction);
             }
         }

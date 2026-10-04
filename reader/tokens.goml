@@ -1,0 +1,157 @@
+package reader;
+
+use ecosystem::goir as ir;
+use std::num;
+
+struct Cursor {
+    tokens: Vec[string],
+    position: Ref[isize],
+    line: isize,
+}
+
+fn syntax(line: isize, message: string) -> ir::Error {
+    ir::error(ir::ErrorKind::InvalidArgument, f"line {line}: " + message)
+}
+
+fn tokenize(source: string, line: isize) -> Result[Cursor, ir::Error] {
+    let tokens = Vec::new();
+    let mut index = 0;
+    while index < source.len() {
+        let byte = source.byte_get(index);
+        if byte == b' ' || byte == b'\t' || byte == b'\r' {
+            index += 1;
+            continue
+        }
+        let start = index;
+        if byte == b'(' || byte == b')' || byte == b',' || byte == b':' || byte == b'='
+            || byte == b'{'
+            || byte == b'}' {
+            index += 1;
+        } else {
+            while index < source.len() {
+                let current = source.byte_get(index);
+                if current == b' ' || current == b'\t' || current == b'\r' || current == b'('
+                    || current == b')'
+                    || current == b','
+                    || current == b':'
+                    || current == b'='
+                    || current == b'{'
+                    || current == b'}' {
+                    break
+                }
+                if current > 127 || current < 32 {
+                    return Result::Err(syntax(line, "expected ASCII IR token"))
+                }
+                index += 1;
+            }
+        }
+        if index - start > 128 || tokens.len() >= 8192 {
+            return Result::Err(ir::error(ir::ErrorKind::LimitExceeded, "IR token limit exceeded"))
+        }
+        tokens.push(source.byte_slice(start, index));
+    }
+    Result::Ok(Cursor { tokens, position: Ref::new(0), line })
+}
+
+impl Cursor {
+    fn next(self: Cursor) -> Result[string, ir::Error] {
+        let position = self.position.get();
+        if position == self.tokens.len() {
+            return Result::Err(syntax(self.line, "unexpected end of line"))
+        }
+        self.position.set(position + 1);
+        Result::Ok(self.tokens[position])
+    }
+
+    fn peek(self: Cursor) -> string {
+        if self.position.get() < self.tokens.len() {
+            self.tokens[self.position.get()]
+        } else {
+            ""
+        }
+    }
+
+    fn expect(self: Cursor, token: string) -> Result[(), ir::Error] {
+        if self.next()? != token {
+            return Result::Err(syntax(self.line, "expected " + token))
+        }
+        Result::Ok(())
+    }
+
+    fn end(self: Cursor) -> Result[(), ir::Error] {
+        if self.position.get() != self.tokens.len() {
+            return Result::Err(syntax(self.line, "unexpected trailing token"))
+        }
+        Result::Ok(())
+    }
+}
+
+fn type_name(cursor: Cursor) -> Result[ir::Type, ir::Error] {
+    match cursor.next()? {
+        "i64" => Result::Ok(ir::Type::I64),
+        "bool" => Result::Ok(ir::Type::Bool),
+        _ => Result::Err(syntax(cursor.line, "unknown value type")),
+    }
+}
+
+fn types(cursor: Cursor) -> Result[Vec[ir::Type], ir::Error] {
+    cursor.expect("(")?;
+    let output = Vec::new();
+    while cursor.peek() != ")" {
+        output.push(type_name(cursor)?);
+        if cursor.peek() != ")" {
+            cursor.expect(",")?;
+        }
+    }
+    cursor.expect(")")?;
+    Result::Ok(output)
+}
+
+fn index_name(token: string, prefix: string, line: isize, limit: isize) -> Result[isize, ir::Error] {
+    if !token.starts_with(prefix) || token.len() == prefix.len() {
+        return Result::Err(syntax(line, "expected " + prefix + " index"))
+    }
+    let digits = token.byte_slice(prefix.len(), token.len());
+    for index in 0..digits.len() {
+        if digits.byte_get(index) < b'0' || digits.byte_get(index) > b'9' {
+            return Result::Err(syntax(line, "invalid numeric index"))
+        }
+    }
+    let index = num::parse_int_structured(digits).map_err(|_| syntax(line, "invalid numeric index"))?;
+    if index >= limit {
+        return Result::Err(ir::error(ir::ErrorKind::LimitExceeded, "IR index exceeds reader limit"))
+    }
+    Result::Ok(index)
+}
+
+fn value_id(cursor: Cursor) -> Result[isize, ir::Error] {
+    index_name(cursor.next()?, "v", cursor.line, 4096)
+}
+
+fn typed_values(cursor: Cursor, end: string) -> Result[Vec[(isize, ir::Type)], ir::Error] {
+    let output = Vec::new();
+    while cursor.peek() != end {
+        let value = value_id(cursor)?;
+        cursor.expect(":")?;
+        output.push((value, type_name(cursor)?));
+        if cursor.peek() != end {
+            cursor.expect(",")?;
+        }
+    }
+    cursor.expect(end)?;
+    Result::Ok(output)
+}
+
+fn value_ids(cursor: Cursor, end: string) -> Result[Vec[isize], ir::Error] {
+    let output = Vec::new();
+    while cursor.peek() != end {
+        output.push(value_id(cursor)?);
+        if cursor.peek() != end {
+            cursor.expect(",")?;
+        }
+    }
+    if end != "" {
+        cursor.expect(end)?;
+    }
+    Result::Ok(output)
+}

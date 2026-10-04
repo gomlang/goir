@@ -1,0 +1,74 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+
+fn move_value(edits: Vec[Edit], source: Location, destination: Location) -> () {
+    if source == destination {
+        return
+    }
+    match (source, destination) {
+        (Stack(_), Stack(_)) => {
+            let temporary = Location::Fixed(mach::FixedReg::AX);
+            edits.push(Edit { source, destination: temporary });
+            edits.push(Edit { source: temporary, destination });
+        },
+        _ => edits.push(Edit { source, destination }),
+    }
+}
+
+fn parallel_edits(input: Vec[Edit], budget: Ref[isize]) -> Result[Vec[Edit], ir::Error] {
+    let pending = Vec::new();
+    for index in 0..input.len() {
+        for earlier in 0..index {
+            spend(budget)?;
+            if input[index].destination == input[earlier].destination {
+                return Result::Err(
+                    ir::error(
+                        ir::ErrorKind::InvalidState,
+                        "parallel copy has duplicate destinations",
+                    ),
+                )
+            }
+        }
+        if input[index].source != input[index].destination {
+            pending.push(input[index]);
+        }
+    }
+    let output = Vec::new();
+    while !pending.is_empty() {
+        let mut ready = -1;
+        for index in 0..pending.len() {
+            let mut needed = false;
+            for item in pending {
+                spend(budget)?;
+                if item.source == pending[index].destination {
+                    needed = true;
+                    break;
+                }
+            }
+            if !needed {
+                ready = index;
+                break;
+            }
+        }
+        if ready >= 0 {
+            move_value(output, pending[ready].source, pending[ready].destination);
+            let _ = pending.remove(ready);
+        } else {
+            let source = pending[0].source;
+            let temporary = Location::Fixed(mach::FixedReg::DX);
+            if source == temporary {
+                return Result::Err(ir::error(ir::ErrorKind::InvalidState, "unresolved copy cycle"))
+            }
+            move_value(output, source, temporary);
+            for index in 0..pending.len() {
+                let item = pending[index];
+                if item.source == source {
+                    pending[index] = Edit { source: temporary, destination: item.destination };
+                }
+            }
+        }
+    }
+    Result::Ok(output)
+}

@@ -1,0 +1,37 @@
+package filetest;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::opt;
+use ecosystem::goir::reader;
+
+pub enum Stage {
+    Verify,
+    Optimize,
+    Compile,
+    Run,
+}
+
+pub struct Output {
+    pub text: string,
+    pub values: Vec[ir::Datum],
+}
+
+pub fn run(source: string, stage: Stage, arguments: Vec[ir::Datum], fuel: u64) -> Result[
+    Output,
+    ir::Error,
+] {
+    let function = reader::read(source)?;
+    let text = match stage {
+        Verify => ir::display(function)?,
+        Optimize => ir::display(opt::simplify(function)?)?,
+        Compile => amd64::emit(function)?.assembly,
+        Run => return Result::Ok(
+            Output {
+                text: ir::display(function)?,
+                values: ir::interpret(function, arguments, fuel)?,
+            },
+        ),
+    };
+    Result::Ok(Output { text, values: Vec::new() })
+}

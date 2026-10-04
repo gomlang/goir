@@ -1,0 +1,408 @@
+package reader;
+
+use ecosystem::goir as ir;
+use std::num;
+
+enum ParsedOperation {
+    Constant(ir::Datum),
+    Binary(ir::BinaryOp, isize, isize),
+    Compare(ir::IntCC, isize, isize),
+    Select(isize, isize, isize),
+    Call(ir::FuncRef, Vec[isize]),
+}
+
+struct ParsedInstruction {
+    definitions: Vec[(isize, ir::Type)],
+    operation: ParsedOperation,
+    line: isize,
+}
+
+struct ParsedBlock {
+    parameters: Vec[(isize, ir::Type)],
+    instructions: Vec[ParsedInstruction],
+    terminator: Cursor,
+}
+
+fn reference(references: Vec[ir::FuncRef], name: string, line: isize) -> Result[
+    ir::FuncRef,
+    ir::Error,
+] {
+    let mut found = Option::None;
+    for item in references {
+        if item.name() == name {
+            if found.is_some() {
+                return Result::Err(syntax(line, "ambiguous function reference " + name))
+            }
+            found = Option::Some(item);
+        }
+    }
+    found.ok_or(syntax(line, "missing function reference " + name))
+}
+
+fn binary_name(name: string, line: isize) -> Result[ir::BinaryOp, ir::Error] {
+    match name {
+        "iadd" => Result::Ok(ir::BinaryOp::Add),
+        "isub" => Result::Ok(ir::BinaryOp::Sub),
+        "imul" => Result::Ok(ir::BinaryOp::Mul),
+        "band" => Result::Ok(ir::BinaryOp::And),
+        "bor" => Result::Ok(ir::BinaryOp::Or),
+        "bxor" => Result::Ok(ir::BinaryOp::Xor),
+        "ishl" => Result::Ok(ir::BinaryOp::Shl),
+        "ushr" => Result::Ok(ir::BinaryOp::ShrU),
+        "sshr" => Result::Ok(ir::BinaryOp::ShrS),
+        _ => Result::Err(syntax(line, "unknown operation " + name)),
+    }
+}
+
+fn comparison_name(name: string, line: isize) -> Result[ir::IntCC, ir::Error] {
+    match name {
+        "eq" => Result::Ok(ir::IntCC::Equal),
+        "ne" => Result::Ok(ir::IntCC::NotEqual),
+        "slt" => Result::Ok(ir::IntCC::SignedLess),
+        "sle" => Result::Ok(ir::IntCC::SignedLessEqual),
+        "ult" => Result::Ok(ir::IntCC::UnsignedLess),
+        "ule" => Result::Ok(ir::IntCC::UnsignedLessEqual),
+        _ => Result::Err(syntax(line, "unknown comparison " + name)),
+    }
+}
+
+fn instruction(cursor: Cursor, references: Vec[ir::FuncRef]) -> Result[ParsedInstruction, ir::Error] {
+    let definitions = if cursor.peek() == "call" {
+        Vec::new()
+    } else {
+        typed_values(cursor, "=")?
+    };
+    let name = cursor.next()?;
+    let operation = match name {
+        "iconst" => ParsedOperation::Constant(
+            ir::Datum::I64(
+                num::parse_int_bits(cursor.next()?, 10, 64).map_err(
+                    |_| syntax(cursor.line, "invalid i64 constant"),
+                )?,
+            ),
+        ),
+        "bconst" => ParsedOperation::Constant(
+            ir::Datum::Bool(
+                match cursor.next()? {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Result::Err(syntax(cursor.line, "invalid boolean constant")),
+                },
+            ),
+        ),
+        "icmp" => {
+            let cc = comparison_name(cursor.next()?, cursor.line)?;
+            let left = value_id(cursor)?;
+            cursor.expect(",")?;
+            ParsedOperation::Compare(cc, left, value_id(cursor)?)
+        },
+        "select" => {
+            let condition = value_id(cursor)?;
+            cursor.expect(",")?;
+            let yes = value_id(cursor)?;
+            cursor.expect(",")?;
+            ParsedOperation::Select(condition, yes, value_id(cursor)?)
+        },
+        "call" => {
+            let target = reference(references, cursor.next()?, cursor.line)?;
+            cursor.expect("(")?;
+            ParsedOperation::Call(target, value_ids(cursor, ")")?)
+        },
+        _ => {
+            let op = binary_name(name, cursor.line)?;
+            let left = value_id(cursor)?;
+            cursor.expect(",")?;
+            ParsedOperation::Binary(op, left, value_id(cursor)?)
+        },
+    };
+    cursor.end()?;
+    Result::Ok(ParsedInstruction { definitions, operation, line: cursor.line })
+}
+
+fn operation_uses(operation: ParsedOperation) -> Vec[isize] {
+    match operation {
+        Constant(_) => Vec::new(),
+        Binary(_, left, right) | Compare(_, left, right) => Vec::from_array([left, right]),
+        Select(condition, yes, no) => Vec::from_array([condition, yes, no]),
+        Call(_, arguments) => arguments,
+    }
+}
+
+fn resolve(values: Vec[Option[ir::Value]], index: isize, line: isize) -> Result[
+    ir::Value,
+    ir::Error,
+] {
+    values[index].ok_or(syntax(line, f"undefined v{index}"))
+}
+
+fn resolved_values(values: Vec[Option[ir::Value]], ids: Vec[isize], line: isize) -> Result[
+    Vec[ir::Value],
+    ir::Error,
+] {
+    let output = Vec::new();
+    for index in ids {
+        output.push(resolve(values, index, line)?);
+    }
+    Result::Ok(output)
+}
+
+fn insert(builder: ir::Builder, values: Vec[Option[ir::Value]], instruction: ParsedInstruction) -> Result[
+    Vec[ir::Value],
+    ir::Error,
+] {
+    let line = instruction.line;
+    if let ParsedOperation::Call(target, arguments) = instruction.operation {
+        return builder.call(target, resolved_values(values, arguments, line)?)
+    }
+    let operation = match instruction.operation {
+        Constant(value) => ir::Operation::Constant(value),
+        Binary(op, left, right) => ir::Operation::Binary(
+            op,
+            resolve(values, left, line)?,
+            resolve(values, right, line)?,
+        ),
+        Compare(cc, left, right) => ir::Operation::Compare(
+            cc,
+            resolve(values, left, line)?,
+            resolve(values, right, line)?,
+        ),
+        Select(condition, yes, no) => ir::Operation::Select(
+            resolve(values, condition, line)?,
+            resolve(values, yes, line)?,
+            resolve(values, no, line)?,
+        ),
+        Call(_, _) => return Result::Err(syntax(line, "unexpected call")),
+    };
+    Result::Ok(Vec::from_array([builder.ins(operation)?]))
+}
+
+fn bind(
+    values: Vec[Option[ir::Value]],
+    types: Vec[Option[ir::Type]],
+    definitions: Vec[(isize, ir::Type)],
+    actual: Vec[ir::Value],
+    line: isize,
+) -> Result[(), ir::Error] {
+    if definitions.len() != actual.len() {
+        return Result::Err(syntax(line, "incorrect definition arity"))
+    }
+    for index in 0..actual.len() {
+        let (slot, ty) = definitions[index];
+        if values[slot].is_some() {
+            return Result::Err(syntax(line, f"duplicate v{slot}"))
+        }
+        values[slot] = Option::Some(actual[index]);
+        types[slot] = Option::Some(ty);
+    }
+    Result::Ok(())
+}
+
+fn edge(cursor: Cursor, blocks: Vec[ir::Block], values: Vec[Option[ir::Value]]) -> Result[
+    ir::Edge,
+    ir::Error,
+] {
+    let target = index_name(cursor.next()?, "block", cursor.line, 256)?;
+    if target >= blocks.len() {
+        return Result::Err(syntax(cursor.line, "undefined block"))
+    }
+    cursor.expect("(")?;
+    Result::Ok(
+        ir::Edge {
+            target: blocks[target],
+            arguments: resolved_values(values, value_ids(cursor, ")")?, cursor.line)?,
+        },
+    )
+}
+
+pub fn read(source: string) -> Result[ir::Function, ir::Error] {
+    read_with_references(source, Vec::new())
+}
+
+pub fn read_with_references(source: string, references: Vec[ir::FuncRef]) -> Result[
+    ir::Function,
+    ir::Error,
+] {
+    if source.len() > 1048576 || references.len() > 1024 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "IR reader input limit exceeded"),
+        )
+    }
+    let lines = Vec::new();
+    let mut line = 0;
+    for text in source.split("\n") {
+        line += 1;
+        let cursor = tokenize(text, line)?;
+        if !cursor.tokens.is_empty() {
+            lines.push(cursor);
+        }
+    }
+    if lines.len() < 4 {
+        return Result::Err(syntax(1, "incomplete function"))
+    }
+    let header = lines[0];
+    header.expect("function")?;
+    let name = header.next()?;
+    let inputs = types(header)?;
+    header.expect("->")?;
+    let outputs = types(header)?;
+    header.expect("{")?;
+    header.end()?;
+    let builder = if references.is_empty() {
+        ir::Builder::new(name, inputs, outputs)?
+    } else {
+        let target = reference(references, name, header.line)?;
+        let builder = ir::Builder::for_function(target)?;
+        if target.signature().parameter_types() != inputs
+            || target.signature().result_types() != outputs {
+            return Result::Err(syntax(header.line, "function signature differs from reference"))
+        }
+        builder
+    };
+    let parsed: Vec[ParsedBlock] = Vec::new();
+    let mut position = 1;
+    let mut instructions = 0;
+    while position < lines.len() && lines[position].peek() != "}" {
+        let cursor = lines[position];
+        let index = index_name(cursor.next()?, "block", cursor.line, 256)?;
+        if index != parsed.len() {
+            return Result::Err(syntax(cursor.line, "blocks must have consecutive indices"))
+        }
+        cursor.expect("(")?;
+        let parameters = typed_values(cursor, ")")?;
+        cursor.expect(":")?;
+        cursor.end()?;
+        position += 1;
+        let body = Vec::new();
+        while position < lines.len() {
+            let word = lines[position].peek();
+            if word == "jump" || word == "brif" || word == "return" {
+                break
+            }
+            instructions += 1;
+            if instructions > 4096 {
+                return Result::Err(
+                    ir::error(ir::ErrorKind::LimitExceeded, "IR instruction limit exceeded"),
+                )
+            }
+            body.push(instruction(lines[position], references)?);
+            position += 1;
+        }
+        if position == lines.len() {
+            return Result::Err(syntax(cursor.line, "missing terminator"))
+        }
+        parsed.push(ParsedBlock { parameters, instructions: body, terminator: lines[position] });
+        position += 1;
+    }
+    if parsed.is_empty() || position + 1 != lines.len() {
+        return Result::Err(syntax(1, "missing closing brace or trailing function"))
+    }
+    lines[position].expect("}")?;
+    lines[position].end()?;
+    let values = Vec::new();
+    let declared_types = Vec::new();
+    for _ in 0..4096 {
+        values.push(Option::None);
+        declared_types.push(Option::None);
+    }
+    let blocks = Vec::new();
+    let cursors = Vec::new();
+    for index in 0..parsed.len() {
+        let parameter_types = Vec::new();
+        for (_, ty) in parsed[index].parameters {
+            parameter_types.push(ty);
+        }
+        let block = if index == 0 {
+            if parameter_types != inputs {
+                return Result::Err(syntax(1, "entry parameters differ from signature"))
+            }
+            builder.entry()
+        } else {
+            builder.append_block(parameter_types)?
+        };
+        bind(
+            values,
+            declared_types,
+            parsed[index].parameters,
+            builder.parameters(block)?,
+            parsed[index].terminator.line,
+        )?;
+        blocks.push(block);
+        cursors.push(0);
+    }
+    let mut remaining = instructions;
+    let mut steps = 0;
+    while remaining > 0 {
+        let before = remaining;
+        for block in 0..parsed.len() {
+            builder.switch_to(blocks[block])?;
+            while cursors[block] < parsed[block].instructions.len() {
+                steps += 1;
+                if steps > 1000000 {
+                    return Result::Err(
+                        ir::error(
+                            ir::ErrorKind::LimitExceeded,
+                            "IR reader dependency budget exhausted",
+                        ),
+                    )
+                }
+                let item = parsed[block].instructions[cursors[block]];
+                let mut ready = true;
+                for operand in operation_uses(item.operation) {
+                    steps += 1;
+                    if steps > 1000000 {
+                        return Result::Err(
+                            ir::error(
+                                ir::ErrorKind::LimitExceeded,
+                                "IR reader dependency budget exhausted",
+                            ),
+                        )
+                    }
+                    if values[operand].is_none() {
+                        ready = false;
+                    }
+                }
+                if !ready {
+                    break
+                }
+                bind(
+                    values,
+                    declared_types,
+                    item.definitions,
+                    insert(builder, values, item)?,
+                    item.line,
+                )?;
+                cursors[block] += 1;
+                remaining -= 1;
+            }
+        }
+        if before == remaining {
+            return Result::Err(syntax(1, "undefined or cyclic SSA instruction dependency"))
+        }
+    }
+    for index in 0..parsed.len() {
+        builder.switch_to(blocks[index])?;
+        let cursor = parsed[index].terminator;
+        match cursor.next()? {
+            "return" => builder.ret(resolved_values(values, value_ids(cursor, "")?, cursor.line)?)?,
+            "jump" => builder.terminate(ir::Terminator::Jump(edge(cursor, blocks, values)?))?,
+            "brif" => {
+                let condition = resolve(values, value_id(cursor)?, cursor.line)?;
+                cursor.expect(",")?;
+                let yes = edge(cursor, blocks, values)?;
+                cursor.expect(",")?;
+                builder.branch(condition, yes, edge(cursor, blocks, values)?)?;
+            },
+            _ => return Result::Err(syntax(cursor.line, "unknown terminator")),
+        }
+        cursor.end()?;
+    }
+    let function = builder.finish()?;
+    for index in 0..values.len() {
+        if let Some(value) = values[index] {
+            if Option::Some(function.value_type(value)?) != declared_types[index] {
+                return Result::Err(syntax(1, f"incorrect declared type for v{index}"))
+            }
+        }
+    }
+    Result::Ok(function)
+}

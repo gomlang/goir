@@ -7,6 +7,7 @@ use module::mach;
 pub enum Location {
     Register(isize),
     Stack(isize),
+    Fixed(mach::FixedReg),
 }
 
 pub struct Options {
@@ -27,9 +28,14 @@ pub struct Allocation {
     register_limit: isize,
     slots: isize,
     spilled_values: isize,
+    plan: Vec[AllocatedBlock],
 }
 
 impl Allocation {
+    pub fn blocks(self: Allocation) -> Vec[AllocatedBlock] {
+        copy_plan(self.plan)
+    }
+
     pub fn function(self: Allocation) -> mach::Function {
         self.machine
     }
@@ -60,11 +66,39 @@ pub fn allocate(function: mach::Function) -> Result[Allocation, ir::Error] {
     allocate_with_options(function, Options::standard())
 }
 
+fn lane_available(live: Liveness, owners: Vec[mach::Reg], reg: mach::Reg, budget: Ref[isize]) -> Result[
+    bool,
+    ir::Error,
+] {
+    for owner in owners {
+        spend(budget)?;
+        if interferes(live, owner, reg, budget)? {
+            return Result::Ok(false)
+        }
+    }
+    Result::Ok(true)
+}
+
+fn drop_expired(live: Liveness, owners: Vec[mach::Reg], start: isize, budget: Ref[isize]) -> Result[
+    (),
+    ir::Error,
+] {
+    let mut index = owners.len();
+    while index > 0 {
+        index = index - 1;
+        spend(budget)?;
+        if live.hulls[owners[index].index()].end < start {
+            let _ = owners.remove(index);
+        }
+    }
+    Result::Ok(())
+}
+
 pub fn allocate_with_options(function: mach::Function, options: Options) -> Result[
     Allocation,
     ir::Error,
 ] {
-    if options.registers < 0 || options.registers > 32 || options.max_steps < 1
+    if options.registers < 0 || options.registers > 7 || options.max_steps < 1
         || options.max_steps > 100000000 {
         return Result::Err(
             ir::error(ir::ErrorKind::InvalidArgument, "invalid register allocation options"),
@@ -73,23 +107,26 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
     let budget = Ref::new(options.max_steps);
     let live = analyze_with_budget(function, budget)?;
     let hints = preferences(function, budget)?;
-    let register_ends = Vec::new();
+    let lanes: Vec[Vec[mach::Reg]] = Vec::new();
     for _ in 0..options.registers {
-        register_ends.push(-1);
+        lanes.push(Vec::new());
     }
-    let slot_ends = Vec::new();
+    let slot_owners: Vec[Vec[mach::Reg]] = Vec::new();
+    let active_slots: Vec[Vec[mach::Reg]] = Vec::new();
     let locations = Vec::new();
+    let homes = Vec::new();
     for _ in 0..function.register_count() {
         locations.push(Location::Stack(-1));
+        homes.push(-1);
     }
-    let mut spilled_values = 0;
     for interval in live.ranges {
         let mut selected = -1;
         for hint in hints[interval.reg.index()] {
             spend(budget)?;
             match locations[hint.index()] {
                 Register(index) => {
-                    if register_ends[index] < interval.start {
+                    drop_expired(live, lanes[index], interval.start, budget)?;
+                    if lane_available(live, lanes[index], interval.reg, budget)? {
                         selected = index;
                         break;
                     }
@@ -98,32 +135,49 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
             }
         }
         if selected < 0 {
-            for index in 0..register_ends.len() {
-                spend(budget)?;
-                if register_ends[index] < interval.start {
+            for index in 0..lanes.len() {
+                drop_expired(live, lanes[index], interval.start, budget)?;
+                if lane_available(live, lanes[index], interval.reg, budget)? {
                     selected = index;
                     break;
                 }
             }
         }
         if selected >= 0 {
-            register_ends[selected] = interval.end;
+            lanes[selected].push(interval.reg);
             locations[interval.reg.index()] = Location::Register(selected);
         } else {
             let mut slot = -1;
-            for index in 0..slot_ends.len() {
-                spend(budget)?;
-                if slot_ends[index] < interval.start {
+            for index in 0..slot_owners.len() {
+                drop_expired(live, active_slots[index], interval.start, budget)?;
+                if lane_available(live, active_slots[index], interval.reg, budget)? {
                     slot = index;
                     break;
                 }
             }
             if slot < 0 {
-                slot = slot_ends.len();
-                slot_ends.push(-1);
+                slot = slot_owners.len();
+                slot_owners.push(Vec::new());
+                active_slots.push(Vec::new());
             }
-            slot_ends[slot] = interval.end;
+            slot_owners[slot].push(interval.reg);
+            active_slots[slot].push(interval.reg);
             locations[interval.reg.index()] = Location::Stack(slot);
+            homes[interval.reg.index()] = slot;
+        }
+    }
+    let plan = allocate_plan(
+        function,
+        live,
+        locations,
+        homes,
+        slot_owners,
+        options.registers,
+        budget,
+    )?;
+    let mut spilled_values = 0;
+    for home in homes {
+        if home >= 0 {
             spilled_values = spilled_values + 1;
         }
     }
@@ -132,24 +186,29 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
         locations,
         live,
         register_limit: options.registers,
-        slots: slot_ends.len(),
+        slots: slot_owners.len(),
         spilled_values,
+        plan,
     };
-    verify(allocation)?;
+    verify_with_budget(allocation, budget)?;
     Result::Ok(allocation)
 }
 
 pub fn verify(allocation: Allocation) -> Result[(), ir::Error] {
+    verify_with_budget(allocation, Ref::new(10000000))
+}
+
+fn verify_with_budget(allocation: Allocation, budget: Ref[isize]) -> Result[(), ir::Error] {
     if allocation.locations.len() != allocation.machine.register_count()
         || allocation.register_limit < 0
-        || allocation.register_limit > 32
+        || allocation.register_limit > 7
         || allocation.slots < 0
         || allocation.slots > allocation.locations.len() {
         return Result::Err(ir::error(ir::ErrorKind::InvalidArgument, "invalid allocation shape"))
     }
-    let lane_ends = Vec::new();
+    let lanes: Vec[Vec[mach::Reg]] = Vec::new();
     for _ in 0..allocation.register_limit + allocation.slots {
-        lane_ends.push(-1);
+        lanes.push(Vec::new());
     }
     for interval in allocation.live.ranges {
         let location = allocation.location(interval.reg)?;
@@ -170,16 +229,17 @@ pub fn verify(allocation: Allocation) -> Result[(), ir::Error] {
                 }
                 allocation.register_limit + index
             },
+            Fixed(_) => return Result::Err(
+                ir::error(ir::ErrorKind::InvalidHandle, "fixed register cannot be a canonical home"),
+            ),
         };
-        if interval.start <= lane_ends[lane] {
+        drop_expired(allocation.live, lanes[lane], interval.start, budget)?;
+        if !lane_available(allocation.live, lanes[lane], interval.reg, budget)? {
             return Result::Err(
-                ir::error(
-                    ir::ErrorKind::InvalidState,
-                    "overlapping live intervals share a location",
-                ),
+                ir::error(ir::ErrorKind::InvalidState, "overlapping live segments share a location"),
             )
         }
-        lane_ends[lane] = interval.end;
+        lanes[lane].push(interval.reg);
     }
-    Result::Ok(())
+    check_with_budget(allocation, budget)
 }

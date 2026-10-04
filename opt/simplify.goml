@@ -50,6 +50,13 @@ fn resolve_operation(operation: ir::Operation, aliases: Vec[Option[ir::Value]], 
 ] {
     match operation {
         Constant(_) => Result::Ok(operation),
+        Call(target, arguments) => {
+            let values = Vec::new();
+            for value in arguments {
+                values.push(resolve(value, aliases, budget)?);
+            }
+            Result::Ok(ir::Operation::Call(target, values))
+        },
         Binary(op, a, b) => Result::Ok(
             ir::Operation::Binary(op, resolve(a, aliases, budget)?, resolve(b, aliases, budget)?),
         ),
@@ -162,10 +169,10 @@ fn progress_size(function: ir::Function) -> isize {
 fn simplify_once(function: ir::Function, budget: Ref[isize]) -> Result[ir::Function, ir::Error] {
     let blocks = function.blocks();
     let aliases: Vec[Option[ir::Value]] = Vec::new();
-    let constants: Vec[Option[ir::Datum]] = Vec::new();
+    let constants = propagate(function, budget)?;
     for _ in 0..function.value_count() {
+        spend(budget)?;
         aliases.push(Option::None);
-        constants.push(Option::None);
     }
     let mut changed = true;
     while changed {
@@ -174,7 +181,10 @@ fn simplify_once(function: ir::Function, budget: Ref[isize]) -> Result[ir::Funct
             spend(budget)?;
             for instruction in block.instructions {
                 spend(budget)?;
-                let index = instruction.result.index();
+                if instruction.operation.has_effects() || instruction.results.len() != 1 {
+                    continue;
+                }
+                let index = instruction.results[0].index();
                 if aliases[index].is_some() || constants[index].is_some() {
                     continue;
                 }
@@ -198,27 +208,25 @@ fn simplify_once(function: ir::Function, budget: Ref[isize]) -> Result[ir::Funct
         let instructions = Vec::new();
         for instruction in block.instructions {
             spend(budget)?;
-            let operation = match constants[instruction.result.index()] {
-                Option::Some(value) => ir::Operation::Constant(value),
-                Option::None => resolve_operation(instruction.operation, aliases, budget)?,
+            let operation = if !instruction.operation.has_effects()
+                && instruction.results.len() == 1 {
+                match constants[instruction.results[0].index()] {
+                    Option::Some(value) => ir::Operation::Constant(value),
+                    Option::None => resolve_operation(instruction.operation, aliases, budget)?,
+                }
+            } else {
+                resolve_operation(instruction.operation, aliases, budget)?
             };
-            instructions.push(ir::Instruction { result: instruction.result, operation });
+            instructions.push(ir::Instruction { results: instruction.results, operation });
         }
         blocks[index] = ir::BlockData {
             id: block.id,
             parameters: block.parameters,
             instructions,
-            terminator: Option::Some(
-                resolve_term(
-                    block.terminator.ok_or(
-                        ir::error(ir::ErrorKind::ControlFlow, "missing terminator"),
-                    )?,
-                    aliases,
-                    constants,
-                    budget,
-                )?,
-            ),
+            terminator: Option::Some(resolve_term(terminator(block)?, aliases, constants, budget)?),
         };
     }
+    let blocks = materialize_parameters(blocks, constants, budget)?;
+    let blocks = number_values(blocks, aliases, constants, budget)?;
     ir::rewrite(function, eliminate(blocks, function.value_count(), budget)?)
 }

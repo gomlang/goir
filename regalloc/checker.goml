@@ -1,0 +1,455 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+
+struct SymbolState {
+    cells: Vec[Vec[isize]],
+}
+
+fn checker_error(message: string) -> ir::Error {
+    ir::error(ir::ErrorKind::InvalidState, f"register allocation dataflow: {message}")
+}
+
+fn checker_lane(allocation: Allocation, location: Location) -> Result[isize, ir::Error] {
+    match location {
+        Register(index) => {
+            if index < 0 || index >= allocation.register_count() {
+                return Result::Err(checker_error("physical register is outside the allocation"))
+            }
+            Result::Ok(index)
+        },
+        Stack(index) => {
+            if index < 0 || index >= allocation.stack_slots() {
+                return Result::Err(checker_error("spill slot is outside the allocation"))
+            }
+            Result::Ok(allocation.register_count() + index)
+        },
+        Fixed(register) => Result::Ok(
+            allocation.register_count() + allocation.stack_slots()
+                + match register {
+                    AX => 0,
+                    CX => 1,
+                    DX => 2,
+                },
+        ),
+    }
+}
+
+fn checker_contains(values: Vec[isize], target: isize, budget: Ref[isize]) -> Result[
+    bool,
+    ir::Error,
+] {
+    for value in values {
+        spend(budget)?;
+        if value == target {
+            return Result::Ok(true)
+        }
+    }
+    Result::Ok(false)
+}
+
+fn checker_copy_cell(input: Vec[isize], budget: Ref[isize]) -> Result[Vec[isize], ir::Error] {
+    let output = Vec::new();
+    for value in input {
+        spend(budget)?;
+        output.push(value);
+    }
+    Result::Ok(output)
+}
+
+fn checker_copy_state(input: SymbolState, budget: Ref[isize]) -> Result[SymbolState, ir::Error] {
+    let cells = Vec::new();
+    for cell in input.cells {
+        spend(budget)?;
+        cells.push(checker_copy_cell(cell, budget)?);
+    }
+    Result::Ok(SymbolState { cells })
+}
+
+fn checker_read(
+    allocation: Allocation,
+    state: SymbolState,
+    reg: mach::Reg,
+    location: Location,
+    budget: Ref[isize],
+) -> Result[(), ir::Error] {
+    spend(budget)?;
+    allocation.function().register_type(reg)?;
+    let lane = checker_lane(allocation, location)?;
+    if !checker_contains(state.cells[lane], reg.index(), budget)? {
+        return Result::Err(checker_error(f"{reg.debug()} is unavailable in {location.debug()}"))
+    }
+    Result::Ok(())
+}
+
+fn checker_forget(state: SymbolState, reg: mach::Reg, budget: Ref[isize]) -> Result[(), ir::Error] {
+    for lane in 0..state.cells.len() {
+        spend(budget)?;
+        let next = Vec::new();
+        for value in state.cells[lane] {
+            spend(budget)?;
+            if value != reg.index() {
+                next.push(value);
+            }
+        }
+        state.cells[lane] = next;
+    }
+    Result::Ok(())
+}
+
+fn checker_define(allocation: Allocation, state: SymbolState, binding: Binding, budget: Ref[isize]) -> Result[
+    (),
+    ir::Error,
+] {
+    checker_forget(state, binding.operand.reg, budget)?;
+    let lane = checker_lane(allocation, binding.location)?;
+    state.cells[lane] = Vec::from_array([binding.operand.reg.index()]);
+    Result::Ok(())
+}
+
+fn checker_edits(allocation: Allocation, state: SymbolState, edits: Vec[Edit], budget: Ref[isize]) -> Result[
+    (),
+    ir::Error,
+] {
+    for edit in edits {
+        spend(budget)?;
+        let source = checker_lane(allocation, edit.source)?;
+        let destination = checker_lane(allocation, edit.destination)?;
+        if state.cells[source].is_empty() {
+            return Result::Err(checker_error("edit copies an uninitialized location"))
+        }
+        state.cells[destination] = checker_copy_cell(state.cells[source], budget)?;
+    }
+    Result::Ok(())
+}
+
+fn checker_binding(
+    allocation: Allocation,
+    binding: Binding,
+    expected: mach::Operand,
+    operands: Vec[Binding],
+) -> Result[(), ir::Error] {
+    if binding.operand != expected {
+        return Result::Err(checker_error("operand descriptor differs from machine IR"))
+    }
+    allocation.function().register_type(binding.operand.reg)?;
+    checker_lane(allocation, binding.location)?;
+    let valid = match expected.constraint {
+        Any => true,
+        Register => match binding.location {
+            Register(_) | Fixed(_) => true,
+            _ => false,
+        },
+        Fixed(register) => binding.location == Location::Fixed(register),
+        Reuse(index) => index >= 0 && index < operands.len()
+            && operands[index].operand.kind == mach::OperandKind::Use
+            && binding.location == operands[index].location,
+    };
+    if !valid {
+        return Result::Err(checker_error("operand does not satisfy its machine constraint"))
+    }
+    Result::Ok(())
+}
+
+fn checker_same_instruction(left: mach::Instruction, right: mach::Instruction) -> bool {
+    match (left, right) {
+        (Immediate { dst: a, value: x }, Immediate { dst: b, value: y }) => a == b && x == y,
+        (Binary { dst: a, op: x, left: p, right: q }, Binary { dst: b, op: y, left: r, right: s }) => a
+            == b
+            && x == y
+            && p == r
+            && q == s,
+        (Compare { dst: a, cc: x, left: p, right: q }, Compare { dst: b, cc: y, left: r, right: s }) => a
+            == b
+            && x == y
+            && p == r
+            && q == s,
+        (
+            Select { dst: a, condition: x, yes: p, no: q },
+            Select { dst: b, condition: y, yes: r, no: s },
+        ) => a == b && x == y && p == r && q == s,
+        (Call { target: a, arguments: p, results: x }, Call { target: b, arguments: q, results: y }) => a
+            == b
+            && p == q
+            && x == y,
+        _ => false,
+    }
+}
+
+fn checker_shape(
+    allocation: Allocation,
+    blocks: Vec[AllocatedBlock],
+    machine: Vec[mach::Block],
+    budget: Ref[isize],
+) -> Result[(), ir::Error] {
+    if blocks.len() != machine.len() || blocks.is_empty() {
+        return Result::Err(checker_error("allocated block count differs from machine IR"))
+    }
+    for index in 0..blocks.len() {
+        spend(budget)?;
+        let block = blocks[index];
+        let original = machine[index];
+        if block.index != index || original.index != index
+            || block.instructions.len() != original.instructions.len() {
+            return Result::Err(checker_error("allocated block differs from machine IR"))
+        }
+        for instruction_index in 0..block.instructions.len() {
+            spend(budget)?;
+            let instruction = block.instructions[instruction_index];
+            let expected = original.instructions[instruction_index];
+            if !checker_same_instruction(instruction.instruction, expected) {
+                return Result::Err(checker_error("allocated instruction differs from machine IR"))
+            }
+            let operands = expected.operands();
+            if operands.len() != instruction.operands.len() {
+                return Result::Err(checker_error("allocated operand count differs from machine IR"))
+            }
+            let call = match expected {
+                Call { .. } => true,
+                _ => false,
+            };
+            for operand_index in 0..operands.len() {
+                spend(budget)?;
+                let binding = instruction.operands[operand_index];
+                checker_binding(allocation, binding, operands[operand_index], instruction.operands)?;
+                if call {
+                    match binding.location {
+                        Fixed(_) => return Result::Err(
+                            checker_error("call operand uses a reserved scratch register"),
+                        ),
+                        _ => (),
+                    }
+                }
+            }
+        }
+        let term_uses = original.terminator.uses();
+        if block.terminator_operands.len() != term_uses.len() {
+            return Result::Err(checker_error("terminator operand count differs from machine IR"))
+        }
+        for operand_index in 0..term_uses.len() {
+            spend(budget)?;
+            checker_binding(
+                allocation,
+                block.terminator_operands[operand_index],
+                mach::Operand {
+                    reg: term_uses[operand_index],
+                    kind: mach::OperandKind::Use,
+                    position: mach::OperandPosition::Early,
+                    constraint: mach::Constraint::Any,
+                },
+                block.terminator_operands,
+            )?;
+        }
+        let successors = original.terminator.successors();
+        if block.edges.len() != successors.len() {
+            return Result::Err(checker_error("allocated edge count differs from machine IR"))
+        }
+        for edge_index in 0..successors.len() {
+            spend(budget)?;
+            let edge = block.edges[edge_index].edge;
+            let expected = successors[edge_index];
+            if edge.target != expected.target || edge.copies.len() != expected.copies.len()
+                || edge.target < 0
+                || edge.target >= blocks.len() {
+                return Result::Err(checker_error("allocated edge differs from machine IR"))
+            }
+            for copy_index in 0..edge.copies.len() {
+                spend(budget)?;
+                if edge.copies[copy_index].source != expected.copies[copy_index].source
+                    || edge.copies[copy_index].destination
+                        != expected.copies[copy_index].destination {
+                    return Result::Err(checker_error("allocated edge copy differs from machine IR"))
+                }
+            }
+        }
+    }
+    Result::Ok(())
+}
+
+fn checker_instruction(
+    allocation: Allocation,
+    state: SymbolState,
+    instruction: AllocatedInstruction,
+    budget: Ref[isize],
+) -> Result[(), ir::Error] {
+    checker_edits(allocation, state, instruction.before, budget)?;
+    for position in Vec::from_array([mach::OperandPosition::Early, mach::OperandPosition::Late]) {
+        for binding in instruction.operands {
+            spend(budget)?;
+            if binding.operand.kind == mach::OperandKind::Use
+                && binding.operand.position == position {
+                checker_read(allocation, state, binding.operand.reg, binding.location, budget)?;
+            }
+        }
+        if position == mach::OperandPosition::Late {
+            for clobber in instruction.instruction.clobbers() {
+                spend(budget)?;
+                match clobber {
+                    Register(index) => {
+                        if index >= 0 && index < allocation.register_count() {
+                            state.cells[index] = Vec::new();
+                        }
+                    },
+                    Fixed(register) => {
+                        state.cells[checker_lane(allocation, Location::Fixed(register))?] = Vec::new();
+                    },
+                    Flags => (),
+                }
+            }
+        }
+        for binding in instruction.operands {
+            spend(budget)?;
+            if binding.operand.kind == mach::OperandKind::Def
+                && binding.operand.position == position {
+                checker_define(allocation, state, binding, budget)?;
+            }
+        }
+    }
+    checker_edits(allocation, state, instruction.after, budget)
+}
+
+fn checker_edge(allocation: Allocation, state: SymbolState, edge: AllocatedEdge, budget: Ref[isize]) -> Result[
+    SymbolState,
+    ir::Error,
+] {
+    let output = checker_copy_state(state, budget)?;
+    checker_edits(allocation, output, edge.edits, budget)?;
+    for copy in edge.edge.copies {
+        spend(budget)?;
+        checker_read(
+            allocation,
+            output,
+            copy.source,
+            allocation.location(copy.destination)?,
+            budget,
+        )?;
+    }
+    for copy in edge.edge.copies {
+        checker_forget(output, copy.destination, budget)?;
+    }
+    for copy in edge.edge.copies {
+        spend(budget)?;
+        let lane = checker_lane(allocation, allocation.location(copy.destination)?)?;
+        output.cells[lane].push(copy.destination.index());
+    }
+    Result::Ok(output)
+}
+
+fn checker_meet(destination: SymbolState, source: SymbolState, budget: Ref[isize]) -> Result[
+    bool,
+    ir::Error,
+] {
+    let mut changed = false;
+    for index in 0..destination.cells.len() {
+        spend(budget)?;
+        let retained = Vec::new();
+        for value in destination.cells[index] {
+            if checker_contains(source.cells[index], value, budget)? {
+                retained.push(value);
+            } else {
+                changed = true;
+            }
+        }
+        destination.cells[index] = retained;
+    }
+    Result::Ok(changed)
+}
+
+pub fn check(allocation: Allocation) -> Result[(), ir::Error] {
+    check_with_budget(allocation, Ref::new(10000000))
+}
+
+pub fn check_with_budget(allocation: Allocation, budget: Ref[isize]) -> Result[(), ir::Error] {
+    spend(budget)?;
+    if allocation.locations.len() != allocation.function().register_count()
+        || allocation.register_count() < 0
+        || allocation.register_count() > 7
+        || allocation.stack_slots() < 0
+        || allocation.stack_slots() > allocation.locations.len() {
+        return Result::Err(
+            ir::error(ir::ErrorKind::InvalidArgument, "invalid allocation checker shape"),
+        )
+    }
+    for location in allocation.locations {
+        spend(budget)?;
+        checker_lane(allocation, location)?;
+        match location {
+            Fixed(_) => return Result::Err(checker_error("canonical home is a scratch register")),
+            _ => (),
+        }
+    }
+    let blocks = allocation.blocks();
+    let machine = allocation.function().blocks();
+    checker_shape(allocation, blocks, machine, budget)?;
+    let lanes = allocation.register_count() + allocation.stack_slots() + 3;
+    if lanes < 3 || blocks.len() > 1048576 / lanes {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "allocation checker state limit exceeded"),
+        )
+    }
+    let entry = SymbolState { cells: Vec::new() };
+    for _ in 0..lanes {
+        spend(budget)?;
+        entry.cells.push(Vec::new());
+    }
+    for parameter in machine[0].parameters {
+        let location = allocation.location(parameter)?;
+        let lane = checker_lane(allocation, location)?;
+        if !entry.cells[lane].is_empty() {
+            return Result::Err(checker_error("entry parameters share a location"))
+        }
+        entry.cells[lane].push(parameter.index());
+    }
+    let incoming: Vec[Option[SymbolState]] = Vec::new();
+    let queued = Vec::new();
+    for _ in blocks {
+        spend(budget)?;
+        incoming.push(Option::None);
+        queued.push(false);
+    }
+    incoming[0] = Option::Some(entry);
+    queued[0] = true;
+    let queue = Vec::from_array([0]);
+    let mut cursor = 0;
+    while cursor < queue.len() {
+        spend(budget)?;
+        let index = queue[cursor];
+        cursor = cursor + 1;
+        queued[index] = false;
+        let state = checker_copy_state(
+            incoming[index].ok_or(checker_error("queued block has no incoming state"))?,
+            budget,
+        )?;
+        let block = blocks[index];
+        for instruction in block.instructions {
+            checker_instruction(allocation, state, instruction, budget)?;
+        }
+        for binding in block.terminator_operands {
+            checker_read(allocation, state, binding.operand.reg, binding.location, budget)?;
+        }
+        for edge in block.edges {
+            spend(budget)?;
+            let next = checker_edge(allocation, state, edge, budget)?;
+            let target = edge.edge.target;
+            let changed = match incoming[target] {
+                Option::Some(previous) => checker_meet(previous, next, budget)?,
+                Option::None => {
+                    incoming[target] = Option::Some(next);
+                    true
+                },
+            };
+            if changed && !queued[target] {
+                queued[target] = true;
+                queue.push(target);
+            }
+        }
+    }
+    for state in incoming {
+        spend(budget)?;
+        if state.is_none() {
+            return Result::Err(checker_error("machine block was not reached"))
+        }
+    }
+    Result::Ok(())
+}

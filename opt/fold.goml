@@ -115,6 +115,7 @@ fn fold_binary(
 fn fold(operation: ir::Operation, constants: Vec[Option[ir::Datum]]) -> Replacement {
     match operation {
         Constant(value) => Replacement::Constant(value),
+        Call(_, _) => Replacement::Keep,
         Binary(op, left, right) => fold_binary(op, left, right, constants),
         Compare(cc, left, right) => {
             let result = match (integer(constants, left), integer(constants, right)) {

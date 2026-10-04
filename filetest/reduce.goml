@@ -1,0 +1,95 @@
+package filetest;
+
+use ecosystem::goir as ir;
+
+pub struct Reduction {
+    pub function: ir::Function,
+    pub attempts: isize,
+    pub accepted: isize,
+}
+
+fn candidate(source: ir::Function, block: isize, instruction: isize, remove: bool) -> Result[
+    ir::Function,
+    ir::Error,
+] {
+    let body = source.blocks();
+    let old = body[block];
+    let instructions = Vec::new();
+    for index in 0..old.instructions.len() {
+        let item = old.instructions[index];
+        if index != instruction {
+            instructions.push(item);
+        } else if !remove {
+            let value = match source.value_type(item.results[0])? {
+                I64 => ir::Datum::I64(0),
+                Bool => ir::Datum::Bool(false),
+            };
+            instructions.push(
+                ir::Instruction { results: item.results, operation: ir::Operation::Constant(value) },
+            );
+        }
+    }
+    body[block] = ir::BlockData { instructions, ..old };
+    ir::rewrite(source, body)
+}
+
+pub fn reduce(
+    source: ir::Function,
+    max_attempts: isize,
+    preserves_failure: (ir::Function) -> Result[bool, ir::Error],
+) -> Result[Reduction, ir::Error] {
+    if max_attempts < 1 || max_attempts > 10000 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::InvalidArgument, "reducer attempts must be in 1..10000"),
+        )
+    }
+    ir::verify(source)?;
+    if !preserves_failure(source)? {
+        return Result::Err(
+            ir::error(ir::ErrorKind::InvalidArgument, "source does not reproduce the failure"),
+        )
+    }
+    let mut function = source;
+    let mut attempts = 0;
+    let mut accepted = 0;
+    let mut changed = true;
+    while changed && attempts < max_attempts {
+        changed = false;
+        let body = function.blocks();
+        for block in 0..body.len() {
+            if changed || attempts >= max_attempts {
+                break
+            }
+            for position in 0..body[block].instructions.len() {
+                if changed || attempts >= max_attempts {
+                    break
+                }
+                let instruction = body[block].instructions[position];
+                if instruction.operation.has_effects() || instruction.results.len() != 1 {
+                    continue
+                }
+                for remove in Vec::from_array([true, false]) {
+                    if changed || attempts >= max_attempts {
+                        break
+                    }
+                    if !remove {
+                        match instruction.operation {
+                            Constant(ir::Datum::I64(0)) | Constant(ir::Datum::Bool(false)) => continue,
+                            _ => (),
+                        };
+                    }
+                    attempts += 1;
+                    if let Ok(reduced) = candidate(function, block, position, remove) {
+                        if ir::display(reduced)? != ir::display(function)?
+                            && preserves_failure(reduced)? {
+                            function = reduced;
+                            accepted += 1;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Result::Ok(Reduction { function, attempts, accepted })
+}

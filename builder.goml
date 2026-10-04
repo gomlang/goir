@@ -45,6 +45,7 @@ impl Builder {
         }
         let function = Function {
             identity,
+            module_identity: Option::None,
             name_value: name,
             inputs: copy_vec(inputs),
             outputs: copy_vec(outputs),
@@ -100,20 +101,60 @@ impl Builder {
         Result::Ok(())
     }
 
+    pub fn for_function(target: FuncRef) -> Result[Builder, Error] {
+        let signature = target.signature();
+        let mut builder = Builder::new(
+            target.name(),
+            signature.parameter_types(),
+            signature.result_types(),
+        )?;
+        let mut function = builder.function;
+        function.module_identity = Option::Some(target.owner);
+        builder.function = function;
+        Result::Ok(builder)
+    }
+
     pub fn ins(self: Builder, operation: Operation) -> Result[Value, Error] {
         self.require_insertion()?;
+        let types = operation_types(self.function, operation)?;
+        if types.len() != 1 || operation.has_effects() {
+            return Result::Err(
+                error(
+                    ErrorKind::InvalidArgument,
+                    "ins requires a scalar pure operation; use call for calls",
+                ),
+            )
+        }
+        Result::Ok(self.insert(operation, types)?[0])
+    }
+
+    pub fn call(self: Builder, target: FuncRef, arguments: Vec[Value]) -> Result[Vec[Value], Error] {
+        self.require_insertion()?;
+        let operation = Operation::Call(target, copy_vec(arguments));
+        let types = operation_types(self.function, operation)?;
+        self.insert(operation, types)
+    }
+
+    fn insert(self: Builder, operation: Operation, types: Vec[Type]) -> Result[Vec[Value], Error] {
         let function = self.function;
-        let ty = operation_type(function, operation)?;
-        if function.values.len() >= function.limits.max_values {
-            return Result::Err(error(ErrorKind::LimitExceeded, "value count exceeds IR limit"))
+        if types.len() > function.limits.max_values - function.values.len()
+            || function.body[self.current.get().slot].instructions.len()
+                >= function.limits.max_values {
+            return Result::Err(error(ErrorKind::LimitExceeded, "instruction exceeds IR limits"))
         }
         let block = self.current.get();
-        let value = Value { slot: function.values.len(), owner: function.identity };
-        function.values.push(
-            ValueData { ty, block, position: function.body[block.slot].instructions.len() },
+        let results = Vec::new();
+        for ty in types {
+            let value = Value { slot: function.values.len(), owner: function.identity };
+            function.values.push(
+                ValueData { ty, block, position: function.body[block.slot].instructions.len() },
+            );
+            results.push(value);
+        }
+        function.body[block.slot].instructions.push(
+            Instruction { results, operation: copy_operation(operation) },
         );
-        function.body[block.slot].instructions.push(Instruction { result: value, operation });
-        Result::Ok(value)
+        Result::Ok(copy_vec(results))
     }
 
     pub fn iconst(self: Builder, value: i64) -> Result[Value, Error] {

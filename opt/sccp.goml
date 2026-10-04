@@ -1,0 +1,240 @@
+package opt;
+
+use ecosystem::goir as ir;
+
+#[derive(PartialEq)]
+enum Lattice {
+    Unknown,
+    Constant(ir::Datum),
+    Overdefined,
+}
+
+struct Propagation {
+    values: Vec[Lattice],
+    constants: Vec[Option[ir::Datum]],
+    users: Vec[Vec[isize]],
+    executable: Vec[bool],
+    queued: Vec[bool],
+    queue: Vec[isize],
+    budget: Ref[isize],
+}
+
+fn join(left: Lattice, right: Lattice) -> Lattice {
+    match (left, right) {
+        (Unknown, other) | (other, Unknown) => other,
+        (Constant(a), Constant(b)) => if a == b {
+            left
+        } else {
+            Lattice::Overdefined
+        },
+        _ => Lattice::Overdefined,
+    }
+}
+
+impl Propagation {
+    fn enqueue(self: Propagation, block: isize) -> () {
+        if self.executable[block] && !self.queued[block] {
+            self.queued[block] = true;
+            self.queue.push(block);
+        }
+    }
+
+    fn merge(self: Propagation, value: ir::Value, incoming: Lattice) -> Result[(), ir::Error] {
+        spend(self.budget)?;
+        let index = value.index();
+        let next = join(self.values[index], incoming);
+        if next == self.values[index] {
+            return Result::Ok(())
+        }
+        self.values[index] = next;
+        self.constants[index] = match next {
+            Constant(value) => Option::Some(value),
+            _ => Option::None,
+        };
+        for block in self.users[index] {
+            spend(self.budget)?;
+            self.enqueue(block);
+        }
+        Result::Ok(())
+    }
+
+    fn edge(self: Propagation, edge: ir::Edge, blocks: Vec[ir::BlockData]) -> Result[(), ir::Error] {
+        spend(self.budget)?;
+        let target = edge.target.index();
+        if !self.executable[target] {
+            self.executable[target] = true;
+            self.enqueue(target);
+        }
+        let parameters = blocks[target].parameters;
+        for index in 0..parameters.len() {
+            self.merge(parameters[index], self.values[edge.arguments[index].index()])?;
+        }
+        Result::Ok(())
+    }
+}
+
+fn evaluate(operation: ir::Operation, state: Propagation) -> Lattice {
+    if operation.has_effects() {
+        return Lattice::Overdefined
+    }
+    match fold(operation, state.constants) {
+        Constant(value) => return Lattice::Constant(value),
+        Alias(value) => return state.values[value.index()],
+        Keep => (),
+    }
+    match operation {
+        Select(condition, yes, no) => {
+            if state.values[condition.index()] == Lattice::Unknown {
+                return Lattice::Unknown
+            }
+            return join(state.values[yes.index()], state.values[no.index()])
+        },
+        _ => (),
+    }
+    for value in ir::operands(operation) {
+        if state.values[value.index()] == Lattice::Unknown {
+            return Lattice::Unknown
+        }
+    }
+    Lattice::Overdefined
+}
+
+fn propagate(function: ir::Function, budget: Ref[isize]) -> Result[
+    Vec[Option[ir::Datum]],
+    ir::Error,
+] {
+    let blocks = function.blocks();
+    let state = Propagation {
+        values: Vec::new(),
+        constants: Vec::new(),
+        users: Vec::new(),
+        executable: Vec::new(),
+        queued: Vec::new(),
+        queue: Vec::new(),
+        budget,
+    };
+    for _ in 0..function.value_count() {
+        spend(budget)?;
+        state.values.push(Lattice::Unknown);
+        state.constants.push(Option::None);
+        state.users.push(Vec::new());
+    }
+    for block in blocks {
+        spend(budget)?;
+        state.executable.push(false);
+        state.queued.push(false);
+        for instruction in block.instructions {
+            for operand in ir::operands(instruction.operation) {
+                spend(budget)?;
+                state.users[operand.index()].push(block.id.index());
+            }
+        }
+        let term = terminator(block)?;
+        match term {
+            Branch(condition, _, _) => state.users[condition.index()].push(block.id.index()),
+            _ => (),
+        }
+        for edge in ir::successors(term) {
+            for argument in edge.arguments {
+                spend(budget)?;
+                state.users[argument.index()].push(block.id.index());
+            }
+        }
+    }
+    for parameter in blocks[0].parameters {
+        state.merge(parameter, Lattice::Overdefined)?;
+    }
+    state.executable[0] = true;
+    state.enqueue(0);
+    let mut cursor = 0;
+    while cursor < state.queue.len() {
+        spend(budget)?;
+        let index = state.queue[cursor];
+        cursor = cursor + 1;
+        state.queued[index] = false;
+        let block = blocks[index];
+        for instruction in block.instructions {
+            spend(budget)?;
+            let next = evaluate(instruction.operation, state);
+            for result in instruction.results {
+                state.merge(result, next)?;
+            }
+        }
+        match terminator(block)? {
+            Jump(edge) => state.edge(edge, blocks)?,
+            Branch(condition, yes, no) => match state.values[condition.index()] {
+                Constant(ir::Datum::Bool(taken)) => state.edge(
+                    if taken {
+                        yes
+                    } else {
+                        no
+                    },
+                    blocks,
+                )?,
+                Overdefined => {
+                    state.edge(yes, blocks)?;
+                    state.edge(no, blocks)?;
+                },
+                _ => (),
+            },
+            Return(_) => (),
+        }
+    }
+    Result::Ok(state.constants)
+}
+
+fn constant_edge(
+    edge: ir::Edge,
+    blocks: Vec[ir::BlockData],
+    constants: Vec[Option[ir::Datum]],
+    budget: Ref[isize],
+) -> Result[ir::Edge, ir::Error] {
+    let parameters = blocks[edge.target.index()].parameters;
+    let arguments = Vec::new();
+    for index in 0..parameters.len() {
+        spend(budget)?;
+        if constants[parameters[index].index()].is_none() {
+            arguments.push(edge.arguments[index]);
+        }
+    }
+    Result::Ok(ir::Edge { target: edge.target, arguments })
+}
+
+fn materialize_parameters(
+    blocks: Vec[ir::BlockData],
+    constants: Vec[Option[ir::Datum]],
+    budget: Ref[isize],
+) -> Result[Vec[ir::BlockData], ir::Error] {
+    let output = Vec::new();
+    for block in blocks {
+        spend(budget)?;
+        let parameters = Vec::new();
+        let instructions = Vec::new();
+        for parameter in block.parameters {
+            spend(budget)?;
+            match constants[parameter.index()] {
+                Option::Some(value) => instructions.push(
+                    ir::Instruction {
+                        results: Vec::from_array([parameter]),
+                        operation: ir::Operation::Constant(value),
+                    },
+                ),
+                Option::None => parameters.push(parameter),
+            }
+        }
+        instructions.extend(block.instructions);
+        let term = match terminator(block)? {
+            Jump(edge) => ir::Terminator::Jump(constant_edge(edge, blocks, constants, budget)?),
+            Branch(condition, yes, no) => ir::Terminator::Branch(
+                condition,
+                constant_edge(yes, blocks, constants, budget)?,
+                constant_edge(no, blocks, constants, budget)?,
+            ),
+            Return(values) => ir::Terminator::Return(values),
+        };
+        output.push(
+            ir::BlockData { id: block.id, parameters, instructions, terminator: Option::Some(term) },
+        );
+    }
+    Result::Ok(output)
+}
