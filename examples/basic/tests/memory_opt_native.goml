@@ -1,0 +1,143 @@
+package tests;
+
+use ecosystem::goir as ir;
+use std::testing;
+
+fn native_memory_join() -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "MemoryJoinBits",
+            Vec::from_array([ir::Type::Bool, ir::Type::F64, ir::Type::F64]),
+            Vec::from_array([ir::Type::F64, ir::Type::F64]),
+        ),
+        "builder",
+    );
+    let inputs = testing::expect_ok(builder.parameters(builder.entry()), "inputs");
+    let slot = testing::expect_ok(builder.stack_slot(ir::Type::F64), "slot");
+    let fresh = testing::expect_ok(builder.stack_load(slot), "fresh zero");
+    testing::assert_ok(builder.stack_store(slot, inputs[1]));
+    let yes = testing::expect_ok(builder.append_block(Vec::new()), "yes");
+    let no = testing::expect_ok(builder.append_block(Vec::new()), "no");
+    let join = testing::expect_ok(builder.append_block(Vec::new()), "join");
+    testing::assert_ok(
+        builder.branch(
+            inputs[0],
+            ir::Edge { target: yes, arguments: Vec::new() },
+            ir::Edge { target: no, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(yes));
+    testing::assert_ok(builder.stack_store(slot, inputs[2]));
+    testing::assert_ok(builder.jump(join, Vec::new()));
+    testing::assert_ok(builder.switch_to(no));
+    testing::assert_ok(builder.jump(join, Vec::new()));
+    testing::assert_ok(builder.switch_to(join));
+    let value = testing::expect_ok(builder.stack_load(slot), "join value");
+    testing::assert_ok(builder.ret(Vec::from_array([fresh, value])));
+    testing::expect_ok(builder.finish(), "function")
+}
+
+fn native_loop_invariant() -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "LoopInvariant",
+            Vec::from_array([ir::Type::Bool, ir::Type::I64, ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let inputs = testing::expect_ok(builder.parameters(builder.entry()), "inputs");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let yes = testing::expect_ok(builder.append_block(Vec::new()), "yes");
+    let no = testing::expect_ok(builder.append_block(Vec::new()), "no");
+    let header = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64])),
+        "header",
+    );
+    let body = testing::expect_ok(builder.append_block(Vec::new()), "body");
+    let exit = testing::expect_ok(builder.append_block(Vec::new()), "exit");
+    testing::assert_ok(
+        builder.branch(
+            inputs[0],
+            ir::Edge { target: yes, arguments: Vec::new() },
+            ir::Edge { target: no, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(yes));
+    testing::assert_ok(builder.jump(header, Vec::from_array([inputs[1], zero])));
+    testing::assert_ok(builder.switch_to(no));
+    testing::assert_ok(builder.jump(header, Vec::from_array([zero, zero])));
+    testing::assert_ok(builder.switch_to(header));
+    let parameters = testing::expect_ok(builder.parameters(header), "parameters");
+    let condition = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, zero, parameters[0]),
+        "condition",
+    );
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: body, arguments: Vec::new() },
+            ir::Edge { target: exit, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(body));
+    let invariant = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Mul, inputs[2], inputs[3]),
+        "invariant",
+    );
+    let sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, parameters[1], invariant), "sum");
+    let remaining = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Sub, parameters[0], one),
+        "remaining",
+    );
+    testing::assert_ok(builder.jump(header, Vec::from_array([remaining, sum])));
+    testing::assert_ok(builder.switch_to(exit));
+    testing::assert_ok(builder.ret(Vec::from_array([parameters[1]])));
+    testing::expect_ok(builder.finish(), "function")
+}
+
+fn memory_optimizer_corpus() -> Vec[TypedCases] {
+    let joins = Vec::new();
+    let bits: Vec[i64] = Vec::from_array(
+        [0, -9223372036854775808, 1, 9221120237041090626, 9221120237041090693],
+    );
+    for condition in Vec::from_array([false, true]) {
+        for left in bits {
+            for right in bits {
+                joins.push(
+                    Vec::from_array(
+                        [
+                            ir::Datum::Bool(condition),
+                            ir::datum_from_bits(ir::Type::F64, left),
+                            ir::datum_from_bits(ir::Type::F64, right),
+                        ],
+                    ),
+                );
+            }
+        }
+    }
+    let loops = Vec::new();
+    for condition in Vec::from_array([false, true]) {
+        for count in Vec::from_array([-1, 0, 1, 2, 9]) {
+            for (left, right) in Vec::from_array([(0, 0), (-7, 9), (9223372036854775807, 2)]) {
+                loops.push(
+                    Vec::from_array(
+                        [
+                            ir::Datum::Bool(condition),
+                            ir::Datum::I64(count),
+                            ir::Datum::I64(left),
+                            ir::Datum::I64(right),
+                        ],
+                    ),
+                );
+            }
+        }
+    }
+    Vec::from_array(
+        [
+            TypedCases { function: native_memory_join(), cases: joins },
+            TypedCases { function: native_loop_invariant(), cases: loops },
+        ],
+    )
+}

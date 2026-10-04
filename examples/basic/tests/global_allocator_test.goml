@@ -1,0 +1,316 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::mach;
+use ecosystem::goir::regalloc;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::testing;
+use std::time;
+
+fn allocator_pressure_function(name: string, ty: ir::Type) -> ir::Function {
+    let types = Vec::new();
+    for _ in 0..10 {
+        types.push(ty);
+    }
+    types.push(ir::Type::I64);
+    types.push(ir::Type::Bool);
+    let b = testing::expect_ok(
+        ir::Builder::new(name, types, Vec::from_array([ty])),
+        "pressure builder",
+    );
+    let args = testing::expect_ok(b.parameters(b.entry()), "inputs");
+    let header = testing::expect_ok(b.append_block(Vec::from_array([ir::Type::I64, ty])), "header");
+    let body = testing::expect_ok(b.append_block(Vec::new()), "body");
+    let after = testing::expect_ok(b.append_block(Vec::new()), "after");
+    let cold = testing::expect_ok(b.append_block(Vec::new()), "cold");
+    let done = testing::expect_ok(b.append_block(Vec::from_array([ty])), "done");
+    let zero = testing::expect_ok(b.iconst(0), "zero");
+    let one = testing::expect_ok(b.iconst(1), "one");
+    let initial = testing::expect_ok(
+        if ty == ir::Type::F64 {
+            b.fconst(0.0)
+        } else {
+            b.iconst(0)
+        },
+        "initial",
+    );
+    testing::assert_ok(b.jump(header, Vec::from_array([args[10], initial])));
+    testing::assert_ok(b.switch_to(header));
+    let values = testing::expect_ok(b.parameters(header), "loop values");
+    let more = testing::expect_ok(b.icmp(ir::IntCC::SignedLess, zero, values[0]), "loop test");
+    testing::assert_ok(
+        b.branch(
+            more,
+            ir::Edge { target: body, arguments: Vec::new() },
+            ir::Edge { target: after, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(b.switch_to(body));
+    let mut sum = values[1];
+    for _ in 0..24 {
+        sum = testing::expect_ok(
+            if ty == ir::Type::F64 {
+                b.fbinary(ir::FloatOp::Add, sum, args[9])
+            } else {
+                b.binary(ir::BinaryOp::Add, sum, args[9])
+            },
+            "hot operation",
+        );
+    }
+    let remaining = testing::expect_ok(b.binary(ir::BinaryOp::Sub, values[0], one), "remaining");
+    testing::assert_ok(b.jump(header, Vec::from_array([remaining, sum])));
+    testing::assert_ok(b.switch_to(after));
+    testing::assert_ok(
+        b.branch(
+            args[11],
+            ir::Edge { target: cold, arguments: Vec::new() },
+            ir::Edge { target: done, arguments: Vec::from_array([values[1]]) },
+        ),
+    );
+    testing::assert_ok(b.switch_to(cold));
+    let mut sum = values[1];
+    for _ in 0..4 {
+        for index in 0..9 {
+            sum = testing::expect_ok(
+                if ty == ir::Type::F64 {
+                    b.fbinary(ir::FloatOp::Add, sum, args[index])
+                } else {
+                    b.binary(ir::BinaryOp::Add, sum, args[index])
+                },
+                "cold operation",
+            );
+        }
+    }
+    sum = testing::expect_ok(
+        if ty == ir::Type::F64 {
+            b.fbinary(ir::FloatOp::Add, sum, args[9])
+        } else {
+            b.binary(ir::BinaryOp::Add, sum, args[9])
+        },
+        "cold use of hot invariant",
+    );
+    testing::assert_ok(b.jump(done, Vec::from_array([sum])));
+    testing::assert_ok(b.switch_to(done));
+    testing::assert_ok(b.ret(testing::expect_ok(b.parameters(done), "return")));
+    testing::expect_ok(b.finish(), "pressure function")
+}
+
+fn allocator_package(
+    name: string,
+    functions: Vec[ir::Function],
+    registers: isize,
+    algorithm: regalloc::Algorithm,
+) -> amd64::Package {
+    let declarations = Vec::from_array(["package " + name + "\n"]);
+    let assembly = Vec::from_array(["#include \"funcdata.h\""]);
+    for function in functions {
+        let machine = testing::expect_ok(mach::lower(function), "lower allocator corpus");
+        let allocated = testing::expect_ok(
+            regalloc::allocate_with_algorithm(
+                machine,
+                regalloc::Options { registers, ..regalloc::Options::standard() },
+                algorithm,
+            ),
+            "allocate corpus",
+        );
+        let compiled = testing::expect_ok(amd64::emit_allocation(allocated), "emit allocation");
+        declarations.push(compiled.declaration);
+        for line in compiled.assembly.split("\n") {
+            if !line.starts_with("#include") {
+                assembly.push(line);
+            }
+        }
+    }
+    amd64::Package { assembly: assembly.join("\n"), declarations: declarations.join("\n") }
+}
+
+fn allocator_percentile(values: Vec[i64], percent: isize) -> i64 {
+    values.sort_by(
+        |a, b| if a < b {
+            -1
+        } else if a > b {
+            1
+        } else {
+            0
+        },
+    );
+    values[(values.len() - 1) * percent / 100]
+}
+
+#[test]
+fn native_global_and_linear_allocators_match_across_hot_cold_regions() -> () {
+    let directory = path::join(
+        "_artifact",
+        "goir-global-"
+            + hash::sha256(testing::expect_ok(rand::bytes(16), "unique allocator directory")),
+    );
+    testing::assert_ok(fs::create_dir_all(directory));
+    let functions = Vec::from_array(
+        [
+            allocator_pressure_function("IntegerPressure", ir::Type::I64),
+            allocator_pressure_function("FloatPressure", ir::Type::F64),
+        ],
+    );
+    let variants = Vec::from_array(
+        [
+            ("linear0", regalloc::Algorithm::LinearScan, 0),
+            ("linear1", regalloc::Algorithm::LinearScan, 1),
+            ("linear7", regalloc::Algorithm::LinearScan, 7),
+            ("global0", regalloc::Algorithm::Global, 0),
+            ("global1", regalloc::Algorithm::Global, 1),
+            ("global7", regalloc::Algorithm::Global, 7),
+        ],
+    );
+    let lines = Vec::from_array(
+        [
+            "package generated",
+            "import (\"testing\";\"math\"; linear0 \"goir-global/linear0\"; linear1 \"goir-global/linear1\"; linear7 \"goir-global/linear7\"; global0 \"goir-global/global0\"; global1 \"goir-global/global1\"; global7 \"goir-global/global7\")",
+        ],
+    );
+    let report = Vec::from_array(
+        [
+            "function\talgorithm\tregisters\tglobal_evictions\tregional_evictions\tsplit_values\tspill_loads\tspill_stores\tweighted_loads\tweighted_stores\tedge_moves\tcompile_p50_ns\tcompile_p95_ns\tallocate_p50_ns\tallocate_p95_ns",
+        ],
+    );
+    for function in functions {
+        testing::assert_ok(
+            fs::write_file_structured(
+                path::join(directory, function.name() + ".goir"),
+                testing::expect_ok(ir::display(function), "pressure IR"),
+            ),
+        );
+        lines.push("func Test" + function.name() + "(t *testing.T) {");
+        for count in Vec::from_array([0, 1, 2, 7, 31]) {
+            for cold in Vec::from_array([false, true]) {
+                let args = Vec::new();
+                let floats = function.parameter_types()[0] == ir::Type::F64;
+                for index in 0..10 {
+                    args.push(
+                        if floats {
+                            ir::Datum::F64(
+                                Vec::from_array(
+                                    [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5],
+                                )[index],
+                            )
+                        } else {
+                            ir::Datum::I64((index + 1).to_i64() * -17)
+                        },
+                    );
+                }
+                args.push(ir::Datum::I64(count));
+                args.push(ir::Datum::Bool(cold));
+                let expected = testing::expect_ok(
+                    ir::interpret(function, args, 100000),
+                    "pressure interpretation",
+                )[0];
+                let inputs = Vec::new();
+                for arg in args {
+                    inputs.push(typed_literal(arg));
+                }
+                for (name, _, _) in variants {
+                    lines.push("{");
+                    lines.push(
+                        "result := " + name + "." + function.name() + "(" + inputs.join(",") + ")",
+                    );
+                    typed_expect(lines, "result", expected, name + " pressure");
+                    lines.push("}");
+                }
+            }
+        }
+        lines.push("}");
+        for (name, algorithm, registers) in variants {
+            let compile_times = Vec::new();
+            let allocate_times = Vec::new();
+            let workspace = regalloc::Workspace::new();
+            for _ in 0..21 {
+                let started = time::Instant::now();
+                let machine = testing::expect_ok(mach::lower(function), "benchmark lower");
+                let profile = testing::expect_ok(
+                    regalloc::allocate_profiled_with_algorithm(
+                        machine,
+                        regalloc::Options { registers, ..regalloc::Options::standard() },
+                        workspace,
+                        algorithm,
+                    ),
+                    "benchmark allocate",
+                );
+                let _ = testing::expect_ok(
+                    amd64::emit_allocation(profile.allocation),
+                    "benchmark emit",
+                );
+                compile_times.push(started.elapsed().as_nanoseconds());
+                allocate_times.push(profile.allocation_ns);
+            }
+            let allocated = testing::expect_ok(
+                regalloc::allocate_with_algorithm(
+                    testing::expect_ok(mach::lower(function), "report lower"),
+                    regalloc::Options { registers, ..regalloc::Options::standard() },
+                    algorithm,
+                ),
+                "report allocation",
+            );
+            let s = allocated.statistics();
+            report.push(
+                function.name() + f"\t{name}\t{registers}\t" + s.global_evictions.to_string() + "\t"
+                    + s.regional_evictions.to_string()
+                    + "\t"
+                    + s.split_values.to_string()
+                    + "\t"
+                    + s.spill_loads.to_string()
+                    + "\t"
+                    + s.spill_stores.to_string()
+                    + "\t"
+                    + s.weighted_spill_loads.to_string()
+                    + "\t"
+                    + s.weighted_spill_stores.to_string()
+                    + "\t"
+                    + s.edge_moves.to_string()
+                    + "\t"
+                    + allocator_percentile(compile_times, 50).to_string()
+                    + "\t"
+                    + allocator_percentile(compile_times, 95).to_string()
+                    + "\t"
+                    + allocator_percentile(allocate_times, 50).to_string()
+                    + "\t"
+                    + allocator_percentile(allocate_times, 95).to_string(),
+            );
+        }
+    }
+    testing::assert_ok(
+        fs::write_file_structured(
+            "_artifact/global-allocation.tsv",
+            (report.join("\n") + "\n").replace("\t", char_from_u32(9).unwrap_or(' ').to_string()),
+        ),
+    );
+    for (name, algorithm, registers) in variants {
+        let output = allocator_package(name, functions, registers, algorithm);
+        let destination = path::join(directory, name);
+        testing::assert_ok(fs::create_dir_all(destination));
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated.go"), output.declarations),
+        );
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated_amd64.s"), output.assembly),
+        );
+    }
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "go.mod"),
+            "module goir-global\n\ngo 1.26.0\n",
+        ),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(path::join(directory, "global_test.go"), lines.join("\n") + "\n"),
+    );
+    let _ = run_go(directory, Vec::from_array(["vet", "./..."]));
+    let output = run_go(
+        directory,
+        Vec::from_array(["test", "-count=1", "-timeout=60s", "-v", "./..."]),
+    );
+    testing::assert(output.contains("PASS"));
+    testing::assert_ok(fs::remove_dir_all(directory));
+}

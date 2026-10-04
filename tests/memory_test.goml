@@ -50,7 +50,7 @@ fn stack_slots_are_typed_zero_initialized_and_not_commoned_across_writes() -> ()
     testing::assert_eq(function.stack_slots().len(), 4);
     let optimized = testing::expect_ok(opt::simplify(function), "optimize");
     testing::assert_err(optimized.stack_slot_type(slot));
-    testing::assert_eq(optimized.stack_slots().len(), 4);
+    testing::assert_eq(optimized.stack_slots().len(), 0);
     let expected = Vec::from_array(
         [
             ir::Datum::I64(0),

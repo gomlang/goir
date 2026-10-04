@@ -135,3 +135,7 @@ fn loop_weights_distinguish_nested_loops_from_entry_and_exit() -> () {
     testing::assert_err(loop_weights(machine, Ref::new(1)));
     testing::assert_ok(allocate(machine));
 }
+
+fn loop_weights(function: mach::Function, budget: Ref[isize]) -> Result[Vec[isize], ir::Error] {
+    Result::Ok(allocation_graph(function, budget)?.block_weights())
+}

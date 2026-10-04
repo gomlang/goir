@@ -1,0 +1,262 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use std::testing;
+
+fn assert_promoted(function: ir::Function) -> () {
+    testing::assert(function.stack_slots().is_empty());
+    for block in function.blocks() {
+        for instruction in block.instructions {
+            testing::assert(
+                match instruction.operation {
+                    StackLoad(_) | StackStore(_, _) => false,
+                    _ => true,
+                },
+            );
+        }
+    }
+}
+
+fn slot_diamond() -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "SlotDiamond",
+            Vec::from_array([ir::Type::Bool, ir::Type::F64, ir::Type::F64]),
+            Vec::from_array([ir::Type::F64, ir::Type::F64]),
+        ),
+        "builder",
+    );
+    let input = testing::expect_ok(builder.parameters(builder.entry()), "input");
+    let slot = testing::expect_ok(builder.stack_slot(ir::Type::F64), "slot");
+    testing::assert_ok(builder.stack_store(slot, input[1]));
+    let yes = testing::expect_ok(builder.append_block(Vec::new()), "yes");
+    let no = testing::expect_ok(builder.append_block(Vec::new()), "no");
+    let join = testing::expect_ok(builder.append_block(Vec::new()), "join");
+    testing::assert_ok(
+        builder.branch(
+            input[0],
+            ir::Edge { target: yes, arguments: Vec::new() },
+            ir::Edge { target: no, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(yes));
+    testing::assert_ok(builder.stack_store(slot, input[2]));
+    testing::assert_ok(builder.jump(join, Vec::new()));
+    testing::assert_ok(builder.switch_to(no));
+    testing::assert_ok(builder.jump(join, Vec::new()));
+    testing::assert_ok(builder.switch_to(join));
+    let first = testing::expect_ok(builder.stack_load(slot), "first");
+    let second = testing::expect_ok(builder.stack_load(slot), "second");
+    testing::assert_ok(builder.ret(Vec::from_array([first, second])));
+    testing::expect_ok(builder.finish(), "function")
+}
+
+#[test]
+fn memory_promotion_builds_join_parameters_and_preserves_float_bits() -> () {
+    let source = slot_diamond();
+    let before = testing::expect_ok(ir::display(source), "before");
+    let optimized = testing::expect_ok(opt::simplify(source), "optimized");
+    assert_promoted(optimized);
+    testing::assert_eq(optimized.blocks()[3].parameters.len(), 1);
+    let bits: Vec[i64] = Vec::from_array([0, -9223372036854775808, 9221120237041090626, 1]);
+    for condition in Vec::from_array([false, true]) {
+        for left in bits {
+            for right in bits {
+                let input = Vec::from_array(
+                    [
+                        ir::Datum::Bool(condition),
+                        ir::datum_from_bits(ir::Type::F64, left),
+                        ir::datum_from_bits(ir::Type::F64, right),
+                    ],
+                );
+                testing::assert(
+                    testing::expect_ok(ir::interpret(source, input, 100), "source")
+                        == testing::expect_ok(ir::interpret(optimized, input, 100), "optimized"),
+                );
+            }
+        }
+    }
+    testing::assert_eq(testing::expect_ok(ir::display(source), "immutable"), before);
+}
+
+fn memory_accumulator(limits: ir::Limits) -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::with_limits(
+            "MemoryAccumulator",
+            Vec::from_array([ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+            limits,
+        ),
+        "builder",
+    );
+    let input = testing::expect_ok(builder.parameters(builder.entry()), "input")[0];
+    let slot = testing::expect_ok(builder.stack_slot(ir::Type::I64), "slot");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let header = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64])),
+        "header",
+    );
+    let body = testing::expect_ok(builder.append_block(Vec::new()), "body");
+    let exit = testing::expect_ok(builder.append_block(Vec::new()), "exit");
+    testing::assert_ok(builder.jump(header, Vec::from_array([input])));
+    testing::assert_ok(builder.switch_to(header));
+    let remaining = testing::expect_ok(builder.parameters(header), "remaining")[0];
+    let condition = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, zero, remaining),
+        "condition",
+    );
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: body, arguments: Vec::new() },
+            ir::Edge { target: exit, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(body));
+    let previous = testing::expect_ok(builder.stack_load(slot), "previous");
+    let sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, previous, remaining), "sum");
+    testing::assert_ok(builder.stack_store(slot, sum));
+    let redundant = testing::expect_ok(builder.stack_load(slot), "forwarded load");
+    let next_sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, redundant, one), "next sum");
+    testing::assert_ok(builder.stack_store(slot, next_sum));
+    let count = testing::expect_ok(builder.binary(ir::BinaryOp::Sub, remaining, one), "count");
+    testing::assert_ok(builder.jump(header, Vec::from_array([count])));
+    testing::assert_ok(builder.switch_to(exit));
+    let result = testing::expect_ok(builder.stack_load(slot), "result");
+    testing::assert_ok(builder.ret(Vec::from_array([result])));
+    testing::expect_ok(builder.finish(), "function")
+}
+
+fn verification_limited_slot(limits: ir::Limits) -> Result[ir::Function, ir::Error] {
+    let builder = testing::expect_ok(
+        ir::Builder::with_limits(
+            "VerificationLimitedSlot",
+            Vec::from_array([ir::Type::Bool]),
+            Vec::from_array([ir::Type::I64]),
+            limits,
+        ),
+        "builder",
+    );
+    let condition = testing::expect_ok(builder.parameters(builder.entry()), "condition")[0];
+    let slot = testing::expect_ok(builder.stack_slot(ir::Type::I64), "slot");
+    let yes = testing::expect_ok(builder.append_block(Vec::new()), "yes");
+    let no = testing::expect_ok(builder.append_block(Vec::new()), "no");
+    let join = testing::expect_ok(builder.append_block(Vec::new()), "join");
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: yes, arguments: Vec::new() },
+            ir::Edge { target: no, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(yes));
+    testing::assert_ok(builder.jump(join, Vec::new()));
+    testing::assert_ok(builder.switch_to(no));
+    testing::assert_ok(builder.jump(join, Vec::new()));
+    testing::assert_ok(builder.switch_to(join));
+    let value = testing::expect_ok(builder.stack_load(slot), "read zero");
+    testing::assert_ok(builder.ret(Vec::from_array([value])));
+    builder.finish()
+}
+
+#[test]
+fn memory_promotion_falls_back_when_transformed_verification_exceeds_source_limit() -> () {
+    let mut limits = ir::Limits::standard();
+    let mut source = Option::None;
+    for steps in 1..1000 {
+        limits.max_verify_steps = steps;
+        match verification_limited_slot(limits) {
+            Ok(function) => {
+                source = Option::Some(function);
+                break;
+            },
+            Err(failure) => testing::assert_eq(failure.kind, ir::ErrorKind::LimitExceeded),
+        }
+    }
+    let source = testing::expect_some(source, "minimum verification budget found");
+    let optimized = testing::expect_ok(opt::simplify(source), "bounded verifier fallback");
+    testing::assert_eq(optimized.stack_slots().len(), 1);
+    for condition in Vec::from_array([false, true]) {
+        testing::assert(
+            testing::expect_ok(
+                ir::interpret(optimized, Vec::from_array([ir::Datum::Bool(condition)]), 100),
+                "zero result",
+            )
+                == Vec::from_array([ir::Datum::I64(0)]),
+        );
+    }
+    testing::assert_eq(
+        testing::expect_err(
+            opt::simplify_with_options(source, opt::Options { max_steps: 30 }),
+            "optimizer cap still propagates",
+        ).kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+}
+
+#[test]
+fn memory_promotion_builds_loop_phis_and_falls_back_under_parameter_limits() -> () {
+    let source = memory_accumulator(ir::Limits::standard());
+    let optimized = testing::expect_ok(opt::simplify(source), "promoted");
+    assert_promoted(optimized);
+    testing::assert_eq(optimized.blocks()[1].parameters.len(), 2);
+    let mut limits = ir::Limits::standard();
+    limits.max_block_parameters = 1;
+    let constrained = memory_accumulator(limits);
+    let fallback = testing::expect_ok(opt::simplify(constrained), "bounded fallback");
+    testing::assert_eq(fallback.stack_slots().len(), 1);
+    let mut limits = ir::Limits::standard();
+    limits.max_values = source.value_count();
+    let value_limited = memory_accumulator(limits);
+    let value_fallback = testing::expect_ok(opt::simplify(value_limited), "bounded value fallback");
+    testing::assert_eq(value_fallback.stack_slots().len(), 1);
+    let mut loads = 0;
+    let mut stores = 0;
+    for instruction in fallback.blocks()[2].instructions {
+        match instruction.operation {
+            StackLoad(_) => {
+                loads += 1;
+            },
+            StackStore(_, _) => {
+                stores += 1;
+            },
+            _ => (),
+        }
+    }
+    testing::assert_eq(loads, 1);
+    testing::assert_eq(stores, 1);
+    for count in Vec::from_array([-1, 0, 1, 2, 10, 31]) {
+        let input = Vec::from_array([ir::Datum::I64(count)]);
+        let expected = testing::expect_ok(ir::interpret(source, input, 10000), "source");
+        for function in Vec::from_array([optimized, constrained, fallback, value_fallback]) {
+            testing::assert(
+                testing::expect_ok(ir::interpret(function, input, 10000), "version") == expected,
+            );
+        }
+    }
+    testing::assert_eq(
+        testing::expect_err(
+            opt::simplify_with_options(source, opt::Options { max_steps: 30 }),
+            "work cap",
+        ).kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+}
+
+#[test]
+fn reconstruction_checks_fresh_definitions_and_preserves_source() -> () {
+    let source = slot_diamond();
+    let reconstruction = testing::expect_ok(
+        ir::Reconstruction::new(testing::expect_ok(ir::verified(source), "verified")),
+        "reconstruction",
+    );
+    testing::assert_eq(
+        testing::expect_err(reconstruction.parameters(source.blocks()[0].id), "foreign block").kind,
+        ir::ErrorKind::WrongFunction,
+    );
+    testing::assert_err(reconstruction.append_parameter(reconstruction.entry(), ir::Type::I64));
+    testing::assert_err(reconstruction.finish(source.blocks()));
+    testing::assert_ok(ir::verify(source));
+}

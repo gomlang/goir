@@ -1,0 +1,210 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::cli;
+use ecosystem::goir::filetest;
+use ecosystem::goir::fuzz;
+use ecosystem::goir::opt;
+use ecosystem::goir::reader;
+use std::testing;
+use std::fs;
+use std::num;
+
+#[test]
+fn cli_checks_modules_runs_typed_inputs_and_dumps_complete_phases() -> () {
+    let case = testing::expect_ok(fuzz::generate(7), "seeded module");
+    let source = testing::expect_ok(reader::display_module(case.module), "module text");
+    let request = testing::expect_ok(
+        cli::parse(Vec::from_array(["check", "module.goir"])),
+        "check command",
+    );
+    testing::assert_eq(
+        testing::expect_ok(cli::execute(request, source), "check module").text,
+        "verified 2 functions\n",
+    );
+    let arguments = Vec::from_array(["run", "module.goir", "--entry", case.entry.name()]);
+    for value in case.arguments {
+        arguments.push("--arg");
+        arguments.push(cli::datum_text(value));
+    }
+    let request = testing::expect_ok(cli::parse(arguments), "typed arguments");
+    let values = testing::expect_ok(
+        ir::interpret_module(case.module, case.entry, case.arguments, case.fuel),
+        "reference",
+    );
+    let expected = Vec::new();
+    for value in values {
+        expected.push(cli::datum_text(value));
+    }
+    testing::assert_eq(
+        testing::expect_ok(cli::execute(request, source), "run command").text,
+        expected.join("\n") + "\n",
+    );
+    let request = testing::expect_ok(
+        cli::parse(
+            Vec::from_array(
+                ["dump", "module.goir", "--stage", "allocate", "--no-opt", "--registers", "1"],
+            ),
+        ),
+        "dump allocation",
+    );
+    let dump = testing::expect_ok(cli::execute(request, source), "complete allocation").text;
+    testing::assert(dump.contains("algorithm Algorithm::Global"));
+    testing::assert(dump.contains("home r"));
+    testing::assert(dump.contains("compare_branch"));
+    testing::assert(dump.contains("Fixed(FixedReg::AX)"));
+    let request = testing::expect_ok(
+        cli::parse(
+            Vec::from_array(
+                [
+                    "compile",
+                    "module.goir",
+                    "--out",
+                    "output",
+                    "--algorithm",
+                    "linear",
+                    "--registers",
+                    "0",
+                ],
+            ),
+        ),
+        "compile command",
+    );
+    let output = testing::expect_ok(cli::execute(request, source), "compile artifact");
+    testing::assert_eq(output.artifacts.len(), 4);
+    testing::assert(output.artifacts[1].contents.contains("TEXT ·Fuzz7"));
+    testing::assert(output.artifacts[3].contents.contains("algorithm=Algorithm::LinearScan"));
+}
+
+#[test]
+fn cli_rejects_bad_targets_duplicate_options_and_lossy_arguments() -> () {
+    for arguments in Vec::from_array(
+        [
+            Vec::from_array(["unknown", "input"]),
+            Vec::from_array(["run"]),
+            Vec::from_array(["compile", "input"]),
+            Vec::from_array(["run", "input", "--arg"]),
+            Vec::from_array(["dump", "input", "--registers", "8"]),
+            Vec::from_array(["dump", "input", "--stage", "allocate", "--stage", "verify"]),
+            Vec::from_array(["bench", "input", "--samples", "0"]),
+            Vec::from_array(
+                ["compile", "input", "--out", "output", "--target", "linux-arm64-go1.26-abi0"],
+            ),
+        ],
+    ) {
+        testing::assert_err(cli::parse(arguments));
+    }
+    testing::assert_err(cli::parse_datum("i32:2147483648"));
+    testing::assert_err(cli::parse_datum("bool:1"));
+    for bits in Vec::from_array([0x8000000000000000, 0x7ff8000000000042, 0xffffffffffffffff]) {
+        let value = ir::Datum::F64(float64_from_bits(bits));
+        testing::assert_eq(
+            testing::expect_ok(cli::parse_datum(cli::datum_text(value)), "bit exact argument"),
+            value,
+        );
+    }
+}
+
+#[test]
+fn seeded_loop_call_memory_modules_reproduce_and_optimize_bit_exactly() -> () {
+    for seed in Vec::from_array([0, 1, 7, 31, 18446744073709551615]) {
+        let case = testing::expect_ok(fuzz::generate(seed), "generated case");
+        let repeat = testing::expect_ok(fuzz::generate(seed), "repeat generation");
+        let source = testing::expect_ok(reader::display_module(case.module), "module source");
+        testing::assert_eq(
+            source,
+            testing::expect_ok(reader::display_module(repeat.module), "repeat source"),
+        );
+        testing::assert_eq(fuzz::manifest(case), fuzz::manifest(repeat));
+        let mut optimized = case.module;
+        for target in optimized.references() {
+            let body = testing::expect_ok(optimized.function(target), "body");
+            if let Some(body) = body {
+                optimized = testing::expect_ok(
+                    optimized.with_function(
+                        target,
+                        testing::expect_ok(opt::simplify(body), "optimize seeded body"),
+                    ),
+                    "replace body",
+                );
+            }
+        }
+        for arguments in fuzz::inputs(case) {
+            testing::assert(
+                testing::expect_ok(
+                    ir::interpret_module(case.module, case.entry, arguments, case.fuel),
+                    "source interpretation",
+                )
+                    == testing::expect_ok(
+                        ir::interpret_module(optimized, case.entry, arguments, case.fuel),
+                        "optimized interpretation",
+                    ),
+            );
+        }
+        let output = testing::expect_ok(
+            filetest::run_module(
+                source,
+                case.entry.name(),
+                filetest::Stage::Lower,
+                Vec::new(),
+                case.fuel,
+            ),
+            "machine snapshots",
+        );
+        testing::assert(output.text.contains("clobber Clobber::Flags"));
+        testing::assert(output.text.contains("edge block"));
+    }
+}
+
+#[test]
+fn cli_snapshots_match_generated_goldens_and_bench_reports_are_tabular() -> () {
+    let source = testing::expect_ok(
+        fs::read_file_structured("tests/data/loop.goir"),
+        "snapshot input",
+    );
+    let request = testing::expect_ok(
+        cli::parse(
+            Vec::from_array(["snapshot", "loop.goir", "--out", "snapshots", "--arg", "i64:10"]),
+        ),
+        "snapshot request",
+    );
+    let output = testing::expect_ok(cli::execute(request, source), "six phases");
+    testing::assert_eq(output.artifacts.len(), 6);
+    for artifact in output.artifacts {
+        let expected = testing::expect_ok(
+            fs::read_file_structured("tests/data/loop-stages/" + artifact.name),
+            "generated snapshot",
+        );
+        testing::assert_ok(
+            filetest::assert_exact(
+                filetest::Output { text: artifact.contents, values: Vec::new() },
+                expected,
+            ),
+        );
+    }
+    let request = testing::expect_ok(
+        cli::parse(Vec::from_array(["bench", "loop.goir", "--samples", "3", "--no-opt"])),
+        "bench request",
+    );
+    let output = testing::expect_ok(cli::execute(request, source), "phase report");
+    testing::assert_ok(fs::write_file_structured("_artifact/pipeline-bench.tsv", output.text));
+    let rows = output.text.trim().split("\n");
+    let tab = char_from_u32(9).unwrap_or(' ').to_string();
+    testing::assert_eq(rows.len(), 19);
+    for index in 1..rows.len() {
+        let columns = rows[index].split(tab);
+        testing::assert_eq(columns.len(), 18);
+        let p50 = testing::expect_ok(num::parse_int_bits(columns[5], 10, 64), "p50");
+        let p95 = testing::expect_ok(num::parse_int_bits(columns[6], 10, 64), "p95");
+        testing::assert(p95 >= p50 && p50 >= 0);
+        testing::assert_eq(columns[15], "1");
+        testing::assert_eq(columns[16], "2");
+    }
+    let output = filetest::Output { text: "first second first\n", values: Vec::new() };
+    testing::assert_ok(
+        filetest::assert_ordered(output, Vec::from_array(["first", "second", "first"])),
+    );
+    testing::assert_err(filetest::assert_ordered(output, Vec::from_array(["second", "second"])));
+    testing::assert_err(filetest::assert_ordered(output, Vec::from_array([""])));
+    testing::assert_err(filetest::assert_exact(output, "first different\n"));
+}

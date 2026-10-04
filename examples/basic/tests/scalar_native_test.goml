@@ -1,0 +1,169 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::regalloc;
+use ecosystem::goir::opt;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::testing;
+
+fn native_scalar_function(name: string, ty: ir::Type, shift: bool) -> ir::Function {
+    let operations = if shift {
+        Vec::from_array(
+            [ir::BinaryOp::ShlChecked, ir::BinaryOp::ShrUChecked, ir::BinaryOp::ShrSChecked],
+        )
+    } else {
+        Vec::from_array(
+            [ir::BinaryOp::DivS, ir::BinaryOp::RemS, ir::BinaryOp::DivU, ir::BinaryOp::RemU],
+        )
+    };
+    let outputs = Vec::new();
+    for _ in 0..operations.len() + 2 {
+        outputs.push(ty);
+    }
+    let b = testing::expect_ok(
+        ir::Builder::new(name, Vec::from_array([ty, ty]), outputs),
+        "scalar builder",
+    );
+    let p = testing::expect_ok(b.parameters(b.entry()), "parameters");
+    let values = Vec::new();
+    for op in operations {
+        values.push(testing::expect_ok(b.binary(op, p[0], p[1]), "scalar operation"));
+    }
+    values.push(p[0]);
+    values.push(p[1]);
+    testing::assert_ok(b.ret(values));
+    testing::expect_ok(b.finish(), "scalar function")
+}
+
+fn native_fold_function(name: string, ty: ir::Type) -> ir::Function {
+    let b = testing::expect_ok(
+        ir::Builder::new(name, Vec::from_array([ty, ty]), Vec::from_array([ty])),
+        "fold builder",
+    );
+    let p = testing::expect_ok(b.parameters(b.entry()), "parameters");
+    let slot = testing::expect_ok(b.stack_slot(ty), "slot");
+    testing::assert_ok(b.stack_store(slot, p[1]));
+    let loaded = testing::expect_ok(b.stack_load(slot), "load");
+    let result = testing::expect_ok(
+        if ty == ir::Type::F64 {
+            b.fbinary(ir::FloatOp::Sub, p[0], loaded)
+        } else {
+            b.binary(ir::BinaryOp::Sub, p[0], loaded)
+        },
+        "fold operation",
+    );
+    testing::assert_ok(b.ret(Vec::from_array([result])));
+    testing::expect_ok(b.finish(), "fold function")
+}
+
+#[test]
+fn native_division_checked_shifts_and_folded_loads_match_go_reference() -> () {
+    let directory = path::join(
+        "_artifact",
+        "goir-scalar-" + hash::sha256(testing::expect_ok(rand::bytes(16), "unique artifact")),
+    );
+    testing::assert_ok(fs::create_dir_all(directory));
+    let source = Vec::from_array(
+        [
+            native_scalar_function("Div64", ir::Type::I64, false),
+            native_scalar_function("Div32", ir::Type::I32, false),
+            native_scalar_function("Shift64", ir::Type::I64, true),
+            native_scalar_function("Shift32", ir::Type::I32, true),
+            native_fold_function("Fold64", ir::Type::I64),
+            native_fold_function("Fold32", ir::Type::I32),
+            native_fold_function("FoldFloat", ir::Type::F64),
+        ],
+    );
+    let simplified = Vec::new();
+    for function in source {
+        simplified.push(testing::expect_ok(opt::simplify(function), "simplify scalar"));
+    }
+    for (name, functions, stack, registers, linear) in Vec::from_array(
+        [
+            ("generated", source, false, 7, false),
+            ("baseline", source, true, 7, false),
+            ("constrained", source, false, 1, false),
+            ("spilled", source, false, 0, false),
+            ("optimized", simplified, false, 7, false),
+            ("optstack", simplified, true, 7, false),
+            ("linear", source, false, 7, true),
+        ],
+    ) {
+        let options = regalloc::Options { registers, ..regalloc::Options::standard() };
+        let output = if linear {
+            let assembly = Vec::from_array(["#include \"funcdata.h\"\n"]);
+            let declarations = Vec::from_array(["package " + name + "\n"]);
+            let context = amd64::CompilerContext::new();
+            for function in functions {
+                let compiled = testing::expect_ok(
+                    context.compile_with_algorithm(
+                        function,
+                        false,
+                        options,
+                        regalloc::Algorithm::LinearScan,
+                    ),
+                    "linear compilation",
+                ).compiled;
+                assembly.push(compiled.assembly.replace("#include \"funcdata.h\"\n", ""));
+                declarations.push(compiled.declaration);
+            }
+            amd64::Package { assembly: assembly.join("\n"), declarations: declarations.join("\n") }
+        } else {
+            testing::expect_ok(
+                if stack {
+                    amd64::emit_stack_package(name, functions)
+                } else {
+                    amd64::emit_package_with_algorithm(
+                        name,
+                        functions,
+                        options,
+                        regalloc::Algorithm::Global,
+                    )
+                },
+                "scalar package",
+            )
+        };
+        let destination = if name == "generated" {
+            directory
+        } else {
+            path::join(directory, name)
+        };
+        testing::assert_ok(fs::create_dir_all(destination));
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated.go"), output.declarations),
+        );
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated_amd64.s"), output.assembly),
+        );
+    }
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "go.mod"),
+            "module goir-scalar-test\n\ngo 1.26.0\n",
+        ),
+    );
+    let prefix = if fs::is_dir("examples/basic") {
+        "examples/basic/"
+    } else {
+        ""
+    };
+    let reference = testing::expect_ok(
+        fs::read_file_structured(prefix + "tests/data/scalar_reference_test.go"),
+        "Go reference",
+    );
+    testing::assert_ok(
+        fs::write_file_structured(path::join(directory, "scalar_test.go"), reference),
+    );
+    let _ = run_go(directory, Vec::from_array(["vet", "./..."]));
+    let output = run_go(
+        directory,
+        Vec::from_array(["test", "-count=1", "-timeout=60s", "-v", "./..."]),
+    );
+    testing::assert(output.contains("PASS"));
+    testing::assert_ok(fs::write_file_structured("_artifact/scalar-native.txt", output));
+    testing::assert_ok(fs::remove_dir_all(directory));
+}

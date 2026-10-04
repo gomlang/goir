@@ -257,6 +257,7 @@ fn typed_corpus() -> Vec[TypedCases] {
     }
     corpus.push(TypedCases { function: typed_rotation(), cases });
     corpus.extend(typed_edge_corpus());
+    corpus.extend(memory_optimizer_corpus());
     corpus
 }
 
@@ -395,7 +396,10 @@ fn native_i32_f64_stack_slots_and_float_edges_match_interpreter() -> () {
         lines.push("}");
     }
     testing::assert_ok(
-        fs::write_file_structured("_artifact/typed-phases.tsv", phases.join("\n") + "\n"),
+        fs::write_file_structured(
+            "_artifact/typed-phases.tsv",
+            (phases.join("\n") + "\n").replace("\t", char_from_u32(9).unwrap_or(' ').to_string()),
+        ),
     );
     for (name, source, stack, registers) in Vec::from_array(
         [

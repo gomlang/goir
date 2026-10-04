@@ -1,0 +1,371 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::mach;
+use ecosystem::goir::opt;
+use ecosystem::goir::reader;
+use ecosystem::goir::regalloc;
+use std::testing;
+
+fn scalar_pair(name: string, ty: ir::Type, op: ir::BinaryOp) -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(name, Vec::from_array([ty, ty]), Vec::from_array([ty])),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "args");
+    let result = testing::expect_ok(builder.binary(op, args[0], args[1]), "operation");
+    testing::assert_ok(builder.ret(Vec::from_array([result])));
+    testing::expect_ok(builder.finish(), "function")
+}
+
+#[test]
+fn division_semantics_wrap_overflow_and_report_zero_traps() -> () {
+    for ty in Vec::from_array([ir::Type::I32, ir::Type::I64]) {
+        let minimum: i64 = if ty == ir::Type::I32 {
+            -2147483648
+        } else {
+            -9223372036854775808
+        };
+        for (op, left, right, expected) in Vec::from_array(
+            [
+                (ir::BinaryOp::DivS, minimum, -1, minimum),
+                (ir::BinaryOp::RemS, minimum, -1, 0),
+                (ir::BinaryOp::DivS, -13, 5, -2),
+                (ir::BinaryOp::RemS, -13, 5, -3),
+                (ir::BinaryOp::DivU, -1, -1, 1),
+                (ir::BinaryOp::RemU, -1, -1, 0),
+            ],
+        ) {
+            let function = scalar_pair("Divide", ty, op);
+            let arguments = Vec::from_array(
+                [ir::datum_from_bits(ty, left), ir::datum_from_bits(ty, right)],
+            );
+            let result = testing::expect_ok(
+                ir::interpret(function, arguments, 100),
+                "interpret division",
+            );
+            testing::assert_eq(result[0].bits(), expected);
+            let optimized = testing::expect_ok(opt::simplify(function), "optimize");
+            testing::assert_eq(
+                testing::expect_ok(ir::interpret(optimized, arguments, 100), "optimized division")[0].bits(),
+                expected,
+            );
+            let zero = Vec::from_array([ir::datum_from_bits(ty, left), ir::datum_from_bits(ty, 0)]);
+            testing::assert_eq(
+                testing::expect_err(ir::interpret(function, zero, 100), "zero division").kind,
+                ir::ErrorKind::ArithmeticTrap,
+            );
+            testing::assert_eq(
+                testing::expect_err(ir::interpret(optimized, zero, 100), "optimized zero division").kind,
+                ir::ErrorKind::ArithmeticTrap,
+            );
+            let machine = testing::expect_ok(mach::lower(function), "lower division");
+            let operands = machine.blocks()[0].instructions[0].operands();
+            testing::assert_eq(operands[0].constraint, mach::Constraint::Fixed(mach::FixedReg::AX));
+            testing::assert_eq(operands[1].constraint, mach::Constraint::Fixed(mach::FixedReg::CX));
+            for registers in Vec::from_array([0, 1, 7]) {
+                let allocation = testing::expect_ok(
+                    regalloc::allocate_with_options(
+                        machine,
+                        regalloc::Options { registers, ..regalloc::Options::standard() },
+                    ),
+                    "division allocation",
+                );
+                testing::assert_ok(regalloc::check(allocation));
+            }
+            let text = testing::expect_ok(ir::display(function), "display division");
+            let parsed = testing::expect_ok(reader::read(text), "read division");
+            testing::assert_eq(testing::expect_ok(ir::display(parsed), "redisplay"), text);
+        }
+    }
+}
+
+#[test]
+fn checked_shifts_reject_negative_counts_and_do_not_mask_large_counts() -> () {
+    for ty in Vec::from_array([ir::Type::I32, ir::Type::I64]) {
+        let width = if ty == ir::Type::I32 {
+            32
+        } else {
+            64
+        };
+        for op in Vec::from_array(
+            [ir::BinaryOp::ShlChecked, ir::BinaryOp::ShrUChecked, ir::BinaryOp::ShrSChecked],
+        ) {
+            let function = scalar_pair("Shift", ty, op);
+            for count in Vec::from_array([width, width + 1, 1000]) {
+                let arguments = Vec::from_array(
+                    [ir::datum_from_bits(ty, -1), ir::datum_from_bits(ty, count)],
+                );
+                let expected = if op == ir::BinaryOp::ShrSChecked {
+                    -1
+                } else {
+                    0
+                };
+                testing::assert_eq(
+                    testing::expect_ok(ir::interpret(function, arguments, 100), "oversized shift")[0].bits(),
+                    expected,
+                );
+            }
+            testing::assert_eq(
+                testing::expect_err(
+                    ir::interpret(
+                        function,
+                        Vec::from_array([ir::datum_from_bits(ty, 1), ir::datum_from_bits(ty, -1)]),
+                        100,
+                    ),
+                    "negative shift",
+                ).kind,
+                ir::ErrorKind::ArithmeticTrap,
+            );
+            let optimized = testing::expect_ok(opt::simplify(function), "optimize shift");
+            testing::assert_eq(
+                testing::expect_err(
+                    ir::interpret(
+                        optimized,
+                        Vec::from_array([ir::datum_from_bits(ty, 0), ir::datum_from_bits(ty, -1)]),
+                        100,
+                    ),
+                    "negative zero shift",
+                ).kind,
+                ir::ErrorKind::ArithmeticTrap,
+            );
+        }
+        let masked = scalar_pair("Masked", ty, ir::BinaryOp::Shl);
+        testing::assert_eq(
+            testing::expect_ok(
+                ir::interpret(
+                    masked,
+                    Vec::from_array([ir::datum_from_bits(ty, 1), ir::datum_from_bits(ty, width)]),
+                    100,
+                ),
+                "masked shift",
+            )[0].bits(),
+            1,
+        );
+    }
+}
+
+#[test]
+fn dead_arithmetic_traps_survive_constant_folding_and_dce() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new("DeadTrap", Vec::new(), Vec::from_array([ir::Type::I64])),
+        "builder",
+    );
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let _ = testing::expect_ok(builder.binary(ir::BinaryOp::DivS, one, zero), "unused division");
+    testing::assert_ok(builder.ret(Vec::from_array([one])));
+    let function = testing::expect_ok(builder.finish(), "function");
+    let simplified = testing::expect_ok(opt::simplify(function), "simplify");
+    testing::assert_eq(
+        testing::expect_err(ir::interpret(simplified, Vec::new(), 100), "dead trap").kind,
+        ir::ErrorKind::ArithmeticTrap,
+    );
+}
+
+#[test]
+fn target_validates_abi_cpu_features_and_register_capabilities() -> () {
+    let target = amd64::Target::standard();
+    testing::assert_ok(target.validate());
+    testing::assert_eq(
+        testing::expect_ok(target.register_pool(mach::RegClass::Integer), "integer pool")[0],
+        "BX",
+    );
+    testing::assert_eq(
+        testing::expect_ok(target.register_pool(mach::RegClass::Float), "float pool")[0],
+        "X3",
+    );
+    testing::assert_err(
+        amd64::Target {
+            calling_convention: amd64::CallingConvention::ABIInternal,
+            ..amd64::Target::standard(),
+        }.validate(),
+    );
+    testing::assert_err(
+        amd64::Target { architecture: amd64::Architecture::Arm64, ..amd64::Target::standard() }.validate(),
+    );
+    testing::assert_err(amd64::Target { go_minor: 25, ..amd64::Target::standard() }.validate());
+    testing::assert_err(
+        amd64::Target { cpu_features: Vec::new(), ..amd64::Target::standard() }.validate(),
+    );
+    testing::assert_err(
+        amd64::Target {
+            cpu_features: Vec::from_array([amd64::CpuFeature::SSE2, amd64::CpuFeature::AVX2]),
+            ..amd64::Target::standard(),
+        }.validate(),
+    );
+    testing::assert_err(
+        amd64::Target { integer_registers: 2, ..amd64::Target::standard() }.validate_options(
+            regalloc::Options::standard(),
+        ),
+    );
+}
+
+fn stack_selection(ty: ir::Type, repeated: bool) -> ir::Function {
+    let output = if repeated {
+        Vec::from_array([ty, ty])
+    } else {
+        Vec::from_array([ty])
+    };
+    let b = testing::expect_ok(
+        ir::Builder::new("FoldLoad", Vec::from_array([ty, ty]), output),
+        "builder",
+    );
+    let p = testing::expect_ok(b.parameters(b.entry()), "params");
+    let slot = testing::expect_ok(b.stack_slot(ty), "slot");
+    testing::assert_ok(b.stack_store(slot, p[1]));
+    let loaded = testing::expect_ok(b.stack_load(slot), "load");
+    let result = testing::expect_ok(
+        if ty == ir::Type::F64 {
+            b.fbinary(ir::FloatOp::Sub, p[0], loaded)
+        } else {
+            b.binary(ir::BinaryOp::Sub, p[0], loaded)
+        },
+        "subtract",
+    );
+    let values = Vec::from_array([result]);
+    if repeated {
+        values.push(loaded);
+    }
+    testing::assert_ok(b.ret(values));
+    testing::expect_ok(b.finish(), "function")
+}
+
+#[test]
+fn stack_load_selection_requires_adjacent_single_use_and_legal_operands() -> () {
+    for ty in Vec::from_array([ir::Type::I32, ir::Type::I64, ir::Type::F64]) {
+        let function = stack_selection(ty, false);
+        let machine = testing::expect_ok(mach::lower(function), "machine");
+        testing::assert_eq(machine.blocks()[0].instructions.len(), 2);
+        testing::assert(
+            match machine.blocks()[0].instructions[1] {
+                BinaryStack { .. } | FloatBinaryStack { .. } => true,
+                _ => false,
+            },
+        );
+        for registers in Vec::from_array([0, 1, 7]) {
+            testing::assert_ok(
+                amd64::emit_with_options(
+                    function,
+                    regalloc::Options { registers, ..regalloc::Options::standard() },
+                ),
+            );
+        }
+        let repeated = testing::expect_ok(mach::lower(stack_selection(ty, true)), "repeated load");
+        testing::assert_eq(repeated.blocks()[0].instructions.len(), 3);
+    }
+}
+
+#[test]
+fn safe_scalar_constants_fold_without_erasing_arithmetic_traps() -> () {
+    for ty in Vec::from_array([ir::Type::I32, ir::Type::I64]) {
+        let minimum: i64 = if ty == ir::Type::I32 {
+            -2147483648
+        } else {
+            -9223372036854775808
+        };
+        let width = if ty == ir::Type::I32 {
+            32
+        } else {
+            64
+        };
+        for (op, a, b, expected) in Vec::from_array(
+            [
+                (ir::BinaryOp::DivS, minimum, -1, minimum),
+                (ir::BinaryOp::RemS, minimum, -1, 0),
+                (ir::BinaryOp::DivU, -1, -1, 1),
+                (ir::BinaryOp::ShlChecked, 1, width, 0),
+                (ir::BinaryOp::ShrSChecked, -1, width, -1),
+            ],
+        ) {
+            let builder = testing::expect_ok(
+                ir::Builder::new("FoldArithmetic", Vec::new(), Vec::from_array([ty])),
+                "builder",
+            );
+            let left = testing::expect_ok(
+                builder.ins(ir::Operation::Constant(ir::datum_from_bits(ty, a))),
+                "left",
+            );
+            let right = testing::expect_ok(
+                builder.ins(ir::Operation::Constant(ir::datum_from_bits(ty, b))),
+                "right",
+            );
+            let result = testing::expect_ok(builder.binary(op, left, right), "operation");
+            testing::assert_ok(builder.ret(Vec::from_array([result])));
+            let function = testing::expect_ok(builder.finish(), "function");
+            let optimized = testing::expect_ok(opt::simplify(function), "fold arithmetic");
+            testing::assert_eq(optimized.blocks()[0].instructions.len(), 1);
+            testing::assert_eq(
+                testing::expect_ok(ir::interpret(optimized, Vec::new(), 100), "folded interpreter")[0].bits(),
+                expected,
+            );
+        }
+    }
+}
+
+#[test]
+fn compilation_context_reuses_cfg_analysis_and_invalidates_transformed_functions() -> () {
+    let source = scalar_pair("CachedScalar", ir::Type::I64, ir::BinaryOp::Add);
+    let context = amd64::CompilerContext::new();
+    let first = testing::expect_ok(
+        context.compile_with_options(source, false, regalloc::Options::standard()),
+        "first compile",
+    );
+    let second = testing::expect_ok(
+        context.compile_with_options(source, false, regalloc::Options::standard()),
+        "cached compile",
+    );
+    testing::assert_eq(first.compiled.assembly, second.compiled.assembly);
+    testing::assert_eq(context.analysis_statistics().builds, 1);
+    testing::assert_eq(context.analysis_statistics().cache_hits, 1);
+    let transformed = testing::expect_ok(opt::simplify(source), "transform");
+    testing::expect_ok(
+        context.compile_with_options(transformed, false, regalloc::Options::standard()),
+        "transformed compile",
+    );
+    testing::assert_eq(context.analysis_statistics().builds, 2);
+    testing::assert_eq(context.analysis_statistics().invalidations, 1);
+    context.clear_analysis();
+    testing::assert_eq(context.analysis_statistics().invalidations, 2);
+    testing::assert_eq(context.completed_functions(), 3);
+    testing::assert_ok(regalloc::check(first.allocation));
+    testing::assert(first.timings.analysis_ns >= 0);
+}
+
+#[test]
+fn stack_load_selection_does_not_move_reads_across_stores() -> () {
+    let b = testing::expect_ok(
+        ir::Builder::new(
+            "LoadBarrier",
+            Vec::from_array([ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let input = testing::expect_ok(b.parameters(b.entry()), "input")[0];
+    let slot = testing::expect_ok(b.stack_slot(ir::Type::I64), "slot");
+    let loaded = testing::expect_ok(b.stack_load(slot), "zero initialized load");
+    testing::assert_ok(b.stack_store(slot, input));
+    let result = testing::expect_ok(
+        b.binary(ir::BinaryOp::Sub, input, loaded),
+        "subtract previous load",
+    );
+    testing::assert_ok(b.ret(Vec::from_array([result])));
+    let function = testing::expect_ok(b.finish(), "function");
+    let machine = testing::expect_ok(mach::lower(function), "lower");
+    testing::assert_eq(machine.blocks()[0].instructions.len(), 3);
+    testing::assert(
+        match machine.blocks()[0].instructions[2] {
+            Binary { .. } => true,
+            _ => false,
+        },
+    );
+    testing::assert_eq(
+        testing::expect_ok(
+            ir::interpret(function, Vec::from_array([ir::Datum::I64(17)]), 100),
+            "load barrier",
+        )[0].bits(),
+        17,
+    );
+}

@@ -590,7 +590,12 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
             );
         }
     }
-    testing::assert_ok(fs::write_file_structured("_artifact/codegen.tsv", report.join("\n") + "\n"));
+    testing::assert_ok(
+        fs::write_file_structured(
+            "_artifact/codegen.tsv",
+            (report.join("\n") + "\n").replace("\t", char_from_u32(9).unwrap_or(' ').to_string()),
+        ),
+    );
     let output = testing::expect_ok(amd64::emit_package("generated", functions), "native output");
     testing::assert_ok(
         fs::write_file_structured(
@@ -651,7 +656,10 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
     }
     testing::assert(encoded.len() > 1);
     testing::assert_ok(
-        fs::write_file_structured("_artifact/encoded-code.tsv", encoded.join("\n") + "\n"),
+        fs::write_file_structured(
+            "_artifact/encoded-code.tsv",
+            (encoded.join("\n") + "\n").replace("\t", char_from_u32(9).unwrap_or(' ').to_string()),
+        ),
     );
     if env::var_structured("GOIR_BENCHMARK").unwrap_or("") == "1" {
         let benchmark = run_go(

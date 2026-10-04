@@ -1,0 +1,288 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::filetest;
+use ecosystem::goir::fuzz;
+use ecosystem::goir::opt;
+use ecosystem::goir::reader;
+use ecosystem::goir::regalloc;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::testing;
+use std::time;
+
+struct FuzzBackend {
+    name: string,
+    optimize: bool,
+    stack: bool,
+    registers: isize,
+    algorithm: regalloc::Algorithm,
+}
+
+fn fuzz_backends() -> Vec[FuzzBackend] {
+    let output = Vec::new();
+    for algorithm in Vec::from_array([regalloc::Algorithm::Global, regalloc::Algorithm::LinearScan]) {
+        for registers in Vec::from_array([0, 1, 7]) {
+            output.push(
+                FuzzBackend {
+                    name: algorithm.debug() + f"{registers}",
+                    optimize: false,
+                    stack: false,
+                    registers,
+                    algorithm,
+                },
+            );
+        }
+    }
+    output.push(
+        FuzzBackend {
+            name: "optimized",
+            optimize: true,
+            stack: false,
+            registers: 7,
+            algorithm: regalloc::Algorithm::Global,
+        },
+    );
+    output.push(
+        FuzzBackend {
+            name: "optspilled",
+            optimize: true,
+            stack: false,
+            registers: 0,
+            algorithm: regalloc::Algorithm::Global,
+        },
+    );
+    output.push(
+        FuzzBackend {
+            name: "stack",
+            optimize: false,
+            stack: true,
+            registers: 0,
+            algorithm: regalloc::Algorithm::LinearScan,
+        },
+    );
+    output
+}
+
+fn fuzz_emit(source: ir::Module, name: string, backend: FuzzBackend) -> Result[
+    amd64::Package,
+    ir::Error,
+] {
+    let mut module = source;
+    if backend.optimize {
+        for target in module.references() {
+            if let Some(function) = module.function(target)? {
+                module = module.with_function(target, opt::simplify(function)?)?;
+            }
+        }
+    }
+    if backend.stack {
+        amd64::emit_stack_module(name, module)
+    } else {
+        amd64::emit_module_with_algorithm(
+            name,
+            module,
+            regalloc::Options { registers: backend.registers, ..regalloc::Options::standard() },
+            backend.algorithm,
+        )
+    }
+}
+
+fn fuzz_reduce_failure(
+    directory: string,
+    case: fuzz::Case,
+    backend: FuzzBackend,
+    arguments: Vec[ir::Datum],
+) -> () {
+    let destination = path::join(directory, "reduced");
+    testing::assert_ok(fs::create_dir_all(destination));
+    let started = time::Instant::now();
+    let predicate = |candidate: ir::Module| {
+        if started.elapsed().as_nanoseconds() > 30000000000 {
+            Result::Err(
+                ir::error(ir::ErrorKind::LimitExceeded, "fuzz reduction exceeded 30 seconds"),
+            )
+        } else {
+            let output = fuzz_emit(candidate, "reproduce", backend)?;
+            reproduce_module_emitted(destination, candidate, case.entry, arguments, "", output)
+        }
+    };
+    let report = match filetest::reduce_module(case.module, 24, predicate) {
+        Ok(reduced) => {
+            testing::assert_ok(
+                fs::write_file_structured(
+                    path::join(destination, "module.goir"),
+                    testing::expect_ok(reader::display_module(reduced.module), "reduced module"),
+                ),
+            );
+            f"attempts={reduced.attempts}\naccepted={reduced.accepted}\n"
+        },
+        Err(error) => error.debug(),
+    };
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(destination, "reduction.txt"),
+            "backend=" + backend.name + "\n" + report,
+        ),
+    );
+}
+
+#[test]
+fn native_seeded_modules_match_all_allocators_and_reduce_failures() -> () {
+    let directory = path::join(
+        "_artifact",
+        "goir-fuzz-" + hash::sha256(testing::expect_ok(rand::bytes(16), "unique fuzz directory")),
+    );
+    testing::assert_ok(fs::create_dir_all(directory));
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "go.mod"),
+            "module goir-fuzz-test\n\ngo 1.26.0\n",
+        ),
+    );
+    let backends = fuzz_backends();
+    let lines = Vec::from_array(
+        [
+            "package generated",
+            "import (\"testing\"; \"math\"; b0 \"goir-fuzz-test/b0\"; b1 \"goir-fuzz-test/b1\"; b2 \"goir-fuzz-test/b2\"; b3 \"goir-fuzz-test/b3\"; b4 \"goir-fuzz-test/b4\"; b5 \"goir-fuzz-test/b5\"; b6 \"goir-fuzz-test/b6\"; b7 \"goir-fuzz-test/b7\"; b8 \"goir-fuzz-test/b8\")",
+            "var _ = math.Float64bits",
+        ],
+    );
+    let cases = Vec::new();
+    let report = Vec::from_array(["seed\tfunctions\tcases\tbackends\tstatus"]);
+    for seed_index in 0..25 {
+        let seed = if seed_index == 24 {
+            18446744073709551615
+        } else {
+            seed_index.to_u64()
+        };
+        let case = testing::expect_ok(fuzz::generate(seed), "generate seeded module");
+        cases.push(case);
+        let reproducer = path::join(directory, f"seed-{seed}");
+        testing::assert_ok(fs::create_dir_all(reproducer));
+        testing::assert_ok(
+            fs::write_file_structured(
+                path::join(reproducer, "module.goir"),
+                testing::expect_ok(reader::display_module(case.module), "save seeded source"),
+            ),
+        );
+        testing::assert_ok(
+            fs::write_file_structured(path::join(reproducer, "case.txt"), fuzz::manifest(case)),
+        );
+        let inputs = fuzz::inputs(case);
+        let all_inputs = Vec::new();
+        for arguments in inputs {
+            let values = Vec::new();
+            for value in arguments {
+                values.push(
+                    match value {
+                        I64(value) => f"i64:{value}",
+                        I32(value) => f"i32:{value}",
+                        F64(value) => f"f64bits:{float64_to_bits(value)}",
+                        Bool(value) => f"bool:{value}",
+                    },
+                );
+            }
+            all_inputs.push(values.join(" "));
+        }
+        testing::assert_ok(
+            fs::write_file_structured(
+                path::join(reproducer, "inputs.txt"),
+                all_inputs.join("\n") + "\n",
+            ),
+        );
+        lines.push(f"func TestFuzz{seed}(t *testing.T) {{");
+        for index in 0..inputs.len() {
+            let arguments = inputs[index];
+            let expected = testing::expect_ok(
+                ir::interpret_module(case.module, case.entry, arguments, case.fuel),
+                "seeded reference",
+            );
+            let arguments_text = Vec::new();
+            for value in arguments {
+                arguments_text.push(literal(value));
+            }
+            for variant in 0..backends.len() {
+                lines.push("{");
+                lines.push(
+                    f"got0, got1 := b{variant}." + case.entry.name() + "("
+                        + arguments_text.join(", ")
+                        + ")",
+                );
+                for position in 0..expected.len() {
+                    lines.push(
+                        "if " + result_mismatch(f"got{position}", expected[position])
+                            + f" {{ t.Fatalf(\"seed {seed} case {index} backend {variant} result {position}: %v\", got{position}) }}",
+                    );
+                }
+                lines.push("}");
+            }
+        }
+        lines.push("}");
+        for variant in 0..backends.len() {
+            let destination = path::join(directory, f"b{variant}");
+            testing::assert_ok(fs::create_dir_all(destination));
+            let output = testing::expect_ok(
+                fuzz_emit(case.module, "generated", backends[variant]),
+                "compile seeded module",
+            );
+            testing::assert_ok(
+                fs::write_file_structured(
+                    path::join(destination, f"seed{seed}.go"),
+                    output.declarations,
+                ),
+            );
+            testing::assert_ok(
+                fs::write_file_structured(
+                    path::join(destination, f"seed{seed}_amd64.s"),
+                    output.assembly,
+                ),
+            );
+        }
+        report.push(f"{seed}\t2\t{inputs.len()}\t{backends.len()}\tpass");
+    }
+    testing::assert_ok(
+        fs::write_file_structured(path::join(directory, "fuzz_test.go"), lines.join("\n") + "\n"),
+    );
+    let result = go_result(
+        directory,
+        Vec::from_array(["test", "-v", "-count=1", "-timeout=90s", "./..."]),
+        120,
+    );
+    if !result.success {
+        testing::assert_ok(
+            fs::write_file_structured(path::join(directory, "failure.txt"), result.output),
+        );
+        for case in cases {
+            let inputs = fuzz::inputs(case);
+            for index in 0..inputs.len() {
+                for variant in 0..backends.len() {
+                    if result.output.contains(
+                        f"seed {case.seed} case {index} backend {variant} result ",
+                    ) {
+                        fuzz_reduce_failure(directory, case, backends[variant], inputs[index]);
+                        testing::fail(
+                            "native seeded mismatch; reproducer and reduction in " + directory
+                                + "\n"
+                                + result.output,
+                        );
+                    }
+                }
+            }
+        }
+        testing::fail(
+            "seeded Go build or execution failed; source retained in " + directory + "\n"
+                + result.output,
+        );
+    }
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join("_artifact", "seeded-fuzz.tsv"),
+            (report.join("\n") + "\n").replace("\t", char_from_u32(9).unwrap_or(' ').to_string()),
+        ),
+    );
+    testing::assert_ok(fs::remove_dir_all(directory));
+}

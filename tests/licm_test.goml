@@ -1,0 +1,235 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use std::testing;
+
+fn invariant_loop(op: ir::BinaryOp) -> ir::Function {
+    invariant_loop_with_limits(op, ir::Limits::standard())
+}
+
+fn invariant_loop_with_limits(op: ir::BinaryOp, limits: ir::Limits) -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::with_limits(
+            "InvariantLoop",
+            Vec::from_array([ir::Type::Bool, ir::Type::I64, ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+            limits,
+        ),
+        "builder",
+    );
+    let inputs = testing::expect_ok(builder.parameters(builder.entry()), "inputs");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let yes = testing::expect_ok(builder.append_block(Vec::new()), "yes");
+    let no = testing::expect_ok(builder.append_block(Vec::new()), "no");
+    let header = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64])),
+        "header",
+    );
+    let body = testing::expect_ok(builder.append_block(Vec::new()), "body");
+    let exit = testing::expect_ok(builder.append_block(Vec::new()), "exit");
+    testing::assert_ok(
+        builder.branch(
+            inputs[0],
+            ir::Edge { target: yes, arguments: Vec::new() },
+            ir::Edge { target: no, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(yes));
+    testing::assert_ok(builder.jump(header, Vec::from_array([inputs[1], zero])));
+    testing::assert_ok(builder.switch_to(no));
+    testing::assert_ok(builder.jump(header, Vec::from_array([zero, zero])));
+    testing::assert_ok(builder.switch_to(header));
+    let parameters = testing::expect_ok(builder.parameters(header), "parameters");
+    let condition = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, zero, parameters[0]),
+        "condition",
+    );
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: body, arguments: Vec::new() },
+            ir::Edge { target: exit, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(body));
+    let invariant = testing::expect_ok(builder.binary(op, inputs[2], inputs[3]), "invariant");
+    let accumulated = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, parameters[1], invariant),
+        "accumulated",
+    );
+    let remaining = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Sub, parameters[0], one),
+        "remaining",
+    );
+    testing::assert_ok(builder.jump(header, Vec::from_array([remaining, accumulated])));
+    testing::assert_ok(builder.switch_to(exit));
+    testing::assert_ok(builder.ret(Vec::from_array([parameters[1]])));
+    testing::expect_ok(builder.finish(), "function")
+}
+
+#[test]
+fn licm_preserves_valid_functions_when_preheaders_exceed_growth_limits() -> () {
+    let standard = invariant_loop(ir::BinaryOp::Mul);
+    let mut limits = ir::Limits::standard();
+    limits.max_blocks = standard.blocks().len();
+    let blocks_limited = invariant_loop_with_limits(ir::BinaryOp::Mul, limits);
+    let mut limits = ir::Limits::standard();
+    limits.max_values = standard.value_count();
+    let values_limited = invariant_loop_with_limits(ir::BinaryOp::Mul, limits);
+    let input = Vec::from_array(
+        [ir::Datum::Bool(true), ir::Datum::I64(4), ir::Datum::I64(7), ir::Datum::I64(3)],
+    );
+    let expected = testing::expect_ok(ir::interpret(standard, input, 1000), "standard");
+    for source in Vec::from_array([blocks_limited, values_limited]) {
+        let optimized = testing::expect_ok(opt::simplify(source), "growth fallback");
+        testing::assert_eq(optimized.blocks().len(), standard.blocks().len());
+        testing::assert(
+            testing::expect_ok(ir::interpret(optimized, input, 1000), "result") == expected,
+        );
+    }
+}
+
+#[test]
+fn licm_creates_natural_loop_preheaders_and_moves_only_invariant_values() -> () {
+    let source = invariant_loop(ir::BinaryOp::Mul);
+    let source_text = testing::expect_ok(ir::display(source), "source");
+    let optimized = testing::expect_ok(opt::simplify(source), "optimize");
+    testing::assert_eq(optimized.blocks().len(), source.blocks().len() + 1);
+    let mut multiplication_blocks = Vec::new();
+    for block in optimized.blocks() {
+        for instruction in block.instructions {
+            if let Binary(ir::BinaryOp::Mul, _, _) = instruction.operation {
+                multiplication_blocks.push(block.id.index());
+            }
+        }
+    }
+    testing::assert(multiplication_blocks == Vec::from_array([6]));
+    for condition in Vec::from_array([false, true]) {
+        for count in Vec::from_array([-1, 0, 1, 3, 10]) {
+            for (left, right) in Vec::from_array([(0, 0), (-1, 7), (9223372036854775807, 2)]) {
+                let input = Vec::from_array(
+                    [
+                        ir::Datum::Bool(condition),
+                        ir::Datum::I64(count),
+                        ir::Datum::I64(left),
+                        ir::Datum::I64(right),
+                    ],
+                );
+                testing::assert(
+                    testing::expect_ok(ir::interpret(source, input, 10000), "source result")
+                        == testing::expect_ok(
+                            ir::interpret(optimized, input, 10000),
+                            "optimized result",
+                        ),
+                );
+            }
+        }
+    }
+    testing::assert_eq(testing::expect_ok(ir::display(source), "source unchanged"), source_text);
+    testing::assert_eq(
+        testing::expect_ok(ir::display(optimized), "optimized text"),
+        testing::expect_ok(
+            ir::display(testing::expect_ok(opt::simplify(optimized), "repeat")),
+            "repeat text",
+        ),
+    );
+}
+
+#[test]
+fn licm_keeps_trapping_division_inside_guarded_loop_body() -> () {
+    let source = invariant_loop(ir::BinaryOp::DivS);
+    let optimized = testing::expect_ok(opt::simplify(source), "optimize");
+    testing::assert_eq(optimized.blocks().len(), source.blocks().len());
+    let mut found = false;
+    for instruction in optimized.blocks()[4].instructions {
+        if let Binary(ir::BinaryOp::DivS, _, _) = instruction.operation {
+            found = true;
+        }
+    }
+    testing::assert(found);
+    for (condition, count) in Vec::from_array([(false, 3), (true, 0), (true, -1)]) {
+        let input = Vec::from_array(
+            [
+                ir::Datum::Bool(condition),
+                ir::Datum::I64(count),
+                ir::Datum::I64(7),
+                ir::Datum::I64(0),
+            ],
+        );
+        for function in Vec::from_array([source, optimized]) {
+            testing::assert(
+                testing::expect_ok(ir::interpret(function, input, 1000), "guarded zero")
+                    == Vec::from_array([ir::Datum::I64(0)]),
+            );
+        }
+    }
+    for function in Vec::from_array([source, optimized]) {
+        testing::assert_eq(
+            testing::expect_err(
+                ir::interpret(
+                    function,
+                    Vec::from_array(
+                        [
+                            ir::Datum::Bool(true),
+                            ir::Datum::I64(1),
+                            ir::Datum::I64(7),
+                            ir::Datum::I64(0),
+                        ],
+                    ),
+                    1000,
+                ),
+                "division trap",
+            ).kind,
+            ir::ErrorKind::ArithmeticTrap,
+        );
+    }
+}
+
+#[test]
+fn optimizer_keeps_unused_trapping_operations_and_loop_divergence() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "UnusedTrap",
+            Vec::from_array([ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let input = testing::expect_ok(builder.parameters(builder.entry()), "input")[0];
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let _ = testing::expect_ok(
+        builder.binary(ir::BinaryOp::DivS, one, input),
+        "unused trapping result",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([one])));
+    let optimized = testing::expect_ok(
+        opt::simplify(testing::expect_ok(builder.finish(), "finish")),
+        "optimize",
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            ir::interpret(optimized, Vec::from_array([ir::Datum::I64(0)]), 100),
+            "retained trap",
+        ).kind,
+        ir::ErrorKind::ArithmeticTrap,
+    );
+    let builder = testing::expect_ok(
+        ir::Builder::new("Divergence", Vec::new(), Vec::new()),
+        "loop builder",
+    );
+    let loop_block = testing::expect_ok(builder.append_block(Vec::new()), "loop");
+    testing::assert_ok(builder.jump(loop_block, Vec::new()));
+    testing::assert_ok(builder.switch_to(loop_block));
+    testing::assert_ok(builder.jump(loop_block, Vec::new()));
+    let source = testing::expect_ok(builder.finish(), "divergent source");
+    for function in Vec::from_array(
+        [source, testing::expect_ok(opt::simplify(source), "divergent optimized")],
+    ) {
+        testing::assert_eq(
+            testing::expect_err(ir::interpret(function, Vec::new(), 50), "divergence retained").kind,
+            ir::ErrorKind::FuelExhausted,
+        );
+    }
+}

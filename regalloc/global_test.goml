@@ -1,0 +1,187 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+use std::testing;
+
+fn pressure_function(name: string, ty: ir::Type) -> ir::Function {
+    let types = Vec::new();
+    for _ in 0..10 {
+        types.push(ty);
+    }
+    types.push(ir::Type::I64);
+    types.push(ir::Type::Bool);
+    let b = testing::expect_ok(
+        ir::Builder::new(name, types, Vec::from_array([ty])),
+        "pressure builder",
+    );
+    let args = testing::expect_ok(b.parameters(b.entry()), "inputs");
+    let header = testing::expect_ok(b.append_block(Vec::from_array([ir::Type::I64, ty])), "header");
+    let body = testing::expect_ok(b.append_block(Vec::new()), "body");
+    let after = testing::expect_ok(b.append_block(Vec::new()), "after");
+    let cold = testing::expect_ok(b.append_block(Vec::new()), "cold");
+    let done = testing::expect_ok(b.append_block(Vec::from_array([ty])), "done");
+    let zero = testing::expect_ok(b.iconst(0), "zero");
+    let one = testing::expect_ok(b.iconst(1), "one");
+    let initial = testing::expect_ok(
+        if ty == ir::Type::F64 {
+            b.fconst(0.0)
+        } else {
+            b.iconst(0)
+        },
+        "initial",
+    );
+    testing::assert_ok(b.jump(header, Vec::from_array([args[10], initial])));
+    testing::assert_ok(b.switch_to(header));
+    let values = testing::expect_ok(b.parameters(header), "loop values");
+    let more = testing::expect_ok(b.icmp(ir::IntCC::SignedLess, zero, values[0]), "loop test");
+    testing::assert_ok(
+        b.branch(
+            more,
+            ir::Edge { target: body, arguments: Vec::new() },
+            ir::Edge { target: after, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(b.switch_to(body));
+    let mut sum = values[1];
+    for _ in 0..24 {
+        sum = testing::expect_ok(
+            if ty == ir::Type::F64 {
+                b.fbinary(ir::FloatOp::Add, sum, args[9])
+            } else {
+                b.binary(ir::BinaryOp::Add, sum, args[9])
+            },
+            "hot operation",
+        );
+    }
+    let remaining = testing::expect_ok(b.binary(ir::BinaryOp::Sub, values[0], one), "remaining");
+    testing::assert_ok(b.jump(header, Vec::from_array([remaining, sum])));
+    testing::assert_ok(b.switch_to(after));
+    testing::assert_ok(
+        b.branch(
+            args[11],
+            ir::Edge { target: cold, arguments: Vec::new() },
+            ir::Edge { target: done, arguments: Vec::from_array([values[1]]) },
+        ),
+    );
+    testing::assert_ok(b.switch_to(cold));
+    let mut sum = values[1];
+    for _ in 0..4 {
+        for index in 0..9 {
+            sum = testing::expect_ok(
+                if ty == ir::Type::F64 {
+                    b.fbinary(ir::FloatOp::Add, sum, args[index])
+                } else {
+                    b.binary(ir::BinaryOp::Add, sum, args[index])
+                },
+                "cold operation",
+            );
+        }
+    }
+    sum = testing::expect_ok(
+        if ty == ir::Type::F64 {
+            b.fbinary(ir::FloatOp::Add, sum, args[9])
+        } else {
+            b.binary(ir::BinaryOp::Add, sum, args[9])
+        },
+        "cold use of hot invariant",
+    );
+    testing::assert_ok(b.jump(done, Vec::from_array([sum])));
+    testing::assert_ok(b.switch_to(done));
+    testing::assert_ok(b.ret(testing::expect_ok(b.parameters(done), "return")));
+    testing::expect_ok(b.finish(), "pressure function")
+}
+
+#[test]
+fn global_priority_eviction_and_cfg_splitting_reduce_hot_loop_spills() -> () {
+    for ty in Vec::from_array([ir::Type::I64, ir::Type::F64]) {
+        let machine = testing::expect_ok(mach::lower(pressure_function("Priority", ty)), "lower");
+        let baseline = testing::expect_ok(
+            allocate_with_algorithm(machine, Options::standard(), Algorithm::LinearScan),
+            "baseline",
+        );
+        let improved = testing::expect_ok(
+            allocate_with_algorithm(machine, Options::standard(), Algorithm::Global),
+            "global",
+        );
+        let before = baseline.statistics();
+        let after = improved.statistics();
+        testing::assert(after.global_evictions > 0);
+        testing::assert(after.split_values > 0);
+        testing::assert(after.regional_evictions > 0);
+        let hot = machine.blocks()[0].parameters[9];
+        testing::assert(
+            match testing::expect_ok(improved.entry_location(1, hot), "hot loop home") {
+                Register(_) => true,
+                _ => false,
+            },
+        );
+        testing::assert(
+            match testing::expect_ok(improved.entry_location(4, hot), "cold branch home") {
+                Stack(_) => true,
+                _ => false,
+            },
+        );
+        testing::assert(
+            after.weighted_spill_loads + after.weighted_spill_stores
+                < before.weighted_spill_loads + before.weighted_spill_stores,
+        );
+        testing::assert_ok(check(improved));
+        testing::assert_eq(improved.algorithm(), Algorithm::Global);
+        let snapshot = testing::expect_ok(improved.block_locations(4), "cold placements");
+        let count = snapshot.len();
+        snapshot.clear();
+        testing::assert_eq(
+            testing::expect_ok(improved.block_locations(4), "isolated placements").len(),
+            count,
+        );
+        for registers in Vec::from_array([0, 1]) {
+            testing::assert_ok(
+                allocate_with_algorithm(
+                    machine,
+                    Options { registers, ..Options::standard() },
+                    Algorithm::Global,
+                ),
+            );
+        }
+    }
+}
+
+#[test]
+fn split_edge_checker_rejects_missing_transfer_and_wrong_target_home() -> () {
+    let machine = testing::expect_ok(
+        mach::lower(pressure_function("CorruptSplit", ir::Type::F64)),
+        "lower",
+    );
+    let allocation = testing::expect_ok(
+        allocate_with_algorithm(machine, Options::standard(), Algorithm::Global),
+        "allocate",
+    );
+    let mut changed = false;
+    for block in allocation.plan {
+        for edge in block.edges {
+            if !edge.edits.is_empty() {
+                let original = copy_vec(edge.edits);
+                edge.edits.clear();
+                if check(allocation).is_err() {
+                    changed = true;
+                    edge.edits.extend(original);
+                    break;
+                }
+                edge.edits.extend(original);
+            }
+        }
+        if changed {
+            break;
+        }
+    }
+    testing::assert(changed);
+    testing::assert_ok(check(allocation));
+    let entry = allocation.placements[1];
+    let original = entry[0];
+    entry[0] = Placement { reg: original.reg, location: Location::Fixed(mach::FixedReg::AX) };
+    testing::assert_err(check(allocation));
+    entry[0] = original;
+    testing::assert_ok(check(allocation));
+    testing::assert_err(allocation.entry_location(-1, machine.blocks()[0].parameters[0]));
+}
