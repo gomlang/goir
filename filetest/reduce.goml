@@ -22,6 +22,8 @@ fn candidate(source: ir::Function, block: isize, instruction: isize, remove: boo
         } else if !remove {
             let value = match source.value_type(item.results[0])? {
                 I64 => ir::Datum::I64(0),
+                I32 => ir::Datum::I32(0),
+                F64 => ir::Datum::F64(0.0),
                 Bool => ir::Datum::Bool(false),
             };
             instructions.push(
@@ -74,7 +76,7 @@ pub fn reduce(
                     }
                     if !remove {
                         match instruction.operation {
-                            Constant(ir::Datum::I64(0)) | Constant(ir::Datum::Bool(false)) => continue,
+                            Constant(ir::Datum::I64(0)) | Constant(ir::Datum::I32(0)) | Constant(ir::Datum::Bool(false)) => continue,
                             _ => (),
                         };
                     }

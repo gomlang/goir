@@ -3,6 +3,8 @@ package goir;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Type {
     I64,
+    I32,
+    F64,
     Bool,
 }
 
@@ -27,6 +29,55 @@ pub enum IntCC {
     SignedLessEqual,
     UnsignedLess,
     UnsignedLessEqual,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FloatOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FloatCC {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum IntConversion {
+    SignExtend,
+    ZeroExtend,
+    Truncate,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Effects {
+    pub reads_memory: bool,
+    pub writes_memory: bool,
+    pub may_trap: bool,
+    pub call: bool,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub struct StackSlot {
+    slot: isize,
+    owner: Ref[()],
+}
+
+impl StackSlot {
+    pub fn index(self: StackSlot) -> isize {
+        self.slot
+    }
+}
+
+impl Debug for StackSlot {
+    fn debug(self: StackSlot) -> string {
+        f"slot{self.slot}"
+    }
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -95,9 +146,11 @@ pub fn error(kind: ErrorKind, message: string) -> Error {
     Error { kind, message }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Datum {
     I64(i64),
+    I32(i32),
+    F64(f64),
     Bool(bool),
 }
 
@@ -105,6 +158,8 @@ impl Datum {
     pub fn value_type(self: Datum) -> Type {
         match self {
             I64(_) => Type::I64,
+            I32(_) => Type::I32,
+            F64(_) => Type::F64,
             Bool(_) => Type::Bool,
         }
     }
@@ -115,6 +170,11 @@ pub enum Operation {
     Binary(BinaryOp, Value, Value),
     Compare(IntCC, Value, Value),
     Select(Value, Value, Value),
+    FloatBinary(FloatOp, Value, Value),
+    FloatCompare(FloatCC, Value, Value),
+    Convert(IntConversion, Value),
+    StackLoad(StackSlot),
+    StackStore(StackSlot, Value),
     Call(FuncRef, Vec[Value]),
 }
 
@@ -175,6 +235,7 @@ pub struct Function {
     outputs: Vec[Type],
     body: Vec[BlockData],
     values: Vec[ValueData],
+    slots: Vec[Type],
     limits: Limits,
 }
 
@@ -238,6 +299,19 @@ impl Function {
         copy_vec(self.outputs)
     }
 
+    pub fn stack_slots(self: Function) -> Vec[StackSlot] {
+        let output = Vec::new();
+        for index in 0..self.slots.len() {
+            output.push(StackSlot { slot: index, owner: self.identity });
+        }
+        output
+    }
+
+    pub fn stack_slot_type(self: Function, slot: StackSlot) -> Result[Type, Error] {
+        check_stack_slot(self, slot)?;
+        Result::Ok(self.slots[slot.slot])
+    }
+
     pub fn value_count(self: Function) -> isize {
         self.values.len()
     }
@@ -278,8 +352,11 @@ fn check_block(function: Function, block: Block) -> Result[(), Error] {
 
 pub fn operands(operation: Operation) -> Vec[Value] {
     match operation {
-        Constant(_) => Vec::new(),
-        Binary(_, left, right) | Compare(_, left, right) => Vec::from_array([left, right]),
+        Constant(_) | StackLoad(_) => Vec::new(),
+        Convert(_, value) | StackStore(_, value) => Vec::from_array([value]),
+        Binary(_, left, right) | Compare(_, left, right) | FloatBinary(_, left, right) | FloatCompare(_, left, right) => Vec::from_array(
+            [left, right],
+        ),
         Select(condition, yes, no) => Vec::from_array([condition, yes, no]),
         Call(_, arguments) => copy_vec(arguments),
     }
@@ -304,13 +381,11 @@ fn operation_types(function: Function, operation: Operation) -> Result[Vec[Type]
     match operation {
         Constant(value) => Result::Ok(Vec::from_array([value.value_type()])),
         Binary(_, left, right) => {
-            require_type(function, left, Type::I64)?;
-            require_type(function, right, Type::I64)?;
-            Result::Ok(Vec::from_array([Type::I64]))
+            let ty = require_integer_pair(function, left, right)?;
+            Result::Ok(Vec::from_array([ty]))
         },
         Compare(_, left, right) => {
-            require_type(function, left, Type::I64)?;
-            require_type(function, right, Type::I64)?;
+            let _ = require_integer_pair(function, left, right)?;
             Result::Ok(Vec::from_array([Type::Bool]))
         },
         Select(condition, yes, no) => {
@@ -318,6 +393,28 @@ fn operation_types(function: Function, operation: Operation) -> Result[Vec[Type]
             let ty = function.value_type(yes)?;
             require_type(function, no, ty)?;
             Result::Ok(Vec::from_array([ty]))
+        },
+        FloatBinary(_, left, right) | FloatCompare(_, left, right) => {
+            require_type(function, left, Type::F64)?;
+            require_type(function, right, Type::F64)?;
+            let ty = match operation {
+                FloatBinary(_, _, _) => Type::F64,
+                _ => Type::Bool,
+            };
+            Result::Ok(Vec::from_array([ty]))
+        },
+        Convert(conversion, value) => {
+            let (input, output) = match conversion {
+                SignExtend | ZeroExtend => (Type::I32, Type::I64),
+                Truncate => (Type::I64, Type::I32),
+            };
+            require_type(function, value, input)?;
+            Result::Ok(Vec::from_array([output]))
+        },
+        StackLoad(slot) => Result::Ok(Vec::from_array([function.stack_slot_type(slot)?])),
+        StackStore(slot, value) => {
+            require_type(function, value, function.stack_slot_type(slot)?)?;
+            Result::Ok(Vec::new())
         },
         Call(target, arguments) => {
             let owner = function.module_identity.ok_or(
@@ -343,12 +440,55 @@ fn operation_types(function: Function, operation: Operation) -> Result[Vec[Type]
 }
 
 impl Operation {
-    pub fn has_effects(self: Operation) -> bool {
+    pub fn effects(self: Operation) -> Effects {
         match self {
-            Call(_, _) => true,
-            _ => false,
+            StackLoad(_) => Effects {
+                reads_memory: true,
+                writes_memory: false,
+                may_trap: false,
+                call: false,
+            },
+            StackStore(_, _) => Effects {
+                reads_memory: false,
+                writes_memory: true,
+                may_trap: false,
+                call: false,
+            },
+            Call(_, _) => Effects {
+                reads_memory: true,
+                writes_memory: true,
+                may_trap: true,
+                call: true,
+            },
+            _ => Effects { reads_memory: false, writes_memory: false, may_trap: false, call: false },
         }
     }
+
+    pub fn has_effects(self: Operation) -> bool {
+        let effects = self.effects();
+        effects.reads_memory || effects.writes_memory || effects.may_trap || effects.call
+    }
+}
+
+fn require_integer_pair(function: Function, left: Value, right: Value) -> Result[Type, Error] {
+    let ty = function.value_type(left)?;
+    if ty != Type::I64 && ty != Type::I32 {
+        return Result::Err(error(ErrorKind::TypeMismatch, "integer operation requires I32 or I64"))
+    }
+    require_type(function, right, ty)?;
+    Result::Ok(ty)
+}
+
+fn check_stack_slot(function: Function, slot: StackSlot) -> Result[(), Error] {
+    if !ptr_eq(function.identity, slot.owner) {
+        return Result::Err(
+            error(ErrorKind::WrongFunction, "stack slot belongs to another function"),
+        )
+    }
+    if slot.slot < 0 || slot.slot >= function.slots.len() {
+        return Result::Err(error(ErrorKind::InvalidHandle, "invalid stack slot"))
+    }
+    Result::Ok(())
 }
 
 impl Debug for Operation {

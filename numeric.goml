@@ -1,0 +1,85 @@
+package goir;
+
+impl PartialEq for Datum {
+    fn eq(self: Datum, other: Datum) -> bool {
+        self.value_type() == other.value_type() && self.bits() == other.bits()
+    }
+}
+
+impl Datum {
+    pub fn bits(self: Datum) -> i64 {
+        match self {
+            I64(value) => value,
+            I32(value) => value.to_i64(),
+            F64(value) => float64_to_bits(value).to_i64(),
+            Bool(value) => if value {
+                1
+            } else {
+                0
+            },
+        }
+    }
+}
+
+pub fn datum_from_bits(ty: Type, value: i64) -> Datum {
+    match ty {
+        I64 => Datum::I64(value),
+        I32 => Datum::I32(value.to_i32()),
+        F64 => Datum::F64(float64_from_bits(value.to_u64())),
+        Bool => Datum::Bool(value != 0),
+    }
+}
+
+fn binary_i32(op: BinaryOp, left: i64, right: i64) -> i64 {
+    let a = left.to_u32();
+    let b = right.to_u32();
+    let shift = (b & 31).to_isize();
+    let value = match op {
+        Add => a + b,
+        Sub => a - b,
+        Mul => a * b,
+        And => a & b,
+        Or => a | b,
+        Xor => a ^ b,
+        Shl => a << shift,
+        ShrU => a >> shift,
+        ShrS => (a.to_i32() >> shift).to_u32(),
+    };
+    value.to_i32().to_i64()
+}
+
+fn compare_i32(cc: IntCC, left: i64, right: i64) -> bool {
+    let a = left.to_i32();
+    let b = right.to_i32();
+    match cc {
+        Equal => a == b,
+        NotEqual => a != b,
+        SignedLess => a < b,
+        SignedLessEqual => a <= b,
+        UnsignedLess => a.to_u32() < b.to_u32(),
+        UnsignedLessEqual => a.to_u32() <= b.to_u32(),
+    }
+}
+
+fn float_binary(op: FloatOp, left: i64, right: i64) -> i64 {
+    let a = float64_from_bits(left.to_u64());
+    let b = float64_from_bits(right.to_u64());
+    let value = match op {
+        Add => a + b,
+        Sub => a - b,
+        Mul => a * b,
+        Div => a / b,
+    };
+    float64_to_bits(value).to_i64()
+}
+
+fn float_compare(cc: FloatCC, left: i64, right: i64) -> bool {
+    let a = float64_from_bits(left.to_u64());
+    let b = float64_from_bits(right.to_u64());
+    match cc {
+        Equal => a == b,
+        NotEqual => a != b,
+        Less => a < b,
+        LessEqual => a <= b,
+    }
+}

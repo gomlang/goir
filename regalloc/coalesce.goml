@@ -1,0 +1,56 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+
+fn coalesce_edges(
+    function: mach::Function,
+    live: Liveness,
+    locations: Vec[Location],
+    budget: Ref[isize],
+) -> Result[(), ir::Error] {
+    let weights = loop_weights(function, budget)?;
+    let blocks = function.blocks();
+    let order = Vec::new();
+    for index in 0..blocks.len() {
+        order.push(index);
+    }
+    order.sort_by(
+        |a, b| if weights[a] == weights[b] {
+            a - b
+        } else {
+            weights[b] - weights[a]
+        },
+    );
+    for index in order {
+        for edge in blocks[index].terminator.successors() {
+            for copy in edge.copies {
+                spend(budget)?;
+                let target = locations[copy.source.index()];
+                if target == locations[copy.destination.index()] {
+                    continue;
+                }
+                match target {
+                    Register(_) => (),
+                    _ => continue,
+                }
+                if copy.source.class() != copy.destination.class() {
+                    continue;
+                }
+                let mut allowed = true;
+                for owner in 0..function.register_count() {
+                    spend(budget)?;
+                    if owner != copy.destination.index() && locations[owner] == target
+                        && interferes(live, function.register(owner)?, copy.destination, budget)? {
+                        allowed = false;
+                        break;
+                    }
+                }
+                if allowed {
+                    locations[copy.destination.index()] = target;
+                }
+            }
+        }
+    }
+    Result::Ok(())
+}

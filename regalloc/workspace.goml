@@ -1,0 +1,96 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+
+pub struct Workspace {
+    starts: Vec[isize],
+    ends: Vec[isize],
+    block_starts: Vec[isize],
+    block_ends: Vec[isize],
+    local_starts: Vec[isize],
+    local_ends: Vec[isize],
+    active: Ref[bool],
+}
+
+impl Workspace {
+    pub fn new() -> Workspace {
+        Workspace {
+            starts: Vec::new(),
+            ends: Vec::new(),
+            block_starts: Vec::new(),
+            block_ends: Vec::new(),
+            local_starts: Vec::new(),
+            local_ends: Vec::new(),
+            active: Ref::new(false),
+        }
+    }
+
+    pub fn retained_capacity(self: Workspace) -> isize {
+        vec_capacity(self.starts) + vec_capacity(self.ends) + vec_capacity(self.block_starts)
+            + vec_capacity(self.block_ends)
+            + vec_capacity(self.local_starts)
+            + vec_capacity(self.local_ends)
+    }
+}
+
+pub struct ProfiledAllocation {
+    pub allocation: Allocation,
+    pub liveness_ns: i64,
+    pub allocation_ns: i64,
+    pub checker_ns: i64,
+}
+
+fn class_registers(class: mach::RegClass, limit: isize) -> Vec[isize] {
+    let output = Vec::new();
+    let base = match class {
+        Integer => 0,
+        Float => 7,
+    };
+    for index in 0..limit {
+        output.push(base + index);
+    }
+    output
+}
+
+fn pool_size(function: mach::Function, limit: isize) -> Result[isize, ir::Error] {
+    for index in 0..function.register_count() {
+        if function.register(index)?.class() == mach::RegClass::Float {
+            return Result::Ok(7 + limit)
+        }
+    }
+    Result::Ok(limit)
+}
+
+fn valid_register(index: isize, limit: isize, pool: isize) -> bool {
+    index >= 0 && index < pool && (index < limit || (index >= 7 && index < 7 + limit))
+}
+
+fn location_class(location: Location) -> Option[mach::RegClass] {
+    match location {
+        Register(index) => Option::Some(
+            if index < 7 {
+                mach::RegClass::Integer
+            } else {
+                mach::RegClass::Float
+            },
+        ),
+        Fixed(register) => Option::Some(
+            match register {
+                AX | CX | DX => mach::RegClass::Integer,
+                _ => mach::RegClass::Float,
+            },
+        ),
+        Rematerialized { reg, .. } => Option::Some(reg.class()),
+        Stack(_) => Option::None,
+    }
+}
+
+fn scratch(class: mach::RegClass) -> Location {
+    Location::Fixed(
+        match class {
+            Integer => mach::FixedReg::AX,
+            Float => mach::FixedReg::X0,
+        },
+    )
+}

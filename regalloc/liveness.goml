@@ -121,6 +121,13 @@ pub fn analyze(function: mach::Function) -> Result[Liveness, ir::Error] {
 }
 
 fn analyze_with_budget(function: mach::Function, budget: Ref[isize]) -> Result[Liveness, ir::Error] {
+    analyze_with_workspace(function, budget, Workspace::new())
+}
+
+fn analyze_with_workspace(function: mach::Function, budget: Ref[isize], workspace: Workspace) -> Result[
+    Liveness,
+    ir::Error,
+] {
     let blocks = function.blocks();
     let count = function.register_count();
     let words = (count + 63) / 64;
@@ -129,8 +136,10 @@ fn analyze_with_budget(function: mach::Function, budget: Ref[isize]) -> Result[L
             ir::error(ir::ErrorKind::LimitExceeded, "liveness matrix limit exceeded"),
         )
     }
-    let starts = Vec::new();
-    let ends = Vec::new();
+    let starts = workspace.starts;
+    let ends = workspace.ends;
+    starts.clear();
+    ends.clear();
     for _ in 0..count {
         starts.push(-1);
         ends.push(-1);
@@ -139,8 +148,10 @@ fn analyze_with_budget(function: mach::Function, budget: Ref[isize]) -> Result[L
     let definitions = Vec::new();
     let incoming = Vec::new();
     let outgoing = Vec::new();
-    let block_starts = Vec::new();
-    let block_ends = Vec::new();
+    let block_starts = workspace.block_starts;
+    let block_ends = workspace.block_ends;
+    block_starts.clear();
+    block_ends.clear();
     let targets: Vec[Vec[isize]] = Vec::new();
     let mut position = 0;
     for block in blocks {
@@ -204,8 +215,10 @@ fn analyze_with_budget(function: mach::Function, budget: Ref[isize]) -> Result[L
         pieces.push(Vec::new());
     }
     for block in blocks {
-        let local_starts = Vec::new();
-        let local_ends = Vec::new();
+        let local_starts = workspace.local_starts;
+        let local_ends = workspace.local_ends;
+        local_starts.clear();
+        local_ends.clear();
         for _ in 0..count {
             local_starts.push(-1);
             local_ends.push(-1);

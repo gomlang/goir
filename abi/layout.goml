@@ -23,7 +23,8 @@ fn slots(types: Vec[Type], offset: Ref[isize]) -> Vec[Slot] {
     let result = Vec::new();
     for ty in types {
         let size = match ty {
-            I64 => 8,
+            I64 | F64 => 8,
+            I32 => 4,
             Bool => 1,
         };
         let position = align_up(offset.get(), size);
@@ -51,6 +52,8 @@ pub fn amd64_abi0_signature(signature: Signature) -> Result[Plan, Error] {
 pub fn go_type(ty: Type) -> string {
     match ty {
         I64 => "int64",
+        I32 => "int32",
+        F64 => "float64",
         Bool => "bool",
     }
 }
@@ -107,7 +110,9 @@ pub fn validate_identifier(name: string) -> Result[(), Error] {
 
 pub fn declaration(function: Function) -> Result[string, Error] {
     validate_identifier(function.name())?;
-    if Vec::from_array(["init", "main", "int64", "bool"]).contains(function.name()) {
+    if Vec::from_array(["init", "main", "int64", "int32", "float64", "bool"]).contains(
+        function.name(),
+    ) {
         return Result::Err(
             error(
                 ErrorKind::InvalidArgument,

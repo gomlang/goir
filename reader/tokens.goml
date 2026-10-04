@@ -89,6 +89,8 @@ impl Cursor {
 fn type_name(cursor: Cursor) -> Result[ir::Type, ir::Error] {
     match cursor.next()? {
         "i64" => Result::Ok(ir::Type::I64),
+        "i32" => Result::Ok(ir::Type::I32),
+        "f64" => Result::Ok(ir::Type::F64),
         "bool" => Result::Ok(ir::Type::Bool),
         _ => Result::Err(syntax(cursor.line, "unknown value type")),
     }

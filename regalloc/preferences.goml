@@ -22,7 +22,12 @@ fn preferences(function: mach::Function, budget: Ref[isize]) -> Result[
                         _ => (),
                     }
                 },
-                Select { dst, yes, no, .. } => {
+                BinaryImmediate { dst, left, .. } => hints[dst.index()].push(left),
+                Lea { dst, value, .. } | Convert { dst, value, .. } => hints[dst.index()].push(
+                    value,
+                ),
+                FloatBinary { dst, left, .. } => hints[dst.index()].push(left),
+                Select { dst, yes, no, .. } | FloatSelect { dst, yes, no, .. } => {
                     hints[dst.index()].push(yes);
                     hints[dst.index()].push(no);
                 },

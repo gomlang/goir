@@ -60,6 +60,7 @@ impl Builder {
                 ],
             ),
             values,
+            slots: Vec::new(),
             limits,
         };
         Result::Ok(Builder { function, current: Ref::new(entry), finished: Ref::new(false) })
@@ -117,11 +118,11 @@ impl Builder {
     pub fn ins(self: Builder, operation: Operation) -> Result[Value, Error] {
         self.require_insertion()?;
         let types = operation_types(self.function, operation)?;
-        if types.len() != 1 || operation.has_effects() {
+        if types.len() != 1 || operation.effects().call || operation.effects().writes_memory {
             return Result::Err(
                 error(
                     ErrorKind::InvalidArgument,
-                    "ins requires a scalar pure operation; use call for calls",
+                    "ins requires a scalar operation; use call or stack_store for effects",
                 ),
             )
         }
@@ -159,6 +160,49 @@ impl Builder {
 
     pub fn iconst(self: Builder, value: i64) -> Result[Value, Error] {
         self.ins(Operation::Constant(Datum::I64(value)))
+    }
+
+    pub fn i32const(self: Builder, value: i32) -> Result[Value, Error] {
+        self.ins(Operation::Constant(Datum::I32(value)))
+    }
+
+    pub fn fconst(self: Builder, value: f64) -> Result[Value, Error] {
+        self.ins(Operation::Constant(Datum::F64(value)))
+    }
+
+    pub fn fbinary(self: Builder, op: FloatOp, left: Value, right: Value) -> Result[Value, Error] {
+        self.ins(Operation::FloatBinary(op, left, right))
+    }
+
+    pub fn fcmp(self: Builder, cc: FloatCC, left: Value, right: Value) -> Result[Value, Error] {
+        self.ins(Operation::FloatCompare(cc, left, right))
+    }
+
+    pub fn convert(self: Builder, conversion: IntConversion, value: Value) -> Result[Value, Error] {
+        self.ins(Operation::Convert(conversion, value))
+    }
+
+    pub fn stack_slot(self: Builder, ty: Type) -> Result[StackSlot, Error] {
+        self.require_open()?;
+        if self.function.slots.len() >= self.function.limits.max_values
+            || self.function.slots.len() >= 4096 {
+            return Result::Err(error(ErrorKind::LimitExceeded, "stack slot limit exceeded"))
+        }
+        let slot = StackSlot { slot: self.function.slots.len(), owner: self.function.identity };
+        self.function.slots.push(ty);
+        Result::Ok(slot)
+    }
+
+    pub fn stack_load(self: Builder, slot: StackSlot) -> Result[Value, Error] {
+        self.ins(Operation::StackLoad(slot))
+    }
+
+    pub fn stack_store(self: Builder, slot: StackSlot, value: Value) -> Result[(), Error] {
+        self.require_insertion()?;
+        let operation = Operation::StackStore(slot, value);
+        let types = operation_types(self.function, operation)?;
+        let _ = self.insert(operation, types)?;
+        Result::Ok(())
     }
 
     pub fn bconst(self: Builder, value: bool) -> Result[Value, Error] {

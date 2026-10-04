@@ -9,6 +9,11 @@ enum ParsedOperation {
     Compare(ir::IntCC, isize, isize),
     Select(isize, isize, isize),
     Call(ir::FuncRef, Vec[isize]),
+    FloatBinary(ir::FloatOp, isize, isize),
+    FloatCompare(ir::FloatCC, isize, isize),
+    Convert(ir::IntConversion, isize),
+    StackLoad(isize),
+    StackStore(isize, isize),
 }
 
 struct ParsedInstruction {
@@ -67,7 +72,7 @@ fn comparison_name(name: string, line: isize) -> Result[ir::IntCC, ir::Error] {
 }
 
 fn instruction(cursor: Cursor, references: Vec[ir::FuncRef]) -> Result[ParsedInstruction, ir::Error] {
-    let definitions = if cursor.peek() == "call" {
+    let definitions = if cursor.peek() == "call" || cursor.peek() == "stack_store" {
         Vec::new()
     } else {
         typed_values(cursor, "=")?
@@ -81,6 +86,60 @@ fn instruction(cursor: Cursor, references: Vec[ir::FuncRef]) -> Result[ParsedIns
                 )?,
             ),
         ),
+        "i32const" => ParsedOperation::Constant(
+            ir::Datum::I32(
+                num::parse_int_bits(cursor.next()?, 10, 32).map_err(
+                    |_| syntax(cursor.line, "invalid i32 constant"),
+                )?.to_i32(),
+            ),
+        ),
+        "fconst_bits" => ParsedOperation::Constant(
+            ir::datum_from_bits(
+                ir::Type::F64,
+                num::parse_uint_bits(cursor.next()?, 10, 64).map_err(
+                    |_| syntax(cursor.line, "invalid f64 bits"),
+                )?.to_i64(),
+            ),
+        ),
+        "fadd" | "fsub" | "fmul" | "fdiv" => {
+            let op = match name {
+                "fadd" => ir::FloatOp::Add,
+                "fsub" => ir::FloatOp::Sub,
+                "fmul" => ir::FloatOp::Mul,
+                _ => ir::FloatOp::Div,
+            };
+            let left = value_id(cursor)?;
+            cursor.expect(",")?;
+            ParsedOperation::FloatBinary(op, left, value_id(cursor)?)
+        },
+        "fcmp" => {
+            let cc = match cursor.next()? {
+                "eq" => ir::FloatCC::Equal,
+                "ne" => ir::FloatCC::NotEqual,
+                "lt" => ir::FloatCC::Less,
+                "le" => ir::FloatCC::LessEqual,
+                _ => return Result::Err(syntax(cursor.line, "unknown float comparison")),
+            };
+            let left = value_id(cursor)?;
+            cursor.expect(",")?;
+            ParsedOperation::FloatCompare(cc, left, value_id(cursor)?)
+        },
+        "sextend" | "uextend" | "ireduce" => ParsedOperation::Convert(
+            match name {
+                "sextend" => ir::IntConversion::SignExtend,
+                "uextend" => ir::IntConversion::ZeroExtend,
+                _ => ir::IntConversion::Truncate,
+            },
+            value_id(cursor)?,
+        ),
+        "stack_load" => ParsedOperation::StackLoad(
+            index_name(cursor.next()?, "slot", cursor.line, 4096)?,
+        ),
+        "stack_store" => {
+            let slot = index_name(cursor.next()?, "slot", cursor.line, 4096)?;
+            cursor.expect(",")?;
+            ParsedOperation::StackStore(slot, value_id(cursor)?)
+        },
         "bconst" => ParsedOperation::Constant(
             ir::Datum::Bool(
                 match cursor.next()? {
@@ -121,8 +180,11 @@ fn instruction(cursor: Cursor, references: Vec[ir::FuncRef]) -> Result[ParsedIns
 
 fn operation_uses(operation: ParsedOperation) -> Vec[isize] {
     match operation {
-        Constant(_) => Vec::new(),
-        Binary(_, left, right) | Compare(_, left, right) => Vec::from_array([left, right]),
+        Constant(_) | StackLoad(_) => Vec::new(),
+        Convert(_, value) | StackStore(_, value) => Vec::from_array([value]),
+        Binary(_, left, right) | Compare(_, left, right) | FloatBinary(_, left, right) | FloatCompare(_, left, right) => Vec::from_array(
+            [left, right],
+        ),
         Select(condition, yes, no) => Vec::from_array([condition, yes, no]),
         Call(_, arguments) => arguments,
     }
@@ -146,13 +208,28 @@ fn resolved_values(values: Vec[Option[ir::Value]], ids: Vec[isize], line: isize)
     Result::Ok(output)
 }
 
-fn insert(builder: ir::Builder, values: Vec[Option[ir::Value]], instruction: ParsedInstruction) -> Result[
-    Vec[ir::Value],
-    ir::Error,
-] {
+fn insert(
+    builder: ir::Builder,
+    values: Vec[Option[ir::Value]],
+    slots: Vec[ir::StackSlot],
+    instruction: ParsedInstruction,
+) -> Result[Vec[ir::Value], ir::Error] {
     let line = instruction.line;
     if let ParsedOperation::Call(target, arguments) = instruction.operation {
         return builder.call(target, resolved_values(values, arguments, line)?)
+    }
+    if let ParsedOperation::StackStore(slot, value) = instruction.operation {
+        if slot >= slots.len() {
+            return Result::Err(syntax(line, "undefined stack slot"))
+        }
+        builder.stack_store(slots[slot], resolve(values, value, line)?)?;
+        return Result::Ok(Vec::new())
+    }
+    if let ParsedOperation::StackLoad(slot) = instruction.operation {
+        if slot >= slots.len() {
+            return Result::Err(syntax(line, "undefined stack slot"))
+        }
+        return Result::Ok(Vec::from_array([builder.stack_load(slots[slot])?]))
     }
     let operation = match instruction.operation {
         Constant(value) => ir::Operation::Constant(value),
@@ -171,7 +248,23 @@ fn insert(builder: ir::Builder, values: Vec[Option[ir::Value]], instruction: Par
             resolve(values, yes, line)?,
             resolve(values, no, line)?,
         ),
-        Call(_, _) => return Result::Err(syntax(line, "unexpected call")),
+        FloatBinary(op, left, right) => ir::Operation::FloatBinary(
+            op,
+            resolve(values, left, line)?,
+            resolve(values, right, line)?,
+        ),
+        FloatCompare(cc, left, right) => ir::Operation::FloatCompare(
+            cc,
+            resolve(values, left, line)?,
+            resolve(values, right, line)?,
+        ),
+        Convert(conversion, value) => ir::Operation::Convert(
+            conversion,
+            resolve(values, value, line)?,
+        ),
+        Call(_, _) | StackLoad(_) | StackStore(_, _) => return Result::Err(
+            syntax(line, "unexpected effectful operation"),
+        ),
     };
     Result::Ok(Vec::from_array([builder.ins(operation)?]))
 }
@@ -261,6 +354,18 @@ pub fn read_with_references(source: string, references: Vec[ir::FuncRef]) -> Res
     let parsed: Vec[ParsedBlock] = Vec::new();
     let mut position = 1;
     let mut instructions = 0;
+    let slots = Vec::new();
+    while position < lines.len() && lines[position].peek().starts_with("slot") {
+        let cursor = lines[position];
+        let index = index_name(cursor.next()?, "slot", cursor.line, 4096)?;
+        if index != slots.len() {
+            return Result::Err(syntax(cursor.line, "stack slots must have consecutive indices"))
+        }
+        cursor.expect(":")?;
+        slots.push(builder.stack_slot(type_name(cursor)?)?);
+        cursor.end()?;
+        position += 1;
+    }
     while position < lines.len() && lines[position].peek() != "}" {
         let cursor = lines[position];
         let index = index_name(cursor.next()?, "block", cursor.line, 256)?;
@@ -368,7 +473,7 @@ pub fn read_with_references(source: string, references: Vec[ir::FuncRef]) -> Res
                     values,
                     declared_types,
                     item.definitions,
-                    insert(builder, values, item)?,
+                    insert(builder, values, slots, item)?,
                     item.line,
                 )?;
                 cursors[block] += 1;

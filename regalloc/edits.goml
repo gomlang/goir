@@ -7,6 +7,17 @@ fn move_value(edits: Vec[Edit], source: Location, destination: Location) -> () {
     if source == destination {
         return
     }
+    if let Location::Rematerialized { .. } = source {
+        if match destination {
+            Stack(_) => true,
+            _ => location_class(destination) == Option::Some(mach::RegClass::Float),
+        } {
+            let temporary = Location::Fixed(mach::FixedReg::AX);
+            edits.push(Edit { source, destination: temporary });
+            edits.push(Edit { source: temporary, destination });
+            return
+        }
+    }
     match (source, destination) {
         (Stack(_), Stack(_)) => {
             let temporary = Location::Fixed(mach::FixedReg::AX);

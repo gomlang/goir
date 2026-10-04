@@ -1,0 +1,64 @@
+package main;
+
+use ecosystem::goir as ir;
+
+pub fn frontend_module() -> Result[ir::Module, ir::Error] {
+    let module = ir::ModuleBuilder::new();
+    let signature = ir::Signature::new(
+        Vec::from_array([ir::Type::I64]),
+        Vec::from_array([ir::Type::I64]),
+    )?;
+    let helper = module.declare("Double", signature)?;
+    let target = module.declare("AssignedSum", signature)?;
+    let body = ir::Builder::for_function(helper)?;
+    let value = body.parameters(body.entry())?[0];
+    let doubled = body.binary(ir::BinaryOp::Add, value, value)?;
+    body.ret(Vec::from_array([doubled]))?;
+    module.define(helper, body.finish()?)?;
+    let frontend = ir::Frontend::for_function(target)?;
+    let builder = frontend.builder();
+    let n = builder.parameters(builder.entry())?[0];
+    let counter = frontend.declare_var(ir::Type::I64)?;
+    let sum = frontend.declare_var(ir::Type::I64)?;
+    let zero = builder.iconst(0)?;
+    let one = builder.iconst(1)?;
+    let three = builder.iconst(3)?;
+    frontend.def_var(counter, zero)?;
+    frontend.def_var(sum, zero)?;
+    let header = frontend.append_block()?;
+    let select = frontend.append_block()?;
+    let yes = frontend.append_block()?;
+    let no = frontend.append_block()?;
+    let next = frontend.append_block()?;
+    let exit = frontend.append_block()?;
+    frontend.jump(header)?;
+    frontend.switch_to(header)?;
+    let index = frontend.use_var(counter)?;
+    let remaining = builder.icmp(ir::IntCC::SignedLess, index, n)?;
+    frontend.branch(remaining, select, exit)?;
+    frontend.switch_to(select)?;
+    let early = builder.icmp(ir::IntCC::SignedLess, index, three)?;
+    frontend.branch(early, yes, no)?;
+    frontend.switch_to(yes)?;
+    let increment = builder.call(helper, Vec::from_array([index]))?[0];
+    let old = frontend.use_var(sum)?;
+    let added = builder.binary(ir::BinaryOp::Add, old, increment)?;
+    frontend.def_var(sum, added)?;
+    frontend.jump(next)?;
+    frontend.switch_to(no)?;
+    let old = frontend.use_var(sum)?;
+    let added = builder.binary(ir::BinaryOp::Add, old, index)?;
+    frontend.def_var(sum, added)?;
+    frontend.jump(next)?;
+    frontend.seal_block(next)?;
+    frontend.switch_to(next)?;
+    let incremented = builder.binary(ir::BinaryOp::Add, index, one)?;
+    frontend.def_var(counter, incremented)?;
+    frontend.jump(header)?;
+    frontend.seal_block(header)?;
+    frontend.switch_to(exit)?;
+    let result = frontend.use_var(sum)?;
+    frontend.ret(Vec::from_array([result]))?;
+    module.define(target, frontend.finish()?)?;
+    module.finish()
+}

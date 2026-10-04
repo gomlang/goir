@@ -49,7 +49,27 @@ fn resolve_operation(operation: ir::Operation, aliases: Vec[Option[ir::Value]], 
     ir::Error,
 ] {
     match operation {
-        Constant(_) => Result::Ok(operation),
+        Constant(_) | StackLoad(_) => Result::Ok(operation),
+        StackStore(slot, value) => Result::Ok(
+            ir::Operation::StackStore(slot, resolve(value, aliases, budget)?),
+        ),
+        Convert(conversion, value) => Result::Ok(
+            ir::Operation::Convert(conversion, resolve(value, aliases, budget)?),
+        ),
+        FloatBinary(op, a, b) => Result::Ok(
+            ir::Operation::FloatBinary(
+                op,
+                resolve(a, aliases, budget)?,
+                resolve(b, aliases, budget)?,
+            ),
+        ),
+        FloatCompare(cc, a, b) => Result::Ok(
+            ir::Operation::FloatCompare(
+                cc,
+                resolve(a, aliases, budget)?,
+                resolve(b, aliases, budget)?,
+            ),
+        ),
         Call(target, arguments) => {
             let values = Vec::new();
             for value in arguments {
@@ -131,19 +151,29 @@ pub fn simplify_with_options(function: ir::Function, options: Options) -> Result
     ir::Function,
     ir::Error,
 ] {
+    Result::Ok(simplify_verified_with_options(ir::verified(function)?, options)?.function())
+}
+
+pub fn simplify_verified(function: ir::VerifiedFunction) -> Result[ir::VerifiedFunction, ir::Error] {
+    simplify_verified_with_options(function, Options::standard())
+}
+
+pub fn simplify_verified_with_options(function: ir::VerifiedFunction, options: Options) -> Result[
+    ir::VerifiedFunction,
+    ir::Error,
+] {
     if options.max_steps < 1 || options.max_steps > 100000000 {
         return Result::Err(
             ir::error(ir::ErrorKind::InvalidArgument, "invalid SSA optimization options"),
         )
     }
-    ir::verify(function)?;
     let budget = Ref::new(options.max_steps);
     let mut current = function;
-    let mut size = progress_size(current);
+    let mut size = progress_size(current.function());
     loop {
         spend(budget)?;
         let next = simplify_once(current, budget)?;
-        let next_size = progress_size(next);
+        let next_size = progress_size(next.function());
         if next_size >= size {
             return Result::Ok(next)
         }
@@ -166,7 +196,11 @@ fn progress_size(function: ir::Function) -> isize {
     count
 }
 
-fn simplify_once(function: ir::Function, budget: Ref[isize]) -> Result[ir::Function, ir::Error] {
+fn simplify_once(checked: ir::VerifiedFunction, budget: Ref[isize]) -> Result[
+    ir::VerifiedFunction,
+    ir::Error,
+] {
+    let function = checked.function();
     let blocks = function.blocks();
     let aliases: Vec[Option[ir::Value]] = Vec::new();
     let constants = propagate(function, budget)?;
@@ -189,7 +223,7 @@ fn simplify_once(function: ir::Function, budget: Ref[isize]) -> Result[ir::Funct
                     continue;
                 }
                 let operation = resolve_operation(instruction.operation, aliases, budget)?;
-                match fold(operation, constants) {
+                match fold(function, operation, constants) {
                     Keep => (),
                     Alias(value) => {
                         aliases[index] = Option::Some(value);
@@ -228,5 +262,5 @@ fn simplify_once(function: ir::Function, budget: Ref[isize]) -> Result[ir::Funct
     }
     let blocks = materialize_parameters(blocks, constants, budget)?;
     let blocks = number_values(blocks, aliases, constants, budget)?;
-    ir::rewrite(function, eliminate(blocks, function.value_count(), budget)?)
+    ir::rewrite_verified(checked, eliminate(blocks, function.value_count(), budget)?)
 }

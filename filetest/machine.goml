@@ -1,0 +1,95 @@
+package filetest;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::mach;
+use ecosystem::goir::regalloc;
+
+fn machine_text(instruction: mach::Instruction) -> string {
+    match instruction {
+        Immediate { dst, value } => f"{dst.debug()} = immediate {value}",
+        FloatImmediate { dst, bits } => f"{dst.debug()} = float_bits {bits.to_u64()}",
+        Binary { dst, op, left, right } => f"{dst.debug()} = {op.name()} {left.debug()}, {right.debug()}",
+        BinaryImmediate { dst, op, left, value } => f"{dst.debug()} = {op.name()}_immediate {left.debug()}, {value}",
+        Lea { dst, value, scale } => f"{dst.debug()} = lea {value.debug()} * {scale}",
+        Compare { dst, cc, left, right } => f"{dst.debug()} = icmp {cc.name()} {left.debug()}, {right.debug()}",
+        Select { dst, condition, yes, no } => f"{dst.debug()} = select {condition.debug()}, {yes.debug()}, {no.debug()}",
+        FloatBinary { dst, op, left, right } => f"{dst.debug()} = {op.name()} {left.debug()}, {right.debug()}",
+        FloatCompare { dst, cc, left, right } => f"{dst.debug()} = fcmp {cc.name()} {left.debug()}, {right.debug()}",
+        FloatSelect { dst, condition, yes, no } => f"{dst.debug()} = float_select {condition.debug()}, {yes.debug()}, {no.debug()}",
+        Convert { dst, op, value } => f"{dst.debug()} = {op.name()} {value.debug()}",
+        StackLoad { dst, slot } => f"{dst.debug()} = stack_load slot{slot.index()}",
+        StackStore { slot, value } => f"stack_store slot{slot.index()}, {value.debug()}",
+        Call { target, .. } => "call " + target.name(),
+    }
+}
+
+fn edit_text(edit: regalloc::Edit) -> string {
+    "edit " + edit.source.debug() + " -> " + edit.destination.debug()
+}
+
+fn stage_text(function: ir::Function, stage: Stage) -> Result[string, ir::Error] {
+    let machine = mach::lower(function)?;
+    let lines = Vec::from_array(["machine " + function.name()]);
+    match stage {
+        Lower => {
+            for block in machine.blocks() {
+                lines.push(f"block{block.index}:");
+                for instruction in block.instructions {
+                    lines.push("    " + machine_text(instruction));
+                    for operand in instruction.operands() {
+                        lines.push("        " + operand.debug());
+                    }
+                    for clobber in instruction.clobbers() {
+                        lines.push("        clobber " + clobber.debug());
+                    }
+                }
+                for reg in block.terminator.uses() {
+                    lines.push("    terminator use " + reg.debug());
+                }
+                for edge in block.terminator.successors() {
+                    lines.push(f"    edge block{edge.target}");
+                    for copy in edge.copies {
+                        lines.push(
+                            "        " + copy.source.debug() + " -> " + copy.destination.debug(),
+                        );
+                    }
+                }
+            }
+        },
+        Allocate => {
+            let allocation = regalloc::allocate(machine)?;
+            regalloc::check(allocation)?;
+            for block in allocation.blocks() {
+                lines.push(f"block{block.index}:");
+                for instruction in block.instructions {
+                    for edit in instruction.before {
+                        lines.push("    before " + edit_text(edit));
+                    }
+                    lines.push("    " + machine_text(instruction.instruction));
+                    for binding in instruction.operands {
+                        lines.push(
+                            "        " + binding.operand.debug() + " @ " + binding.location.debug(),
+                        );
+                    }
+                    for edit in instruction.after {
+                        lines.push("    after " + edit_text(edit));
+                    }
+                }
+                for binding in block.terminator_operands {
+                    lines.push(
+                        "    terminator " + binding.operand.reg.debug() + " @ "
+                            + binding.location.debug(),
+                    );
+                }
+                for edge in block.edges {
+                    lines.push(f"    edge block{edge.edge.target}");
+                    for edit in edge.edits {
+                        lines.push("        " + edit_text(edit));
+                    }
+                }
+            }
+        },
+        _ => return Result::Err(ir::error(ir::ErrorKind::InvalidArgument, "expected machine stage")),
+    }
+    Result::Ok(lines.join("\n") + "\n")
+}

@@ -1,0 +1,141 @@
+package filetest;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::opt;
+use ecosystem::goir::reader;
+
+pub struct ModuleReduction {
+    pub module: ir::Module,
+    pub attempts: isize,
+    pub accepted: isize,
+}
+
+pub fn reduce_module(
+    source: ir::Module,
+    max_attempts: isize,
+    preserves_failure: (ir::Module) -> Result[bool, ir::Error],
+) -> Result[ModuleReduction, ir::Error] {
+    if max_attempts < 1 || max_attempts > 10000 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::InvalidArgument, "module reducer attempts must be in 1..10000"),
+        )
+    }
+    ir::verify_module(source)?;
+    if !preserves_failure(source)? {
+        return Result::Err(
+            ir::error(
+                ir::ErrorKind::InvalidArgument,
+                "source module does not reproduce the failure",
+            ),
+        )
+    }
+    let mut module = source;
+    let mut attempts = 0;
+    let mut accepted = 0;
+    let mut changed = true;
+    while changed && attempts < max_attempts {
+        changed = false;
+        for target in module.references() {
+            if changed || attempts >= max_attempts {
+                break
+            }
+            let function = match module.function(target)? {
+                Some(function) => function,
+                None => continue,
+            };
+            let blocks = function.blocks();
+            for block in 0..blocks.len() {
+                if changed || attempts >= max_attempts {
+                    break
+                }
+                for position in 0..blocks[block].instructions.len() {
+                    if changed || attempts >= max_attempts {
+                        break
+                    }
+                    let item = blocks[block].instructions[position];
+                    if item.operation.has_effects() || item.results.len() != 1 {
+                        continue
+                    }
+                    for remove in Vec::from_array([true, false]) {
+                        if changed || attempts >= max_attempts {
+                            break
+                        }
+                        attempts += 1;
+                        if let Ok(function) = candidate(function, block, position, remove) {
+                            let reduced = module.with_function(target, function)?;
+                            if reader::display_module(reduced)? != reader::display_module(module)?
+                                && preserves_failure(reduced)? {
+                                module = reduced;
+                                accepted += 1;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Result::Ok(ModuleReduction { module, attempts, accepted })
+}
+
+pub fn run_module(source: string, entry: string, stage: Stage, arguments: Vec[ir::Datum], fuel: u64) -> Result[
+    Output,
+    ir::Error,
+] {
+    let mut module = reader::read_module(source)?;
+    let mut target = Option::None;
+    for reference in module.references() {
+        if reference.name() == entry {
+            target = Option::Some(reference);
+        }
+    }
+    let target = target.ok_or(ir::error(ir::ErrorKind::InvalidArgument, "unknown module entry"))?;
+    let text = match stage {
+        Verify => reader::display_module(module)?,
+        Optimize => {
+            for reference in module.references() {
+                if let Some(function) = module.function(reference)? {
+                    module = module.with_function(reference, opt::simplify(function)?)?;
+                }
+            }
+            reader::display_module(module)?
+        },
+        Compile => amd64::emit_module("filetest", module)?.assembly,
+        Lower | Allocate => {
+            let texts = Vec::new();
+            for function in module.functions() {
+                texts.push(stage_text(function, stage)?);
+            }
+            texts.join("\n")
+        },
+        Run => return Result::Ok(
+            Output {
+                text: reader::display_module(module)?,
+                values: ir::interpret_module(module, target, arguments, fuel)?,
+            },
+        ),
+    };
+    Result::Ok(Output { text, values: Vec::new() })
+}
+
+pub fn assert_output(output: Output, required: Vec[string], forbidden: Vec[string]) -> Result[
+    (),
+    ir::Error,
+] {
+    for text in required {
+        if !output.text.contains(text) {
+            return Result::Err(
+                ir::error(ir::ErrorKind::InvalidState, "missing filetest text: " + text),
+            )
+        }
+    }
+    for text in forbidden {
+        if output.text.contains(text) {
+            return Result::Err(
+                ir::error(ir::ErrorKind::InvalidState, "unexpected filetest text: " + text),
+            )
+        }
+    }
+    Result::Ok(())
+}

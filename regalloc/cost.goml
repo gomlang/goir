@@ -1,0 +1,132 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+
+fn loop_weights(function: mach::Function, budget: Ref[isize]) -> Result[Vec[isize], ir::Error] {
+    let blocks = function.blocks();
+    let count = blocks.len();
+    let words = (count + 63) / 64;
+    let predecessors: Vec[Vec[isize]] = Vec::new();
+    let dominators = Vec::new();
+    for index in 0..count {
+        predecessors.push(Vec::new());
+        let row = bit_row(words);
+        for candidate in 0..count {
+            spend(budget)?;
+            if index != 0 || candidate == 0 {
+                bit_set(row, candidate);
+            }
+        }
+        dominators.push(row);
+    }
+    for block in blocks {
+        for edge in block.terminator.successors() {
+            predecessors[edge.target].push(block.index);
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in 1..count {
+            for word in 0..words {
+                spend(budget)?;
+                let mut incoming: u64 = ~0;
+                for predecessor in predecessors[index] {
+                    spend(budget)?;
+                    incoming = incoming & dominators[predecessor][word];
+                }
+                if index / 64 == word {
+                    incoming = incoming | ((1.to_u64()) << (index % 64));
+                }
+                if dominators[index][word] != incoming {
+                    dominators[index][word] = incoming;
+                    changed = true;
+                }
+            }
+        }
+    }
+    let loops = Vec::new();
+    for _ in 0..count {
+        loops.push(bit_row(words));
+    }
+    for block in blocks {
+        for edge in block.terminator.successors() {
+            spend(budget)?;
+            let header = edge.target;
+            if !bit_has(dominators[block.index], header) {
+                continue;
+            }
+            let members = loops[header];
+            bit_set(members, header);
+            let pending = Vec::from_array([block.index]);
+            let mut cursor = 0;
+            while cursor < pending.len() {
+                spend(budget)?;
+                let member = pending[cursor];
+                cursor = cursor + 1;
+                if bit_has(members, member) {
+                    continue;
+                }
+                bit_set(members, member);
+                for predecessor in predecessors[member] {
+                    pending.push(predecessor);
+                }
+            }
+        }
+    }
+    let weights = Vec::new();
+    for index in 0..count {
+        let mut weight = 1;
+        for members in loops {
+            spend(budget)?;
+            if bit_has(members, index) && weight < 262144 {
+                weight = weight * 8;
+            }
+        }
+        weights.push(weight);
+    }
+    Result::Ok(weights)
+}
+
+fn value_weights(function: mach::Function, budget: Ref[isize]) -> Result[Vec[isize], ir::Error] {
+    let block_weights = loop_weights(function, budget)?;
+    let output = Vec::new();
+    for _ in 0..function.register_count() {
+        output.push(1);
+    }
+    for block in function.blocks() {
+        for instruction in block.instructions {
+            for reg in instruction.uses() {
+                spend(budget)?;
+                output[reg.index()] = output[reg.index()] + block_weights[block.index];
+            }
+        }
+        for reg in block.terminator.uses() {
+            spend(budget)?;
+            output[reg.index()] = output[reg.index()] + block_weights[block.index];
+        }
+    }
+    Result::Ok(output)
+}
+
+fn constants_for(function: mach::Function) -> Vec[Option[i64]] {
+    let output = Vec::new();
+    for _ in 0..function.register_count() {
+        output.push(Option::None);
+    }
+    for block in function.blocks() {
+        for instruction in block.instructions {
+            match instruction {
+                Immediate { dst, value } => {
+                    output[dst.index()] = Option::Some(value);
+                },
+                FloatImmediate { dst, bits } => {
+                    output[dst.index()] = Option::Some(bits);
+                },
+                _ => (),
+            }
+        }
+    }
+    output
+}

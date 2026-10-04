@@ -1,0 +1,337 @@
+package goir;
+
+#[derive(PartialEq, Eq)]
+pub struct Variable {
+    slot: isize,
+    owner: Ref[()],
+}
+
+pub struct Frontend {
+    engine: Builder,
+    identity: Ref[()],
+    types: Vec[Type],
+    definitions: Vec[Vec[Option[Value]]],
+    parameters: Vec[Vec[Variable]],
+    sealed: Vec[bool],
+    predecessors: Vec[Vec[Block]],
+    budget: Ref[isize],
+}
+
+fn frontend_spend(frontend: Frontend) -> Result[(), Error] {
+    if frontend.budget.get() <= 0 {
+        return Result::Err(error(ErrorKind::LimitExceeded, "frontend SSA work limit exceeded"))
+    }
+    frontend.budget.set(frontend.budget.get() - 1);
+    Result::Ok(())
+}
+
+impl Frontend {
+    fn wrap(engine: Builder) -> Frontend {
+        Frontend {
+            engine,
+            identity: Ref::new(()),
+            types: Vec::new(),
+            definitions: Vec::from_array([Vec::new()]),
+            parameters: Vec::from_array([Vec::new()]),
+            sealed: Vec::from_array([true]),
+            predecessors: Vec::from_array([Vec::new()]),
+            budget: Ref::new(engine.function.limits.max_verify_steps),
+        }
+    }
+
+    pub fn new(name: string, inputs: Vec[Type], outputs: Vec[Type]) -> Result[Frontend, Error] {
+        Result::Ok(Frontend::wrap(Builder::new(name, inputs, outputs)?))
+    }
+
+    pub fn with_limits(name: string, inputs: Vec[Type], outputs: Vec[Type], limits: Limits) -> Result[
+        Frontend,
+        Error,
+    ] {
+        Result::Ok(Frontend::wrap(Builder::with_limits(name, inputs, outputs, limits)?))
+    }
+
+    pub fn for_function(target: FuncRef) -> Result[Frontend, Error] {
+        Result::Ok(Frontend::wrap(Builder::for_function(target)?))
+    }
+
+    pub fn builder(self: Frontend) -> Builder {
+        self.engine
+    }
+
+    pub fn entry(self: Frontend) -> Block {
+        self.engine.entry()
+    }
+
+    fn require_open(self: Frontend) -> Result[(), Error] {
+        frontend_spend(self)?;
+        self.engine.require_open()?;
+        if self.engine.function.body.len() != self.sealed.len() {
+            return Result::Err(
+                error(
+                    ErrorKind::InvalidState,
+                    "create frontend blocks through Frontend::append_block",
+                ),
+            )
+        }
+        Result::Ok(())
+    }
+
+    fn variable_type(self: Frontend, variable: Variable) -> Result[Type, Error] {
+        if !ptr_eq(variable.owner, self.identity) {
+            return Result::Err(
+                error(ErrorKind::WrongFunction, "variable belongs to another frontend"),
+            )
+        }
+        if variable.slot < 0 || variable.slot >= self.types.len() {
+            return Result::Err(error(ErrorKind::InvalidHandle, "invalid frontend variable"))
+        }
+        Result::Ok(self.types[variable.slot])
+    }
+
+    pub fn declare_var(self: Frontend, ty: Type) -> Result[Variable, Error] {
+        self.require_open()?;
+        if self.types.len() >= self.engine.function.limits.max_values {
+            return Result::Err(error(ErrorKind::LimitExceeded, "frontend variable limit exceeded"))
+        }
+        let variable = Variable { slot: self.types.len(), owner: self.identity };
+        self.types.push(ty);
+        for definitions in self.definitions {
+            frontend_spend(self)?;
+            definitions.push(Option::None);
+        }
+        Result::Ok(variable)
+    }
+
+    pub fn def_var(self: Frontend, variable: Variable, value: Value) -> Result[(), Error] {
+        self.require_open()?;
+        self.engine.require_insertion()?;
+        let ty = self.variable_type(variable)?;
+        if self.engine.function.value_type(value)? != ty {
+            return Result::Err(
+                error(ErrorKind::TypeMismatch, "assignment differs from variable type"),
+            )
+        }
+        self.definitions[self.engine.current.get().slot][variable.slot] = Option::Some(value);
+        Result::Ok(())
+    }
+
+    fn read_block(self: Frontend, variable: Variable, block: Block) -> Result[Value, Error] {
+        frontend_spend(self)?;
+        let ty = self.variable_type(variable)?;
+        check_block(self.engine.function, block)?;
+        if let Some(value) = self.definitions[block.slot][variable.slot] {
+            return Result::Ok(value)
+        }
+        if block == self.entry() {
+            return Result::Err(
+                error(
+                    ErrorKind::InvalidState,
+                    "variable is used before assignment on an incoming path",
+                ),
+            )
+        }
+        let function = self.engine.function;
+        if function.values.len() >= function.limits.max_values
+            || function.body[block.slot].parameters.len() >= function.limits.max_block_parameters {
+            return Result::Err(
+                error(ErrorKind::LimitExceeded, "frontend block parameters exceed IR limits"),
+            )
+        }
+        let value = Value { slot: function.values.len(), owner: function.identity };
+        function.values.push(ValueData { ty, block, position: -1 });
+        function.body[block.slot].parameters.push(value);
+        self.parameters[block.slot].push(variable);
+        self.definitions[block.slot][variable.slot] = Option::Some(value);
+        Result::Ok(value)
+    }
+
+    pub fn use_var(self: Frontend, variable: Variable) -> Result[Value, Error] {
+        self.require_open()?;
+        self.engine.require_insertion()?;
+        self.read_block(variable, self.engine.current.get())
+    }
+
+    pub fn append_block(self: Frontend) -> Result[Block, Error] {
+        self.require_open()?;
+        let block = self.engine.append_block(Vec::new())?;
+        let definitions = Vec::new();
+        for _ in self.types {
+            frontend_spend(self)?;
+            definitions.push(Option::None);
+        }
+        self.definitions.push(definitions);
+        self.parameters.push(Vec::new());
+        self.sealed.push(false);
+        self.predecessors.push(Vec::new());
+        Result::Ok(block)
+    }
+
+    pub fn switch_to(self: Frontend, block: Block) -> Result[(), Error] {
+        self.require_open()?;
+        self.engine.switch_to(block)
+    }
+
+    pub fn seal_block(self: Frontend, block: Block) -> Result[(), Error] {
+        self.require_open()?;
+        check_block(self.engine.function, block)?;
+        self.sealed[block.slot] = true;
+        Result::Ok(())
+    }
+
+    pub fn seal_all(self: Frontend) -> Result[(), Error] {
+        self.require_open()?;
+        for index in 0..self.sealed.len() {
+            frontend_spend(self)?;
+            self.sealed[index] = true;
+        }
+        Result::Ok(())
+    }
+
+    fn terminate(self: Frontend, term: Terminator) -> Result[(), Error] {
+        self.require_open()?;
+        self.engine.require_insertion()?;
+        let source = self.engine.current.get();
+        for edge in successors(term) {
+            frontend_spend(self)?;
+            check_block(self.engine.function, edge.target)?;
+            if self.sealed[edge.target.slot] {
+                return Result::Err(
+                    error(
+                        ErrorKind::InvalidState,
+                        "cannot add an incoming edge to a sealed frontend block",
+                    ),
+                )
+            }
+        }
+        for edge in successors(term) {
+            self.predecessors[edge.target.slot].push(source);
+        }
+        let mut block = self.engine.function.body[source.slot];
+        block.terminator = Option::Some(copy_terminator(term));
+        self.engine.function.body[source.slot] = block;
+        Result::Ok(())
+    }
+
+    pub fn jump(self: Frontend, target: Block) -> Result[(), Error] {
+        self.terminate(Terminator::Jump(Edge { target, arguments: Vec::new() }))
+    }
+
+    pub fn branch(self: Frontend, condition: Value, yes: Block, no: Block) -> Result[(), Error] {
+        self.require_open()?;
+        if self.engine.function.value_type(condition)? != Type::Bool {
+            return Result::Err(error(ErrorKind::TypeMismatch, "frontend branch requires bool"))
+        }
+        self.terminate(
+            Terminator::Branch(
+                condition,
+                Edge { target: yes, arguments: Vec::new() },
+                Edge { target: no, arguments: Vec::new() },
+            ),
+        )
+    }
+
+    pub fn ret(self: Frontend, values: Vec[Value]) -> Result[(), Error] {
+        self.require_open()?;
+        self.engine.ret(values)
+    }
+
+    fn fill_edge(self: Frontend, source: Block, edge: Edge) -> Result[Edge, Error] {
+        let arguments = Vec::new();
+        for variable in self.parameters[edge.target.slot] {
+            frontend_spend(self)?;
+            arguments.push(self.read_block(variable, source)?);
+        }
+        Result::Ok(Edge { target: edge.target, arguments })
+    }
+
+    pub fn finish(self: Frontend) -> Result[Function, Error] {
+        self.seal_all()?;
+        let incoming = Vec::new();
+        for _ in self.sealed {
+            incoming.push(0);
+        }
+        for block in self.engine.function.body {
+            let term = block.terminator.ok_or(
+                error(ErrorKind::ControlFlow, "frontend block is missing a terminator"),
+            )?;
+            for edge in successors(term) {
+                frontend_spend(self)?;
+                check_block(self.engine.function, edge.target)?;
+                incoming[edge.target.slot] += 1;
+            }
+        }
+        for index in 0..incoming.len() {
+            frontend_spend(self)?;
+            if incoming[index] != self.predecessors[index].len() {
+                return Result::Err(
+                    error(
+                        ErrorKind::InvalidState,
+                        "create frontend control flow through Frontend::jump or branch",
+                    ),
+                )
+            }
+        }
+        let mut changed = true;
+        while changed {
+            let before = self.engine.function.values.len();
+            for index in 0..self.engine.function.body.len() {
+                frontend_spend(self)?;
+                let source = self.engine.function.body[index].id;
+                let term = self.engine.function.body[index].terminator.ok_or(
+                    error(ErrorKind::ControlFlow, "frontend block is missing a terminator"),
+                )?;
+                let next = match term {
+                    Jump(edge) => Terminator::Jump(self.fill_edge(source, edge)?),
+                    Branch(condition, yes, no) => Terminator::Branch(
+                        condition,
+                        self.fill_edge(source, yes)?,
+                        self.fill_edge(source, no)?,
+                    ),
+                    Return(values) => Terminator::Return(values),
+                };
+                let mut block = self.engine.function.body[index];
+                block.terminator = Option::Some(next);
+                self.engine.function.body[index] = block;
+            }
+            changed = before != self.engine.function.values.len();
+        }
+        self.engine.finish()
+    }
+}
+
+impl Module {
+    pub fn with_function(self: Module, target: FuncRef, replacement: Function) -> Result[
+        Module,
+        Error,
+    ] {
+        check_reference(self, target)?;
+        if target.imported || replacement.name() != target.name()
+            || replacement.signature() != target.signature() {
+            return Result::Err(
+                error(ErrorKind::TypeMismatch, "module replacement differs from declared function"),
+            )
+        }
+        if let Some(owner) = replacement.module_identity {
+            if !ptr_eq(owner, self.identity) {
+                return Result::Err(
+                    error(ErrorKind::WrongFunction, "module replacement belongs to another module"),
+                )
+            }
+        }
+        let definitions = copy_vec(self.definitions);
+        definitions[target.slot] = Option::Some(replacement);
+        let module = Module {
+            identity: self.identity,
+            targets: copy_vec(self.targets),
+            definitions,
+        };
+        verify_module(module)?;
+        Result::Ok(module)
+    }
+}
+
+impl ModuleBuilder {
+    pub fn references(self: ModuleBuilder) -> Vec[FuncRef] {
+        copy_vec(self.module.targets)
+    }
+}

@@ -82,7 +82,9 @@ fn check_use(
 pub fn verify(function: Function) -> Result[(), Error] {
     let count = function.body.len();
     if count == 0 || count > function.limits.max_blocks
-        || function.values.len() > function.limits.max_values {
+        || function.values.len() > function.limits.max_values
+        || function.slots.len() > function.limits.max_values
+        || function.slots.len() > 4096 {
         return Result::Err(error(ErrorKind::LimitExceeded, "invalid function size"))
     }
     let remaining = Ref::new(function.limits.max_verify_steps);

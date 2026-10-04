@@ -8,10 +8,12 @@ fn rewritten_value(source: Function, values: Vec[Option[Value]], value: Value) -
     values[value.slot].ok_or(error(ErrorKind::InvalidHandle, "rewrite uses a removed definition"))
 }
 
-fn rewritten_operation(source: Function, values: Vec[Option[Value]], operation: Operation) -> Result[
-    Operation,
-    Error,
-] {
+fn rewritten_operation(
+    source: Function,
+    identity: Ref[()],
+    values: Vec[Option[Value]],
+    operation: Operation,
+) -> Result[Operation, Error] {
     match operation {
         Constant(_) => Result::Ok(operation),
         Binary(op, left, right) => Result::Ok(
@@ -35,6 +37,36 @@ fn rewritten_operation(source: Function, values: Vec[Option[Value]], operation: 
                 rewritten_value(source, values, no)?,
             ),
         ),
+        FloatBinary(op, left, right) => Result::Ok(
+            Operation::FloatBinary(
+                op,
+                rewritten_value(source, values, left)?,
+                rewritten_value(source, values, right)?,
+            ),
+        ),
+        FloatCompare(cc, left, right) => Result::Ok(
+            Operation::FloatCompare(
+                cc,
+                rewritten_value(source, values, left)?,
+                rewritten_value(source, values, right)?,
+            ),
+        ),
+        Convert(conversion, value) => Result::Ok(
+            Operation::Convert(conversion, rewritten_value(source, values, value)?),
+        ),
+        StackLoad(slot) => {
+            check_stack_slot(source, slot)?;
+            Result::Ok(Operation::StackLoad(StackSlot { slot: slot.slot, owner: identity }))
+        },
+        StackStore(slot, value) => {
+            check_stack_slot(source, slot)?;
+            Result::Ok(
+                Operation::StackStore(
+                    StackSlot { slot: slot.slot, owner: identity },
+                    rewritten_value(source, values, value)?,
+                ),
+            )
+        },
         Call(target, arguments) => {
             let output = Vec::new();
             for argument in arguments {
@@ -66,7 +98,14 @@ fn rewritten_edge(
 }
 
 pub fn rewrite(source: Function, body: Vec[BlockData]) -> Result[Function, Error] {
-    verify(source)?;
+    Result::Ok(rewrite_verified(verified(source)?, body)?.function())
+}
+
+pub fn rewrite_verified(checked: VerifiedFunction, body: Vec[BlockData]) -> Result[
+    VerifiedFunction,
+    Error,
+] {
+    let source = checked.function();
     if body.is_empty() || body.len() > source.body.len() {
         return Result::Err(
             error(ErrorKind::InvalidArgument, "rewrite requires a subset of source blocks"),
@@ -146,7 +185,7 @@ pub fn rewrite(source: Function, body: Vec[BlockData]) -> Result[Function, Error
             instructions.push(
                 Instruction {
                     results,
-                    operation: rewritten_operation(source, values, instruction.operation)?,
+                    operation: rewritten_operation(source, identity, values, instruction.operation)?,
                 },
             );
         }
@@ -192,8 +231,8 @@ pub fn rewrite(source: Function, body: Vec[BlockData]) -> Result[Function, Error
         outputs: copy_vec(source.outputs),
         body: output,
         values: definitions,
+        slots: copy_vec(source.slots),
         limits: source.limits,
     };
-    verify(function)?;
-    Result::Ok(function)
+    verified(function)
 }

@@ -45,28 +45,27 @@ fn comparison_opcode(cc: ir::IntCC) -> string {
     }
 }
 
-fn instruction(lines: Vec[string], value: ir::Instruction, base: isize) -> Result[(), ir::Error] {
+fn instruction(
+    lines: Vec[string],
+    value: ir::Instruction,
+    base: isize,
+    function: ir::Function,
+    locals: isize,
+) -> Result[(), ir::Error] {
     match value.operation {
         Constant(datum) => {
-            let integer = match datum {
-                I64(integer) => integer,
-                Bool(boolean) => if boolean {
-                    1
-                } else {
-                    0
-                },
-            };
+            let integer = datum.bits();
             lines.push("    MOVQ $" + integer.to_string() + ", AX");
         },
         Binary(op, left, right) => {
             load(lines, left, "AX", base);
             load(lines, right, "CX", base);
-            lines.push("    " + binary_opcode(op) + " CX, AX");
+            lines.push("    " + typed_binary_opcode(op, function.value_type(left)?) + " CX, AX");
         },
         Compare(cc, left, right) => {
             load(lines, left, "AX", base);
             load(lines, right, "CX", base);
-            lines.push("    CMPQ AX, CX");
+            lines.push("    " + compare_width(function.value_type(left)?) + " AX, CX");
             lines.push("    " + comparison_opcode(cc) + " AL");
             lines.push("    MOVBQZX AL, AX");
         },
@@ -77,26 +76,46 @@ fn instruction(lines: Vec[string], value: ir::Instruction, base: isize) -> Resul
             lines.push("    CMPQ DX, $0");
             lines.push("    CMOVQEQ CX, AX");
         },
+        FloatBinary(op, left, right) => {
+            load(lines, left, "X0", base);
+            load(lines, right, "X1", base);
+            lines.push("    " + float_opcode(op) + " X1, X0");
+            save(lines, value.results[0], "X0", base);
+            return Result::Ok(())
+        },
+        FloatCompare(cc, left, right) => {
+            load(lines, left, "X0", base);
+            load(lines, right, "X1", base);
+            float_compare(lines, cc);
+        },
+        Convert(op, input) => {
+            load(lines, input, "AX", base);
+            lines.push("    " + conversion_opcode(op) + " AX, AX");
+        },
+        StackLoad(slot) => {
+            let offset = locals + slot.index() * 8;
+            lines.push(f"    MOVQ {offset}(SP), AX");
+        },
+        StackStore(slot, input) => {
+            load(lines, input, "AX", base);
+            let offset = locals + slot.index() * 8;
+            lines.push(f"    MOVQ AX, {offset}(SP)");
+            return Result::Ok(())
+        },
         Call(target, arguments) => {
             let plan = abi::amd64_abi0_signature(target.signature())?;
             abi::validate_identifier(target.name())?;
             for position in 0..arguments.len() {
                 load(lines, arguments[position], "AX", base);
                 let slot = plan.parameters[position];
-                let opcode = match slot.ty {
-                    I64 => "MOVQ",
-                    Bool => "MOVB",
-                };
+                let opcode = abi_store_opcode(slot.ty);
                 let offset = slot.offset;
                 lines.push(f"    {opcode} AX, {offset}(SP)");
             }
             lines.push("    CALL ·" + target.name() + "(SB)");
             for position in 0..value.results.len() {
                 let slot = plan.results[position];
-                let opcode = match slot.ty {
-                    I64 => "MOVQ",
-                    Bool => "MOVBQZX",
-                };
+                let opcode = abi_load_opcode(slot.ty);
                 let offset = slot.offset;
                 lines.push(f"    {opcode} {offset}(SP), AX");
                 save(lines, value.results[position], "AX", base);
@@ -146,7 +165,9 @@ fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled,
         }
     }
     let base = outgoing_bytes(function)?;
-    let stack_slots = base / 8 + function.value_count() + temporary_slots;
+    let stack_slots = base / 8 + function.value_count() + temporary_slots
+        + function.stack_slots().len();
+    let locals = base + (function.value_count() + temporary_slots) * 8;
     let frame_bytes = stack_slots * 8;
     if frame_bytes > 32768 {
         return Result::Err(
@@ -162,13 +183,11 @@ fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled,
     }
     lines.push(f"TEXT ·{name}(SB), $" + frame_bytes.to_string() + f"-{argument_bytes}");
     lines.push("    NO_LOCAL_POINTERS");
+    initialize_slots(lines, function, locals);
     for index in 0..plan.parameters.len() {
         let slot = plan.parameters[index];
         let offset = slot.offset;
-        let opcode = match slot.ty {
-            I64 => "MOVQ",
-            Bool => "MOVBQZX",
-        };
+        let opcode = abi_load_opcode(slot.ty);
         lines.push(f"    {opcode} p{index}+{offset}(FP), AX");
         save(lines, blocks[0].parameters[index], "AX", base);
     }
@@ -176,7 +195,7 @@ fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled,
         let index = block.id.index();
         lines.push(f"block{index}:");
         for value in block.instructions {
-            instruction(lines, value, base)?;
+            instruction(lines, value, base, function, locals)?;
         }
         let term = block.terminator.ok_or(
             ir::error(ir::ErrorKind::ControlFlow, "missing terminator"),
@@ -187,10 +206,7 @@ fn emit_stack_function(function: ir::Function, header: bool) -> Result[Compiled,
                     load(lines, values[position], "AX", base);
                     let slot = plan.results[position];
                     let offset = slot.offset;
-                    let opcode = match slot.ty {
-                        I64 => "MOVQ",
-                        Bool => "MOVB",
-                    };
+                    let opcode = abi_store_opcode(slot.ty);
                     lines.push(f"    {opcode} AX, r{position}+{offset}(FP)");
                 }
                 lines.push("    RET");
@@ -260,7 +276,9 @@ pub fn emit_stack_module(name: string, module: ir::Module) -> Result[Package, ir
     ir::verify_module(module)?;
     for target in module.references() {
         abi::validate_identifier(target.name())?;
-        if Vec::from_array(["init", "main", "int64", "bool"]).contains(target.name()) {
+        if Vec::from_array(["init", "main", "int64", "int32", "float64", "bool"]).contains(
+            target.name(),
+        ) {
             return Result::Err(
                 ir::error(
                     ir::ErrorKind::InvalidArgument,
@@ -270,4 +288,87 @@ pub fn emit_stack_module(name: string, module: ir::Module) -> Result[Package, ir
         }
     }
     emit_stack_package(name, module.functions())
+}
+
+fn typed_binary_opcode(op: ir::BinaryOp, ty: ir::Type) -> string {
+    if ty != ir::Type::I32 {
+        return binary_opcode(op)
+    }
+    match op {
+        Add => "ADDL",
+        Sub => "SUBL",
+        Mul => "IMULL",
+        And => "ANDL",
+        Or => "ORL",
+        Xor => "XORL",
+        Shl => "SHLL",
+        ShrU => "SHRL",
+        ShrS => "SARL",
+    }
+}
+
+fn compare_width(ty: ir::Type) -> string {
+    if ty == ir::Type::I32 {
+        "CMPL"
+    } else {
+        "CMPQ"
+    }
+}
+
+fn conversion_opcode(op: ir::IntConversion) -> string {
+    match op {
+        SignExtend => "MOVLQSX",
+        ZeroExtend | Truncate => "MOVL",
+    }
+}
+
+fn float_opcode(op: ir::FloatOp) -> string {
+    match op {
+        Add => "ADDSD",
+        Sub => "SUBSD",
+        Mul => "MULSD",
+        Div => "DIVSD",
+    }
+}
+
+fn abi_load_opcode(ty: ir::Type) -> string {
+    match ty {
+        I64 | F64 => "MOVQ",
+        I32 => "MOVL",
+        Bool => "MOVBQZX",
+    }
+}
+
+fn abi_store_opcode(ty: ir::Type) -> string {
+    match ty {
+        I64 | F64 => "MOVQ",
+        I32 => "MOVL",
+        Bool => "MOVB",
+    }
+}
+
+fn float_compare(lines: Vec[string], cc: ir::FloatCC) -> () {
+    lines.push("    UCOMISD X1, X0");
+    let opcode = match cc {
+        Equal => "SETEQ",
+        NotEqual => "SETNE",
+        Less => "SETCS",
+        LessEqual => "SETLS",
+    };
+    lines.push("    " + opcode + " AL");
+    if cc == ir::FloatCC::NotEqual {
+        lines.push("    SETPS DL");
+        lines.push("    ORB DL, AL");
+    } else {
+        lines.push("    SETPC DL");
+        lines.push("    ANDB DL, AL");
+    }
+    lines.push("    MOVBQZX AL, AX");
+}
+
+fn initialize_slots(lines: Vec[string], function: ir::Function, base: isize) -> () {
+    for slot in function.stack_slots() {
+        let offset = base + slot.index() * 8;
+        lines.push(f"    MOVQ $0, {offset}(SP)");
+    }
 }

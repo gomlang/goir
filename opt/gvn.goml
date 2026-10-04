@@ -124,6 +124,8 @@ fn expression_key(operation: ir::Operation) -> string {
     };
     match normalized {
         Constant(ir::Datum::I64(value)) => f"i64:{value}",
+        Constant(ir::Datum::I32(value)) => f"i32:{value}",
+        Constant(ir::Datum::F64(value)) => f"f64:{float64_to_bits(value)}",
         Constant(ir::Datum::Bool(value)) => if value {
             "bool:true"
         } else {
@@ -132,7 +134,10 @@ fn expression_key(operation: ir::Operation) -> string {
         Binary(op, left, right) => f"binary:{op.debug()}:{left.index()}:{right.index()}",
         Compare(cc, left, right) => f"compare:{cc.debug()}:{left.index()}:{right.index()}",
         Select(condition, yes, no) => f"select:{condition.index()}:{yes.index()}:{no.index()}",
-        Call(_, _) => "effectful",
+        FloatBinary(op, left, right) => f"float:{op.debug()}:{left.index()}:{right.index()}",
+        FloatCompare(cc, left, right) => f"float_compare:{cc.debug()}:{left.index()}:{right.index()}",
+        Convert(conversion, value) => f"convert:{conversion.debug()}:{value.index()}",
+        StackLoad(_) | StackStore(_, _) | Call(_, _) => "effectful",
     }
 }
 

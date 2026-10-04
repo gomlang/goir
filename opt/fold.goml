@@ -112,12 +112,20 @@ fn fold_binary(
     Replacement::Keep
 }
 
-fn fold(operation: ir::Operation, constants: Vec[Option[ir::Datum]]) -> Replacement {
+fn fold(function: ir::Function, operation: ir::Operation, constants: Vec[Option[ir::Datum]]) -> Replacement {
     match operation {
         Constant(value) => Replacement::Constant(value),
-        Call(_, _) => Replacement::Keep,
-        Binary(op, left, right) => fold_binary(op, left, right, constants),
+        Call(_, _) | StackLoad(_) | StackStore(_, _) | FloatBinary(_, _, _) | FloatCompare(_, _, _) => Replacement::Keep,
+        Convert(conversion, value) => fold_conversion(conversion, constants[value.index()]),
+        Binary(op, left, right) => if is_i32(function, left) {
+            fold_i32(op, left, right, constants)
+        } else {
+            fold_binary(op, left, right, constants)
+        },
         Compare(cc, left, right) => {
+            if is_i32(function, left) {
+                return fold_compare_i32(cc, left, right, constants)
+            }
             let result = match (integer(constants, left), integer(constants, right)) {
                 (Option::Some(a), Option::Some(b)) => Option::Some(
                     match cc {
@@ -168,5 +176,79 @@ fn fold(operation: ir::Operation, constants: Vec[Option[ir::Datum]]) -> Replacem
                 _ => Replacement::Keep,
             }
         },
+    }
+}
+
+fn fold_conversion(conversion: ir::IntConversion, value: Option[ir::Datum]) -> Replacement {
+    match (conversion, value) {
+        (SignExtend, Option::Some(ir::Datum::I32(value))) => constant_integer(value.to_i64()),
+        (ZeroExtend, Option::Some(ir::Datum::I32(value))) => constant_integer(
+            value.to_u32().to_i64(),
+        ),
+        (Truncate, Option::Some(ir::Datum::I64(value))) => Replacement::Constant(
+            ir::Datum::I32(value.to_i32()),
+        ),
+        _ => Replacement::Keep,
+    }
+}
+
+fn fold_i32(op: ir::BinaryOp, left: ir::Value, right: ir::Value, constants: Vec[Option[ir::Datum]]) -> Replacement {
+    match (constants[left.index()], constants[right.index()]) {
+        (Option::Some(ir::Datum::I32(a)), Option::Some(ir::Datum::I32(b))) => {
+            let x = a.to_u32();
+            let y = b.to_u32();
+            let shift = (y & 31).to_isize();
+            let result = match op {
+                Add => x + y,
+                Sub => x - y,
+                Mul => x * y,
+                And => x & y,
+                Or => x | y,
+                Xor => x ^ y,
+                Shl => x << shift,
+                ShrU => x >> shift,
+                ShrS => (a >> shift).to_u32(),
+            };
+            Replacement::Constant(ir::Datum::I32(result.to_i32()))
+        },
+        _ => if left == right {
+            match op {
+                Sub | Xor => Replacement::Constant(ir::Datum::I32(0)),
+                And | Or => Replacement::Alias(left),
+                _ => Replacement::Keep,
+            }
+        } else {
+            Replacement::Keep
+        },
+    }
+}
+
+fn fold_compare_i32(
+    cc: ir::IntCC,
+    left: ir::Value,
+    right: ir::Value,
+    constants: Vec[Option[ir::Datum]],
+) -> Replacement {
+    match (constants[left.index()], constants[right.index()]) {
+        (Option::Some(ir::Datum::I32(a)), Option::Some(ir::Datum::I32(b))) => Replacement::Constant(
+            ir::Datum::Bool(
+                match cc {
+                    Equal => a == b,
+                    NotEqual => a != b,
+                    SignedLess => a < b,
+                    SignedLessEqual => a <= b,
+                    UnsignedLess => a.to_u32() < b.to_u32(),
+                    UnsignedLessEqual => a.to_u32() <= b.to_u32(),
+                },
+            ),
+        ),
+        _ => Replacement::Keep,
+    }
+}
+
+fn is_i32(function: ir::Function, value: ir::Value) -> bool {
+    match function.value_type(value) {
+        Ok(ty) => ty == ir::Type::I32,
+        Err(_) => false,
     }
 }

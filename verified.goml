@@ -1,0 +1,16 @@
+package goir;
+
+pub struct VerifiedFunction {
+    function_value: Function,
+}
+
+impl VerifiedFunction {
+    pub fn function(self: VerifiedFunction) -> Function {
+        self.function_value
+    }
+}
+
+pub fn verified(function: Function) -> Result[VerifiedFunction, Error] {
+    verify(function)?;
+    Result::Ok(VerifiedFunction { function_value: function })
+}

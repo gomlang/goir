@@ -2,112 +2,476 @@ package mach;
 
 use ecosystem::goir as ir;
 
-fn reg(owner: Ref[()], value: ir::Value) -> Reg {
-    Reg { slot: value.index(), owner }
+fn reg(owner: Ref[()], value: ir::Value, source: ir::Function) -> Result[Reg, ir::Error] {
+    Result::Ok(
+        Reg { slot: value.index(), owner, class_value: class_for_type(source.value_type(value)?) },
+    )
 }
 
-fn lower_edge(owner: Ref[()], edge: ir::Edge, blocks: Vec[ir::BlockData]) -> Edge {
+fn lower_edge(owner: Ref[()], edge: ir::Edge, blocks: Vec[ir::BlockData], source: ir::Function) -> Result[
+    Edge,
+    ir::Error,
+] {
     let copies = Vec::new();
     let target = edge.target.index();
     for index in 0..edge.arguments.len() {
         copies.push(
             Copy {
-                source: reg(owner, edge.arguments[index]),
-                destination: reg(owner, blocks[target].parameters[index]),
+                source: reg(owner, edge.arguments[index], source)?,
+                destination: reg(owner, blocks[target].parameters[index], source)?,
             },
         );
     }
-    Edge { target, copies }
+    Result::Ok(Edge { target, copies })
+}
+
+fn integer_constant(operation: Option[ir::Operation]) -> Option[i64] {
+    match operation {
+        Some(ir::Operation::Constant(ir::Datum::I64(value))) => Option::Some(value),
+        Some(ir::Operation::Constant(ir::Datum::I32(value))) => Option::Some(value.to_i64()),
+        _ => Option::None,
+    }
+}
+
+fn commutative(op: ir::BinaryOp) -> bool {
+    match op {
+        Add | Mul | And | Or | Xor => true,
+        _ => false,
+    }
+}
+
+fn lower_binary(
+    dst: Reg,
+    op: ir::BinaryOp,
+    left: Reg,
+    right: Reg,
+    constants: Vec[Option[ir::Operation]],
+    ty: ir::Type,
+) -> Instruction {
+    let mut input = left;
+    let mut constant = integer_constant(constants[right.slot]);
+    if constant == Option::None && commutative(op) {
+        constant = integer_constant(constants[left.slot]);
+        input = right;
+    }
+    match constant {
+        Some(value) => {
+            if op == ir::BinaryOp::Mul && (value == 3 || value == 5 || value == 9) {
+                return Instruction::Lea { dst, value: input, scale: (value - 1).to_isize() }
+            }
+            let immediate = match op {
+                Shl | ShrU | ShrS => value
+                    & if ty == ir::Type::I32 {
+                        31
+                    } else {
+                        63
+                    },
+                _ => value,
+            };
+            if immediate >= -2147483648 && immediate <= 2147483647 {
+                return Instruction::BinaryImmediate { dst, op, left: input, value: immediate }
+            }
+        },
+        None => (),
+    }
+    Instruction::Binary { dst, op, left, right }
 }
 
 pub fn lower(source: ir::Function) -> Result[Function, ir::Error] {
-    ir::verify(source)?;
+    lower_verified(ir::verified(source)?)
+}
+
+pub fn lower_verified(source: ir::VerifiedFunction) -> Result[Function, ir::Error] {
+    lower_source(source.function())
+}
+
+fn lower_source(source: ir::Function) -> Result[Function, ir::Error] {
     let identity = Ref::new(());
     let blocks = source.blocks();
+    let definitions: Vec[Option[ir::Operation]] = Vec::new();
+    let uses = Vec::new();
+    for _ in 0..source.value_count() {
+        definitions.push(Option::None);
+        uses.push(0);
+    }
+    for block in blocks {
+        for instruction in block.instructions {
+            if instruction.results.len() == 1 {
+                definitions[instruction.results[0].index()] = Option::Some(instruction.operation);
+            }
+            for value in ir::operands(instruction.operation) {
+                uses[value.index()] = uses[value.index()] + 1;
+            }
+        }
+        let term = block.terminator.ok_or(
+            ir::error(ir::ErrorKind::ControlFlow, "missing terminator"),
+        )?;
+        match term {
+            Return(values) => {
+                for value in values {
+                    uses[value.index()] = uses[value.index()] + 1;
+                }
+            },
+            Branch(value, _, _) => {
+                uses[value.index()] = uses[value.index()] + 1;
+            },
+            _ => (),
+        }
+        for edge in ir::successors(term) {
+            for value in edge.arguments {
+                uses[value.index()] = uses[value.index()] + 1;
+            }
+        }
+    }
     let body = Vec::new();
     let types = Vec::new();
     for _ in 0..source.value_count() {
         types.push(ir::Type::I64);
     }
     for block in blocks {
-        let parameters = Vec::new();
         for value in block.parameters {
-            parameters.push(reg(identity, value));
             types[value.index()] = source.value_type(value)?;
         }
-        let instructions = Vec::new();
         for instruction in block.instructions {
-            let results = Vec::new();
-            for result in instruction.results {
-                let dst = reg(identity, result);
-                types[dst.slot] = source.value_type(result)?;
-                results.push(dst);
+            for value in instruction.results {
+                types[value.index()] = source.value_type(value)?;
             }
-            if let ir::Operation::Call(target, arguments) = instruction.operation {
-                let uses = Vec::new();
-                for argument in arguments {
-                    uses.push(reg(identity, argument));
-                }
-                instructions.push(Instruction::Call { target, arguments: uses, results });
-                continue;
-            }
-            let dst = results[0];
-            instructions.push(
-                match instruction.operation {
-                    Call(_, _) => return Result::Err(
-                        ir::error(ir::ErrorKind::InvalidState, "call reached scalar lowering"),
-                    ),
-                    Constant(value) => Instruction::Immediate {
-                        dst,
-                        value: match value {
-                            I64(integer) => integer,
-                            Bool(boolean) => if boolean {
-                                1
-                            } else {
-                                0
-                            },
-                        },
-                    },
-                    Binary(op, left, right) => Instruction::Binary {
-                        dst,
-                        op,
-                        left: reg(identity, left),
-                        right: reg(identity, right),
-                    },
-                    Compare(cc, left, right) => Instruction::Compare {
-                        dst,
-                        cc,
-                        left: reg(identity, left),
-                        right: reg(identity, right),
-                    },
-                    Select(condition, yes, no) => Instruction::Select {
-                        dst,
-                        condition: reg(identity, condition),
-                        yes: reg(identity, yes),
-                        no: reg(identity, no),
-                    },
-                },
-            );
+        }
+    }
+    for block in blocks {
+        let parameters = Vec::new();
+        for value in block.parameters {
+            parameters.push(reg(identity, value, source)?);
         }
         let term = block.terminator.ok_or(
             ir::error(ir::ErrorKind::ControlFlow, "missing terminator"),
         )?;
+        let mut fused = Option::None;
+        if let ir::Terminator::Branch(condition, _, _) = term {
+            if uses[condition.index()] == 1 {
+                if let Option::Some(ir::Operation::Compare(cc, left, right)) = definitions[condition.index()] {
+                    fused = Option::Some((condition, cc, left, right));
+                }
+            }
+        }
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            if let Option::Some((condition, _, _, _)) = fused {
+                if instruction.results.len() == 1 && instruction.results[0] == condition {
+                    continue;
+                }
+            }
+            let results = Vec::new();
+            for result in instruction.results {
+                results.push(reg(identity, result, source)?);
+            }
+            match instruction.operation {
+                Call(target, arguments) => {
+                    let values = Vec::new();
+                    for argument in arguments {
+                        values.push(reg(identity, argument, source)?);
+                    }
+                    instructions.push(Instruction::Call { target, arguments: values, results });
+                    continue;
+                },
+                StackStore(slot, value) => {
+                    instructions.push(
+                        Instruction::StackStore { slot, value: reg(identity, value, source)? },
+                    );
+                    continue;
+                },
+                _ => (),
+            }
+            let dst = results[0];
+            instructions.push(
+                match instruction.operation {
+                    Constant(value) => if value.value_type() == ir::Type::F64 {
+                        Instruction::FloatImmediate { dst, bits: value.bits() }
+                    } else {
+                        Instruction::Immediate { dst, value: value.bits() }
+                    },
+                    Binary(op, left, right) => lower_binary(
+                        dst,
+                        op,
+                        reg(identity, left, source)?,
+                        reg(identity, right, source)?,
+                        definitions,
+                        types[dst.slot],
+                    ),
+                    Compare(cc, left, right) => Instruction::Compare {
+                        dst,
+                        cc,
+                        left: reg(identity, left, source)?,
+                        right: reg(identity, right, source)?,
+                    },
+                    Select(condition, yes, no) => if types[dst.slot] == ir::Type::F64 {
+                        Instruction::FloatSelect {
+                            dst,
+                            condition: reg(identity, condition, source)?,
+                            yes: reg(identity, yes, source)?,
+                            no: reg(identity, no, source)?,
+                        }
+                    } else {
+                        Instruction::Select {
+                            dst,
+                            condition: reg(identity, condition, source)?,
+                            yes: reg(identity, yes, source)?,
+                            no: reg(identity, no, source)?,
+                        }
+                    },
+                    FloatBinary(op, left, right) => Instruction::FloatBinary {
+                        dst,
+                        op,
+                        left: reg(identity, left, source)?,
+                        right: reg(identity, right, source)?,
+                    },
+                    FloatCompare(cc, left, right) => Instruction::FloatCompare {
+                        dst,
+                        cc,
+                        left: reg(identity, left, source)?,
+                        right: reg(identity, right, source)?,
+                    },
+                    Convert(op, value) => Instruction::Convert {
+                        dst,
+                        op,
+                        value: reg(identity, value, source)?,
+                    },
+                    StackLoad(slot) => Instruction::StackLoad { dst, slot },
+                    _ => return Result::Err(
+                        ir::error(
+                            ir::ErrorKind::InvalidState,
+                            "effect operation reached scalar lowering",
+                        ),
+                    ),
+                },
+            );
+        }
         let terminator = match term {
-            Jump(edge) => Terminator::Jump(lower_edge(identity, edge, blocks)),
-            Branch(condition, yes, no) => Terminator::Branch {
-                condition: reg(identity, condition),
-                yes: lower_edge(identity, yes, blocks),
-                no: lower_edge(identity, no, blocks),
+            Jump(edge) => Terminator::Jump(lower_edge(identity, edge, blocks, source)?),
+            Branch(condition, yes, no) => {
+                let yes = lower_edge(identity, yes, blocks, source)?;
+                let no = lower_edge(identity, no, blocks, source)?;
+                match fused {
+                    Some((_, cc, left, right)) => Terminator::CompareBranch {
+                        cc,
+                        left: reg(identity, left, source)?,
+                        right: reg(identity, right, source)?,
+                        yes,
+                        no,
+                    },
+                    None => Terminator::Branch {
+                        condition: reg(identity, condition, source)?,
+                        yes,
+                        no,
+                    },
+                }
             },
             Return(values) => {
                 let output = Vec::new();
                 for value in values {
-                    output.push(reg(identity, value));
+                    output.push(reg(identity, value, source)?);
                 }
                 Terminator::Return(output)
             },
         };
         body.push(Block { index: block.id.index(), parameters, instructions, terminator });
     }
-    Result::Ok(Function { source_value: source, identity, body, types })
+    compact(Function { source_value: source, identity, body, types })
+}
+
+fn map_reg(reg: Reg, mapping: Vec[isize]) -> Reg {
+    Reg { slot: mapping[reg.slot], owner: reg.owner, class_value: reg.class_value }
+}
+
+fn map_regs(regs: Vec[Reg], mapping: Vec[isize]) -> Vec[Reg] {
+    let output = Vec::new();
+    for reg in regs {
+        output.push(map_reg(reg, mapping));
+    }
+    output
+}
+
+fn map_edge(edge: Edge, mapping: Vec[isize]) -> Edge {
+    let copies = Vec::new();
+    for copy in edge.copies {
+        copies.push(
+            Copy {
+                source: map_reg(copy.source, mapping),
+                destination: map_reg(copy.destination, mapping),
+            },
+        );
+    }
+    Edge { target: edge.target, copies }
+}
+
+fn map_instruction(instruction: Instruction, mapping: Vec[isize]) -> Instruction {
+    match instruction {
+        Immediate { dst, value } => Instruction::Immediate { dst: map_reg(dst, mapping), value },
+        FloatImmediate { dst, bits } => Instruction::FloatImmediate {
+            dst: map_reg(dst, mapping),
+            bits,
+        },
+        Binary { dst, op, left, right } => Instruction::Binary {
+            dst: map_reg(dst, mapping),
+            op,
+            left: map_reg(left, mapping),
+            right: map_reg(right, mapping),
+        },
+        BinaryImmediate { dst, op, left, value } => Instruction::BinaryImmediate {
+            dst: map_reg(dst, mapping),
+            op,
+            left: map_reg(left, mapping),
+            value,
+        },
+        Lea { dst, value, scale } => Instruction::Lea {
+            dst: map_reg(dst, mapping),
+            value: map_reg(value, mapping),
+            scale,
+        },
+        Compare { dst, cc, left, right } => Instruction::Compare {
+            dst: map_reg(dst, mapping),
+            cc,
+            left: map_reg(left, mapping),
+            right: map_reg(right, mapping),
+        },
+        Select { dst, condition, yes, no } => Instruction::Select {
+            dst: map_reg(dst, mapping),
+            condition: map_reg(condition, mapping),
+            yes: map_reg(yes, mapping),
+            no: map_reg(no, mapping),
+        },
+        FloatBinary { dst, op, left, right } => Instruction::FloatBinary {
+            dst: map_reg(dst, mapping),
+            op,
+            left: map_reg(left, mapping),
+            right: map_reg(right, mapping),
+        },
+        FloatCompare { dst, cc, left, right } => Instruction::FloatCompare {
+            dst: map_reg(dst, mapping),
+            cc,
+            left: map_reg(left, mapping),
+            right: map_reg(right, mapping),
+        },
+        FloatSelect { dst, condition, yes, no } => Instruction::FloatSelect {
+            dst: map_reg(dst, mapping),
+            condition: map_reg(condition, mapping),
+            yes: map_reg(yes, mapping),
+            no: map_reg(no, mapping),
+        },
+        Convert { dst, op, value } => Instruction::Convert {
+            dst: map_reg(dst, mapping),
+            op,
+            value: map_reg(value, mapping),
+        },
+        StackLoad { dst, slot } => Instruction::StackLoad { dst: map_reg(dst, mapping), slot },
+        StackStore { slot, value } => Instruction::StackStore {
+            slot,
+            value: map_reg(value, mapping),
+        },
+        Call { target, arguments, results } => Instruction::Call {
+            target,
+            arguments: map_regs(arguments, mapping),
+            results: map_regs(results, mapping),
+        },
+    }
+}
+
+fn compact(function: Function) -> Result[Function, ir::Error] {
+    let used = Vec::new();
+    for _ in function.types {
+        used.push(false);
+    }
+    for block in function.body {
+        for instruction in block.instructions {
+            for reg in instruction.uses() {
+                used[reg.slot] = true;
+            }
+        }
+        for reg in block.terminator.uses() {
+            used[reg.slot] = true;
+        }
+    }
+    let kept = Vec::new();
+    for _ in function.types {
+        kept.push(false);
+    }
+    let body = Vec::new();
+    for block in function.body {
+        for reg in block.parameters {
+            kept[reg.slot] = true;
+        }
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            let remove = match instruction {
+                Immediate { dst, .. } | FloatImmediate { dst, .. } => !used[dst.slot],
+                _ => false,
+            };
+            if !remove {
+                for reg in instruction.definitions() {
+                    kept[reg.slot] = true;
+                }
+                instructions.push(instruction);
+            }
+        }
+        body.push(
+            Block {
+                index: block.index,
+                parameters: block.parameters,
+                instructions,
+                terminator: block.terminator,
+            },
+        );
+    }
+    let mapping = Vec::new();
+    let types = Vec::new();
+    for index in 0..kept.len() {
+        mapping.push(
+            if kept[index] {
+                let slot = types.len();
+                types.push(function.types[index]);
+                slot
+            } else {
+                -1
+            },
+        );
+    }
+    let output = Vec::new();
+    for block in body {
+        let instructions = Vec::new();
+        for instruction in block.instructions {
+            instructions.push(map_instruction(instruction, mapping));
+        }
+        let terminator = match block.terminator {
+            Jump(edge) => Terminator::Jump(map_edge(edge, mapping)),
+            Branch { condition, yes, no } => Terminator::Branch {
+                condition: map_reg(condition, mapping),
+                yes: map_edge(yes, mapping),
+                no: map_edge(no, mapping),
+            },
+            CompareBranch { cc, left, right, yes, no } => Terminator::CompareBranch {
+                cc,
+                left: map_reg(left, mapping),
+                right: map_reg(right, mapping),
+                yes: map_edge(yes, mapping),
+                no: map_edge(no, mapping),
+            },
+            Return(values) => Terminator::Return(map_regs(values, mapping)),
+        };
+        output.push(
+            Block {
+                index: block.index,
+                parameters: map_regs(block.parameters, mapping),
+                instructions,
+                terminator,
+            },
+        );
+    }
+    Result::Ok(
+        Function {
+            source_value: function.source_value,
+            identity: function.identity,
+            body: output,
+            types,
+        },
+    )
 }

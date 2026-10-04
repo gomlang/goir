@@ -6,7 +6,9 @@ use module::mach;
 use module::regalloc;
 
 fn physical(index: isize) -> string {
-    Vec::from_array(["BX", "SI", "DI", "R8", "R9", "R10", "R11"])[index]
+    Vec::from_array(
+        ["BX", "SI", "DI", "R8", "R9", "R10", "R11", "X3", "X4", "X5", "X6", "X7", "X8", "X9"],
+    )[index]
 }
 
 fn place_at(location: regalloc::Location, base: isize) -> string {
@@ -16,8 +18,12 @@ fn place_at(location: regalloc::Location, base: isize) -> string {
             AX => "AX",
             CX => "CX",
             DX => "DX",
+            X0 => "X0",
+            X1 => "X1",
+            X2 => "X2",
         },
         Stack(index) => (base + index * 8).to_string() + "(SP)",
+        Rematerialized { bits, .. } => "$" + bits.to_string(),
     }
 }
 
@@ -30,7 +36,7 @@ fn move_operand(lines: Vec[string], source: string, destination: string) -> () {
 fn register_location(location: regalloc::Location) -> bool {
     match location {
         Register(_) | Fixed(_) => true,
-        Stack(_) => false,
+        _ => false,
     }
 }
 
@@ -56,24 +62,49 @@ fn allocated_instruction(
     lines: Vec[string],
     instruction: regalloc::AllocatedInstruction,
     base: isize,
+    locals: isize,
+    function: mach::Function,
+    serial: Ref[isize],
 ) -> Result[(), ir::Error] {
     emit_edits(lines, instruction.before, base)?;
     let operands = instruction.operands;
     match instruction.instruction {
-        Immediate { value, .. } => {
+        Immediate { value, .. } => lines.push(
+            "    MOVQ $" + value.to_string() + ", " + place_at(operands[0].location, base),
+        ),
+        FloatImmediate { bits, .. } => {
+            lines.push("    MOVQ $" + bits.to_string() + ", AX");
+            move_operand(lines, "AX", place_at(operands[0].location, base));
+        },
+        Binary { op, dst, .. } => lines.push(
+            "    " + typed_binary_opcode(op, function.register_type(dst)?) + " "
+                + place_at(operands[1].location, base)
+                + ", "
+                + place_at(operands[2].location, base),
+        ),
+        BinaryImmediate { op, dst, value, .. } => lines.push(
+            "    " + typed_binary_opcode(op, function.register_type(dst)?) + " $"
+                + value.to_string()
+                + ", "
+                + place_at(operands[1].location, base),
+        ),
+        Lea { dst, scale, .. } => {
+            let register = place_at(operands[0].location, base);
+            let opcode = if function.register_type(dst)? == ir::Type::I32 {
+                "LEAL"
+            } else {
+                "LEAQ"
+            };
             lines.push(
-                "    MOVQ $" + value.to_string() + ", " + place_at(operands[0].location, base),
+                f"    {opcode} ({register})({register}*{scale}), "
+                    + place_at(operands[1].location, base),
             );
         },
-        Binary { op, .. } => {
+        Compare { cc, left, .. } => {
             lines.push(
-                "    " + binary_opcode(op) + " " + place_at(operands[1].location, base) + ", "
-                    + place_at(operands[2].location, base),
-            );
-        },
-        Compare { cc, .. } => {
-            lines.push(
-                "    CMPQ " + place_at(operands[0].location, base) + ", "
+                "    " + compare_width(function.register_type(left)?) + " "
+                    + place_at(operands[0].location, base)
+                    + ", "
                     + place_at(operands[1].location, base),
             );
             lines.push("    " + comparison_opcode(cc) + " AL");
@@ -86,55 +117,92 @@ fn allocated_instruction(
                     + place_at(operands[3].location, base),
             );
         },
+        FloatBinary { op, .. } => lines.push(
+            "    " + float_opcode(op) + " " + place_at(operands[1].location, base) + ", "
+                + place_at(operands[2].location, base),
+        ),
+        FloatCompare { cc, .. } => float_compare(lines, cc),
+        FloatSelect { .. } => {
+            let label = serial.get();
+            serial.set(label + 1);
+            lines.push("    CMPQ " + place_at(operands[0].location, base) + ", $0");
+            lines.push(f"    JNE select_done{label}");
+            lines.push("    MOVQ X1, X0");
+            lines.push(f"select_done{label}:");
+        },
+        Convert { op, .. } => lines.push(
+            "    " + conversion_opcode(op) + " " + place_at(operands[0].location, base) + ", "
+                + place_at(operands[1].location, base),
+        ),
+        StackLoad { slot, .. } => {
+            let offset = locals + slot.index() * 8;
+            lines.push(f"    MOVQ {offset}(SP), " + place_at(operands[0].location, base));
+        },
+        StackStore { slot, .. } => {
+            let source = operands[0].location;
+            let register = if register_location(source) {
+                place_at(source, base)
+            } else {
+                "AX"
+            };
+            move_operand(lines, place_at(source, base), register);
+            let offset = locals + slot.index() * 8;
+            lines.push("    MOVQ " + register + f", {offset}(SP)");
+        },
         Call { target, arguments, results } => {
             abi::validate_identifier(target.name())?;
             let plan = abi::amd64_abi0_signature(target.signature())?;
             for index in 0..arguments.len() {
                 let location = operands[index].location;
-                let source = if register_location(location) {
+                let register = if register_location(location) {
                     place_at(location, base)
                 } else {
                     "AX"
                 };
-                move_operand(lines, place_at(location, base), source);
+                move_operand(lines, place_at(location, base), register);
                 let slot = plan.parameters[index];
-                let opcode = match slot.ty {
-                    I64 => "MOVQ",
-                    Bool => "MOVB",
-                };
                 let offset = slot.offset;
-                lines.push(f"    {opcode} " + source + f", {offset}(SP)");
+                lines.push("    " + abi_store_opcode(slot.ty) + " " + register + f", {offset}(SP)");
             }
             lines.push("    CALL ·" + target.name() + "(SB)");
             for index in 0..results.len() {
                 let location = operands[arguments.len() + index].location;
-                let destination = if register_location(location) {
+                let register = if register_location(location) {
                     place_at(location, base)
                 } else {
                     "AX"
                 };
                 let slot = plan.results[index];
-                let opcode = match slot.ty {
-                    I64 => "MOVQ",
-                    Bool => "MOVBQZX",
-                };
                 let offset = slot.offset;
-                lines.push(f"    {opcode} {offset}(SP), " + destination);
-                move_operand(lines, destination, place_at(location, base));
+                lines.push("    " + abi_load_opcode(slot.ty) + f" {offset}(SP), " + register);
+                move_operand(lines, register, place_at(location, base));
             }
         },
     }
     emit_edits(lines, instruction.after, base)
 }
 
-fn emit_allocated_edge(lines: Vec[string], edge: regalloc::AllocatedEdge, base: isize) -> Result[
+fn emit_allocated_edge(lines: Vec[string], edge: regalloc::AllocatedEdge, base: isize, next: isize) -> Result[
     (),
     ir::Error,
 ] {
     emit_edits(lines, edge.edits, base)?;
     let target = edge.edge.target;
-    lines.push(f"    JMP block{target}");
+    if target != next {
+        lines.push(f"    JMP block{target}");
+    }
     Result::Ok(())
+}
+
+fn branch_opcode(cc: ir::IntCC) -> string {
+    match cc {
+        Equal => "JEQ",
+        NotEqual => "JNE",
+        SignedLess => "JLT",
+        SignedLessEqual => "JLE",
+        UnsignedLess => "JCS",
+        UnsignedLessEqual => "JLS",
+    }
 }
 
 pub fn emit(function: ir::Function) -> Result[Compiled, ir::Error] {
@@ -153,10 +221,11 @@ pub fn emit_with_options(function: ir::Function, options: regalloc::Options) -> 
             ),
         )
     }
-    emit_allocation(regalloc::allocate_with_options(mach::lower(function)?, options)?)
+    emit_allocated_function(regalloc::allocate_with_options(mach::lower(function)?, options)?, true)
 }
 
 pub fn emit_allocation(allocation: regalloc::Allocation) -> Result[Compiled, ir::Error] {
+    regalloc::verify(allocation)?;
     emit_allocated_function(allocation, true)
 }
 
@@ -164,8 +233,15 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
     Compiled,
     ir::Error,
 ] {
-    regalloc::verify(allocation)?;
-    if allocation.register_count() > 7 {
+    emit_allocated_lines(allocation, header, Vec::new())
+}
+
+fn emit_allocated_lines(allocation: regalloc::Allocation, header: bool, lines: Vec[string]) -> Result[
+    Compiled,
+    ir::Error,
+] {
+    lines.clear();
+    if allocation.register_count() > 14 {
         return Result::Err(
             ir::error(
                 ir::ErrorKind::Unsupported,
@@ -177,7 +253,8 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
     let declaration = abi::declaration(function)?;
     let plan = abi::amd64_abi0(function)?;
     let base = outgoing_bytes(function)?;
-    let stack_slots = base / 8 + allocation.stack_slots();
+    let stack_slots = base / 8 + allocation.stack_slots() + function.stack_slots().len();
+    let locals = base + allocation.stack_slots() * 8;
     let frame_bytes = stack_slots * 8;
     if frame_bytes > 32768 {
         return Result::Err(
@@ -186,22 +263,20 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
     }
     let name = function.name();
     let argument_bytes = plan.argument_bytes;
-    let lines = Vec::new();
     if header {
         lines.push("#include \"funcdata.h\"");
         lines.push("");
     }
     lines.push(f"TEXT ·{name}(SB), $" + frame_bytes.to_string() + f"-{argument_bytes}");
     lines.push("    NO_LOCAL_POINTERS");
+    initialize_slots(lines, function, locals);
+    let serial = Ref::new(0);
     let blocks = allocation.function().blocks();
     let allocated = allocation.blocks();
     for index in 0..plan.parameters.len() {
         let slot = plan.parameters[index];
         let offset = slot.offset;
-        let opcode = match slot.ty {
-            I64 => "MOVQ",
-            Bool => "MOVBQZX",
-        };
+        let opcode = abi_load_opcode(slot.ty);
         let destination = allocation.location(blocks[0].parameters[index])?;
         let register = if register_location(destination) {
             place_at(destination, base)
@@ -215,8 +290,9 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
         let index = block.index;
         lines.push(f"block{index}:");
         for instruction in block.instructions {
-            allocated_instruction(lines, instruction, base)?;
+            allocated_instruction(lines, instruction, base, locals, allocation.function(), serial)?;
         }
+        emit_edits(lines, block.terminal_edits, base)?;
         match blocks[index].terminator {
             Return(values) => {
                 for position in 0..values.len() {
@@ -229,23 +305,33 @@ fn emit_allocated_function(allocation: regalloc::Allocation, header: bool) -> Re
                     move_operand(lines, place_at(source, base), register);
                     let slot = plan.results[position];
                     let offset = slot.offset;
-                    let opcode = match slot.ty {
-                        I64 => "MOVQ",
-                        Bool => "MOVB",
-                    };
+                    let opcode = abi_store_opcode(slot.ty);
                     lines.push(f"    {opcode} " + register + f", r{position}+{offset}(FP)");
                 }
                 lines.push("    RET");
             },
-            Jump(_) => emit_allocated_edge(lines, block.edges[0], base)?,
+            Jump(_) => emit_allocated_edge(lines, block.edges[0], base, index + 1)?,
+            CompareBranch { cc, left, .. } => {
+                let a = block.terminator_operands[0].location;
+                let b = block.terminator_operands[1].location;
+                move_operand(lines, place_at(a, base), "AX");
+                lines.push(
+                    "    " + compare_width(allocation.function().register_type(left)?) + " AX, "
+                        + place_at(b, base),
+                );
+                lines.push("    " + branch_opcode(cc) + f" edge_yes{index}");
+                emit_allocated_edge(lines, block.edges[1], base, -1)?;
+                lines.push(f"edge_yes{index}:");
+                emit_allocated_edge(lines, block.edges[0], base, index + 1)?;
+            },
             Branch { .. } => {
                 lines.push(
                     "    CMPQ " + place_at(block.terminator_operands[0].location, base) + ", $0",
                 );
                 lines.push(f"    JNE edge_yes{index}");
-                emit_allocated_edge(lines, block.edges[1], base)?;
+                emit_allocated_edge(lines, block.edges[1], base, -1)?;
                 lines.push(f"edge_yes{index}:");
-                emit_allocated_edge(lines, block.edges[0], base)?;
+                emit_allocated_edge(lines, block.edges[0], base, index + 1)?;
             },
         }
     }
@@ -308,7 +394,9 @@ pub fn emit_module_with_options(name: string, module: ir::Module, options: regal
     ir::verify_module(module)?;
     for target in module.references() {
         abi::validate_identifier(target.name())?;
-        if Vec::from_array(["init", "main", "int64", "bool"]).contains(target.name()) {
+        if Vec::from_array(["init", "main", "int64", "int32", "float64", "bool"]).contains(
+            target.name(),
+        ) {
             return Result::Err(
                 ir::error(
                     ir::ErrorKind::InvalidArgument,

@@ -4,6 +4,8 @@ impl Type {
     pub fn name(self: Type) -> string {
         match self {
             I64 => "i64",
+            I32 => "i32",
+            F64 => "f64",
             Bool => "bool",
         }
     }
@@ -53,10 +55,17 @@ fn edge_text(edge: Edge) -> string {
 fn operation_text(operation: Operation) -> string {
     match operation {
         Constant(Datum::I64(value)) => f"iconst {value}",
+        Constant(Datum::I32(value)) => f"i32const {value}",
+        Constant(Datum::F64(value)) => f"fconst_bits {float64_to_bits(value)}",
         Constant(Datum::Bool(value)) => f"bconst {value}",
         Binary(op, left, right) => op.name() + f" v{left.slot}, v{right.slot}",
         Compare(cc, left, right) => "icmp " + cc.name() + f" v{left.slot}, v{right.slot}",
         Select(condition, yes, no) => f"select v{condition.slot}, v{yes.slot}, v{no.slot}",
+        FloatBinary(op, left, right) => op.name() + f" v{left.slot}, v{right.slot}",
+        FloatCompare(cc, left, right) => "fcmp " + cc.name() + f" v{left.slot}, v{right.slot}",
+        Convert(conversion, value) => conversion.name() + f" v{value.slot}",
+        StackLoad(slot) => f"stack_load slot{slot.slot}",
+        StackStore(slot, value) => f"stack_store slot{slot.slot}, v{value.slot}",
         Call(target, arguments) => "call " + target.name() + "(" + value_list(arguments) + ")",
     }
 }
@@ -78,6 +87,9 @@ pub fn display(function: Function) -> Result[string, Error] {
                 + ") {",
         ],
     );
+    for index in 0..function.slots.len() {
+        lines.push(f"    slot{index}: " + function.slots[index].name());
+    }
     for block in function.body {
         let parameters = Vec::new();
         for value in block.parameters {
@@ -110,4 +122,36 @@ pub fn display(function: Function) -> Result[string, Error] {
     }
     lines.push("}");
     Result::Ok(lines.join("\n") + "\n")
+}
+
+impl FloatOp {
+    pub fn name(self: FloatOp) -> string {
+        match self {
+            Add => "fadd",
+            Sub => "fsub",
+            Mul => "fmul",
+            Div => "fdiv",
+        }
+    }
+}
+
+impl FloatCC {
+    pub fn name(self: FloatCC) -> string {
+        match self {
+            Equal => "eq",
+            NotEqual => "ne",
+            Less => "lt",
+            LessEqual => "le",
+        }
+    }
+}
+
+impl IntConversion {
+    pub fn name(self: IntConversion) -> string {
+        match self {
+            SignExtend => "sextend",
+            ZeroExtend => "uextend",
+            Truncate => "ireduce",
+        }
+    }
 }

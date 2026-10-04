@@ -1,14 +1,7 @@
 package goir;
 
 fn encode(value: Datum) -> i64 {
-    match value {
-        I64(integer) => integer,
-        Bool(boolean) => if boolean {
-            1
-        } else {
-            0
-        },
-    }
+    value.bits()
 }
 
 fn binary_value(op: BinaryOp, left: i64, right: i64) -> i64 {
@@ -37,11 +30,22 @@ fn compare_value(cc: IntCC, left: i64, right: i64) -> bool {
     }
 }
 
-fn evaluate(operation: Operation, values: Vec[i64]) -> Result[i64, Error] {
+fn evaluate(function: Function, operation: Operation, values: Vec[i64], slots: Vec[i64]) -> Result[
+    i64,
+    Error,
+] {
     let value = match operation {
         Constant(value) => encode(value),
-        Binary(op, left, right) => binary_value(op, values[left.slot], values[right.slot]),
-        Compare(cc, left, right) => if compare_value(cc, values[left.slot], values[right.slot]) {
+        Binary(op, left, right) => if function.values[left.slot].ty == Type::I32 {
+            binary_i32(op, values[left.slot], values[right.slot])
+        } else {
+            binary_value(op, values[left.slot], values[right.slot])
+        },
+        Compare(cc, left, right) => if (if function.values[left.slot].ty == Type::I32 {
+            compare_i32(cc, values[left.slot], values[right.slot])
+        } else {
+            compare_value(cc, values[left.slot], values[right.slot])
+        }) {
             1
         } else {
             0
@@ -51,7 +55,18 @@ fn evaluate(operation: Operation, values: Vec[i64]) -> Result[i64, Error] {
         } else {
             values[no.slot]
         },
-        Call(_, _) => return Result::Err(
+        FloatBinary(op, left, right) => float_binary(op, values[left.slot], values[right.slot]),
+        FloatCompare(cc, left, right) => if float_compare(cc, values[left.slot], values[right.slot]) {
+            1
+        } else {
+            0
+        },
+        Convert(conversion, value) => match conversion {
+            SignExtend | Truncate => values[value.slot].to_i32().to_i64(),
+            ZeroExtend => values[value.slot].to_u32().to_i64(),
+        },
+        StackLoad(slot) => slots[slot.slot],
+        StackStore(_, _) | Call(_, _) => return Result::Err(
             error(ErrorKind::InvalidState, "scalar evaluation received a call"),
         ),
     };
@@ -69,6 +84,7 @@ fn spend_fuel(fuel: Ref[u64]) -> Result[(), Error] {
 struct Frame {
     function: Function,
     values: Vec[i64],
+    slots: Vec[i64],
     block: isize,
     position: isize,
     destinations: Vec[Value],
@@ -102,14 +118,15 @@ fn frame(function: Function, arguments: Vec[Datum], destinations: Vec[Value]) ->
     for index in 0..arguments.len() {
         values[function.body[0].parameters[index].slot] = encode(arguments[index]);
     }
-    Result::Ok(Frame { function, values, block: 0, position: 0, destinations })
+    let slots = Vec::new();
+    for _ in function.slots {
+        slots.push(0);
+    }
+    Result::Ok(Frame { function, values, slots, block: 0, position: 0, destinations })
 }
 
 fn datum(ty: Type, value: i64) -> Datum {
-    match ty {
-        I64 => Datum::I64(value),
-        Bool => Datum::Bool(value != 0),
-    }
+    datum_from_bits(ty, value)
 }
 
 fn execute(
@@ -127,7 +144,7 @@ fn execute(
     }
     let frames = Vec::from_array([frame(initial, arguments, Vec::new())?]);
     let remaining = Ref::new(fuel);
-    let mut cells = initial.value_count();
+    let mut cells = initial.value_count() + initial.slots.len();
     loop {
         let index = frames.len() - 1;
         let mut current = frames[index];
@@ -150,7 +167,8 @@ fn execute(
                     }
                     match module.function(target)? {
                         Some(callee) => {
-                            if frames.len() >= max_depth || callee.value_count() > 1048576 - cells {
+                            if frames.len() >= max_depth
+                                || callee.value_count() + callee.slots.len() > 1048576 - cells {
                                 return Result::Err(
                                     error(
                                         ErrorKind::LimitExceeded,
@@ -158,7 +176,7 @@ fn execute(
                                     ),
                                 )
                             }
-                            cells = cells + callee.value_count();
+                            cells = cells + callee.value_count() + callee.slots.len();
                             frames.push(frame(callee, input, instruction.results)?);
                         },
                         None => {
@@ -172,10 +190,15 @@ fn execute(
                         },
                     }
                 },
+                StackStore(slot, value) => {
+                    current.slots[slot.slot] = current.values[value.slot];
+                },
                 _ => {
                     current.values[instruction.results[0].slot] = evaluate(
+                        function,
                         instruction.operation,
                         current.values,
+                        current.slots,
                     )?;
                 },
             }
@@ -191,7 +214,7 @@ fn execute(
                     );
                 }
                 let _ = frames.pop();
-                cells = cells - function.value_count();
+                cells = cells - function.value_count() - function.slots.len();
                 if frames.is_empty() {
                     return Result::Ok(output)
                 }

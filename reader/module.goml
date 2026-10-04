@@ -1,0 +1,112 @@
+package reader;
+
+use ecosystem::goir as ir;
+
+fn signature_text(signature: ir::Signature) -> string {
+    let inputs = Vec::new();
+    let outputs = Vec::new();
+    for ty in signature.parameter_types() {
+        inputs.push(ty.name());
+    }
+    for ty in signature.result_types() {
+        outputs.push(ty.name());
+    }
+    "(" + inputs.join(", ") + ") -> (" + outputs.join(", ") + ")"
+}
+
+pub fn display_module(module: ir::Module) -> Result[string, ir::Error] {
+    ir::verify_module(module)?;
+    let lines = Vec::from_array(["module {"]);
+    for target in module.references() {
+        let name = tokenize(target.name(), 1)?;
+        if name.tokens.len() != 1 || name.tokens[0] != target.name() {
+            return Result::Err(syntax(1, "module symbol must be one ASCII IR token"))
+        }
+        lines.push(
+            (if target.is_imported() {
+                "import "
+            } else {
+                "declare "
+            })
+                + target.name()
+                + signature_text(target.signature()),
+        );
+    }
+    for function in module.functions() {
+        lines.push(ir::display(function)?);
+    }
+    lines.push("}");
+    Result::Ok(lines.join("\n") + "\n")
+}
+
+pub fn read_module(source: string) -> Result[ir::Module, ir::Error] {
+    if source.len() > 1048576 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "module reader input limit exceeded"),
+        )
+    }
+    let lines = source.split("\n");
+    let declarations = ir::ModuleBuilder::new();
+    let functions: Vec[string] = Vec::new();
+    let mut opened = false;
+    let mut closed = false;
+    let mut body = Vec::new();
+    for index in 0..lines.len() {
+        let cursor = tokenize(lines[index], index + 1)?;
+        if cursor.tokens.is_empty() {
+            continue
+        }
+        if closed {
+            return Result::Err(syntax(index + 1, "trailing module input"))
+        }
+        if !opened {
+            cursor.expect("module")?;
+            cursor.expect("{")?;
+            cursor.end()?;
+            opened = true;
+            continue
+        }
+        if !body.is_empty() {
+            body.push(lines[index]);
+            if cursor.peek() == "}" {
+                cursor.expect("}")?;
+                cursor.end()?;
+                functions.push(body.join("\n") + "\n");
+                body = Vec::new();
+            }
+            continue
+        }
+        match cursor.next()? {
+            "import" | "declare" => {
+                let imported = cursor.tokens[0] == "import";
+                let name = cursor.next()?;
+                let inputs = types(cursor)?;
+                cursor.expect("->")?;
+                let signature = ir::Signature::new(inputs, types(cursor)?)?;
+                cursor.end()?;
+                if imported {
+                    declarations.import(name, signature)?;
+                } else {
+                    declarations.declare(name, signature)?;
+                }
+            },
+            "function" => body.push(lines[index]),
+            "}" => {
+                cursor.end()?;
+                closed = true;
+            },
+            _ => return Result::Err(
+                syntax(index + 1, "expected declaration, function, or module end"),
+            ),
+        }
+    }
+    if !opened || !closed || !body.is_empty() {
+        return Result::Err(syntax(lines.len(), "incomplete module"))
+    }
+    let references = declarations.references();
+    for source in functions {
+        let function = read_with_references(source, references)?;
+        declarations.define(reference(references, function.name(), 1)?, function)?;
+    }
+    declarations.finish()
+}

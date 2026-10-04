@@ -1,0 +1,100 @@
+package amd64;
+
+use ecosystem::goir as ir;
+use module::mach;
+use module::opt;
+use module::regalloc;
+use std::time::{Instant};
+
+#[derive(Debug, PartialEq)]
+pub struct PhaseTimings {
+    pub verify_ns: i64,
+    pub optimize_ns: i64,
+    pub lowering_ns: i64,
+    pub liveness_ns: i64,
+    pub allocation_ns: i64,
+    pub checker_ns: i64,
+    pub emission_ns: i64,
+    pub total_ns: i64,
+}
+
+pub struct Compilation {
+    pub compiled: Compiled,
+    pub function: ir::Function,
+    pub machine: mach::Function,
+    pub allocation: regalloc::Allocation,
+    pub timings: PhaseTimings,
+}
+
+pub struct CompilerContext {
+    workspace: regalloc::Workspace,
+    lines: Vec[string],
+    completed: Ref[isize],
+}
+
+impl CompilerContext {
+    pub fn new() -> CompilerContext {
+        CompilerContext {
+            workspace: regalloc::Workspace::new(),
+            lines: Vec::new(),
+            completed: Ref::new(0),
+        }
+    }
+
+    pub fn retained_capacity(self: CompilerContext) -> isize {
+        self.lines.capacity() + self.workspace.retained_capacity()
+    }
+
+    pub fn completed_functions(self: CompilerContext) -> isize {
+        self.completed.get()
+    }
+
+    pub fn compile(self: CompilerContext, function: ir::Function) -> Result[Compilation, ir::Error] {
+        self.compile_with_options(function, true, regalloc::Options::standard())
+    }
+
+    pub fn compile_with_options(
+        self: CompilerContext,
+        function: ir::Function,
+        optimize: bool,
+        options: regalloc::Options,
+    ) -> Result[Compilation, ir::Error] {
+        let total = Instant::now();
+        let phase = Instant::now();
+        let verified = ir::verified(function)?;
+        let verify_ns = phase.elapsed().as_nanoseconds();
+        let phase = Instant::now();
+        let input = if optimize {
+            opt::simplify_verified(verified)?
+        } else {
+            verified
+        };
+        let optimize_ns = phase.elapsed().as_nanoseconds();
+        let phase = Instant::now();
+        let machine = mach::lower_verified(input)?;
+        let lowering_ns = phase.elapsed().as_nanoseconds();
+        let profiled = regalloc::allocate_profiled(machine, options, self.workspace)?;
+        let phase = Instant::now();
+        let compiled = emit_allocated_lines(profiled.allocation, true, self.lines)?;
+        let emission_ns = phase.elapsed().as_nanoseconds();
+        self.completed.set(self.completed.get() + 1);
+        Result::Ok(
+            Compilation {
+                compiled,
+                function: input.function(),
+                machine,
+                allocation: profiled.allocation,
+                timings: PhaseTimings {
+                    verify_ns,
+                    optimize_ns,
+                    lowering_ns,
+                    liveness_ns: profiled.liveness_ns,
+                    allocation_ns: profiled.allocation_ns,
+                    checker_ns: profiled.checker_ns,
+                    emission_ns,
+                    total_ns: total.elapsed().as_nanoseconds(),
+                },
+            },
+        )
+    }
+}

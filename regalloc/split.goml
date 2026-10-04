@@ -10,6 +10,9 @@ struct Planner {
     homes: Vec[isize],
     slot_owners: Vec[Vec[mach::Reg]],
     limit: isize,
+    pool: isize,
+    constants: Vec[Option[i64]],
+    weights: Vec[isize],
     budget: Ref[isize],
 }
 
@@ -18,6 +21,7 @@ struct BlockState {
     lanes: Vec[Option[mach::Reg]],
     uses: Vec[Vec[isize]],
     cursors: Vec[isize],
+    saved: Vec[bool],
 }
 
 fn current_location(state: BlockState, reg: mach::Reg) -> Result[Location, ir::Error] {
@@ -71,9 +75,18 @@ fn spill_register(planner: Planner, state: BlockState, reg: mach::Reg, edits: Ve
     ir::Error,
 ] {
     let source = current_location(state, reg)?;
-    let home = spill_home(planner, reg)?;
-    move_value(edits, source, home);
-    state.current[reg.index()] = Option::Some(home);
+    let location = match planner.constants[reg.index()] {
+        Some(bits) => Location::Rematerialized { reg, bits },
+        None => {
+            let home = spill_home(planner, reg)?;
+            if !state.saved[reg.index()] {
+                move_value(edits, source, home);
+                state.saved[reg.index()] = true;
+            }
+            home
+        },
+    };
+    state.current[reg.index()] = Option::Some(location);
     match source {
         Register(index) => {
             state.lanes[index] = Option::None;
@@ -109,7 +122,7 @@ fn choose_lane(
     edits: Vec[Edit],
 ) -> Result[Location, ir::Error] {
     if planner.limit == 0 {
-        return Result::Ok(Location::Fixed(mach::FixedReg::AX))
+        return Result::Ok(scratch(reg.class()))
     }
     let preferred = match planner.canonical[reg.index()] {
         Register(index) => index,
@@ -121,9 +134,10 @@ fn choose_lane(
             _ => (),
         }
     }
-    let mut selected = 0;
+    let mut selected = -1;
     let mut farthest = -1;
-    for index in 0..planner.limit {
+    let mut lowest = 9223372036854775807;
+    for index in class_registers(reg.class(), planner.limit) {
         spend(planner.budget)?;
         match state.lanes[index] {
             None => return Result::Ok(Location::Register(index)),
@@ -133,7 +147,13 @@ fn choose_lane(
                     evict_lane(planner, state, index, position, edits)?;
                     return Result::Ok(Location::Register(index))
                 }
-                if next > farthest {
+                let cost = if planner.constants[owner.index()].is_some() {
+                    0
+                } else {
+                    (planner.weights[owner.index()] * 1024) / (next - position + 1)
+                };
+                if selected < 0 || cost < lowest || (cost == lowest && next > farthest) {
+                    lowest = cost;
                     farthest = next;
                     selected = index;
                 }
@@ -172,22 +192,32 @@ fn state_for_block(planner: Planner, block: mach::Block) -> Result[BlockState, i
     let current: Vec[Option[Location]] = Vec::new();
     let uses: Vec[Vec[isize]] = Vec::new();
     let cursors = Vec::new();
+    let saved = Vec::new();
     for _ in 0..planner.function.register_count() {
         spend(planner.budget)?;
         current.push(Option::None);
         uses.push(Vec::new());
         cursors.push(0);
+        saved.push(false);
     }
     let lanes = Vec::new();
-    for _ in 0..planner.limit {
+    for _ in 0..planner.pool {
         lanes.push(Option::None);
     }
-    let state = BlockState { current, lanes, uses, cursors };
+    let state = BlockState { current, lanes, uses, cursors, saved };
     for reg in planner.live.live_in(block.index)? {
         set_location(state, reg, planner.canonical[reg.index()]);
+        state.saved[reg.index()] = match planner.canonical[reg.index()] {
+            Stack(_) => true,
+            _ => false,
+        };
     }
     for reg in block.parameters {
         set_location(state, reg, planner.canonical[reg.index()]);
+        state.saved[reg.index()] = match planner.canonical[reg.index()] {
+            Stack(_) => true,
+            _ => false,
+        };
     }
     for index in 0..block.instructions.len() {
         for reg in block.instructions[index].uses() {
@@ -222,6 +252,7 @@ fn call_plan(planner: Planner, state: BlockState, instruction: mach::Instruction
     }
     let operands = Vec::new();
     let descriptors = instruction.operands();
+    materialize_uses(planner, state, descriptors, before)?;
     for operand in descriptors {
         if operand.kind == mach::OperandKind::Use {
             operands.push(Binding { operand, location: current_location(state, operand.reg)? });
@@ -251,7 +282,7 @@ fn call_plan(planner: Planner, state: BlockState, instruction: mach::Instruction
                 _ => (),
             }
             if location == Option::None {
-                for index in 0..planner.limit {
+                for index in class_registers(operand.reg.class(), planner.limit) {
                     match state.lanes[index] {
                         None => {
                             location = Option::Some(Location::Register(index));
@@ -267,6 +298,10 @@ fn call_plan(planner: Planner, state: BlockState, instruction: mach::Instruction
             };
             operands.push(Binding { operand, location: assigned });
             set_location(state, operand.reg, assigned);
+            state.saved[operand.reg.index()] = match assigned {
+                Stack(_) => true,
+                _ => false,
+            };
         }
     }
     Result::Ok(AllocatedInstruction { instruction, operands, before, after })
@@ -345,6 +380,7 @@ fn instruction_plan(
             move_value(after, location, destination);
         }
     }
+    materialize_uses(planner, state, descriptors, before)?;
     let operands = Vec::new();
     for index in 0..descriptors.len() {
         let operand = descriptors[index];
@@ -371,7 +407,13 @@ fn instruction_plan(
     }
     expire(state, position, true);
     match result {
-        Some(reg) => set_location(state, reg, destination),
+        Some(reg) => {
+            set_location(state, reg, destination);
+            state.saved[reg.index()] = match destination {
+                Stack(_) => true,
+                _ => false,
+            };
+        },
         None => (),
     }
     Result::Ok(AllocatedInstruction { instruction, operands, before, after })
@@ -386,7 +428,18 @@ fn allocate_plan(
     limit: isize,
     budget: Ref[isize],
 ) -> Result[Vec[AllocatedBlock], ir::Error] {
-    let planner = Planner { function, live, canonical, homes, slot_owners, limit, budget };
+    let planner = Planner {
+        function,
+        live,
+        canonical,
+        homes,
+        slot_owners,
+        limit,
+        budget,
+        pool: pool_size(function, limit)?,
+        constants: constants_for(function),
+        weights: value_weights(function, budget)?,
+    };
     let blocks = Vec::new();
     for block in function.blocks() {
         spend(budget)?;
@@ -397,6 +450,10 @@ fn allocate_plan(
             instructions.push(
                 instruction_plan(planner, state, block.instructions[position], position)?,
             );
+        }
+        let terminal_edits = Vec::new();
+        for reg in block.terminator.uses() {
+            materialize_value(planner, state, reg, terminal_edits)?;
         }
         let terminator_operands = Vec::new();
         for reg in block.terminator.uses() {
@@ -433,7 +490,43 @@ fn allocate_plan(
             }
             edges.push(AllocatedEdge { edge, edits: parallel_edits(moves, budget)? });
         }
-        blocks.push(AllocatedBlock { index: block.index, instructions, terminator_operands, edges });
+        blocks.push(
+            AllocatedBlock {
+                index: block.index,
+                instructions,
+                terminator_operands,
+                terminal_edits,
+                edges,
+            },
+        );
     }
     Result::Ok(blocks)
+}
+
+fn materialize_value(planner: Planner, state: BlockState, reg: mach::Reg, edits: Vec[Edit]) -> Result[
+    (),
+    ir::Error,
+] {
+    let location = current_location(state, reg)?;
+    if let Location::Rematerialized { .. } = location {
+        let home = spill_home(planner, reg)?;
+        move_value(edits, location, home);
+        state.current[reg.index()] = Option::Some(home);
+        state.saved[reg.index()] = true;
+    }
+    Result::Ok(())
+}
+
+fn materialize_uses(
+    planner: Planner,
+    state: BlockState,
+    operands: Vec[mach::Operand],
+    edits: Vec[Edit],
+) -> Result[(), ir::Error] {
+    for operand in operands {
+        if operand.kind == mach::OperandKind::Use && operand.constraint == mach::Constraint::Any {
+            materialize_value(planner, state, operand.reg, edits)?;
+        }
+    }
+    Result::Ok(())
 }

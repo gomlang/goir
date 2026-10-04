@@ -8,6 +8,8 @@ use ecosystem::goir::reader;
 pub enum Stage {
     Verify,
     Optimize,
+    Lower,
+    Allocate,
     Compile,
     Run,
 }
@@ -26,6 +28,7 @@ pub fn run(source: string, stage: Stage, arguments: Vec[ir::Datum], fuel: u64) -
         Verify => ir::display(function)?,
         Optimize => ir::display(opt::simplify(function)?)?,
         Compile => amd64::emit(function)?.assembly,
+        Lower | Allocate => stage_text(function, stage)?,
         Run => return Result::Ok(
             Output {
                 text: ir::display(function)?,

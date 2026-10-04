@@ -28,6 +28,7 @@ pub struct AllocatedBlock {
     pub index: isize,
     pub instructions: Vec[AllocatedInstruction],
     pub terminator_operands: Vec[Binding],
+    pub terminal_edits: Vec[Edit],
     pub edges: Vec[AllocatedEdge],
 }
 
@@ -70,6 +71,7 @@ fn copy_plan(input: Vec[AllocatedBlock]) -> Vec[AllocatedBlock] {
                 index: block.index,
                 instructions,
                 terminator_operands: copy_vec(block.terminator_operands),
+                terminal_edits: copy_vec(block.terminal_edits),
                 edges,
             },
         );

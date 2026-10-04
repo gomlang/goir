@@ -2,12 +2,17 @@ package regalloc;
 
 use ecosystem::goir as ir;
 use module::mach;
+use std::time;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Location {
     Register(isize),
     Stack(isize),
     Fixed(mach::FixedReg),
+    Rematerialized {
+        reg: mach::Reg,
+        bits: i64,
+    },
 }
 
 pub struct Options {
@@ -26,6 +31,7 @@ pub struct Allocation {
     locations: Vec[Location],
     live: Liveness,
     register_limit: isize,
+    class_limit: isize,
     slots: isize,
     spilled_values: isize,
     plan: Vec[AllocatedBlock],
@@ -55,6 +61,16 @@ impl Allocation {
 
     pub fn register_count(self: Allocation) -> isize {
         self.register_limit
+    }
+
+    pub fn registers(self: Allocation, class: mach::RegClass) -> Vec[Location] {
+        let output = Vec::new();
+        for index in class_registers(class, self.class_limit) {
+            if index < self.register_limit {
+                output.push(Location::Register(index));
+            }
+        }
+        output
     }
 
     pub fn liveness(self: Allocation) -> Liveness {
@@ -98,6 +114,28 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
     Allocation,
     ir::Error,
 ] {
+    Result::Ok(allocate_profiled(function, options, Workspace::new())?.allocation)
+}
+
+pub fn allocate_profiled(function: mach::Function, options: Options, workspace: Workspace) -> Result[
+    ProfiledAllocation,
+    ir::Error,
+] {
+    if workspace.active.get() {
+        return Result::Err(
+            ir::error(ir::ErrorKind::InvalidState, "allocation workspace is already active"),
+        )
+    }
+    workspace.active.set(true);
+    let output = allocate_in_workspace(function, options, workspace);
+    workspace.active.set(false);
+    output
+}
+
+fn allocate_in_workspace(function: mach::Function, options: Options, workspace: Workspace) -> Result[
+    ProfiledAllocation,
+    ir::Error,
+] {
     if options.registers < 0 || options.registers > 7 || options.max_steps < 1
         || options.max_steps > 100000000 {
         return Result::Err(
@@ -105,10 +143,14 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
         )
     }
     let budget = Ref::new(options.max_steps);
-    let live = analyze_with_budget(function, budget)?;
+    let started = time::Instant::now();
+    let live = analyze_with_workspace(function, budget, workspace)?;
+    let liveness_ns = started.elapsed().as_nanoseconds();
+    let allocation_started = time::Instant::now();
+    let register_limit = pool_size(function, options.registers)?;
     let hints = preferences(function, budget)?;
     let lanes: Vec[Vec[mach::Reg]] = Vec::new();
-    for _ in 0..options.registers {
+    for _ in 0..register_limit {
         lanes.push(Vec::new());
     }
     let slot_owners: Vec[Vec[mach::Reg]] = Vec::new();
@@ -125,6 +167,10 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
             spend(budget)?;
             match locations[hint.index()] {
                 Register(index) => {
+                    if location_class(Location::Register(index))
+                        != Option::Some(interval.reg.class()) {
+                        continue;
+                    }
                     drop_expired(live, lanes[index], interval.start, budget)?;
                     if lane_available(live, lanes[index], interval.reg, budget)? {
                         selected = index;
@@ -135,7 +181,7 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
             }
         }
         if selected < 0 {
-            for index in 0..lanes.len() {
+            for index in class_registers(interval.reg.class(), options.registers) {
                 drop_expired(live, lanes[index], interval.start, budget)?;
                 if lane_available(live, lanes[index], interval.reg, budget)? {
                     selected = index;
@@ -166,6 +212,7 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
             homes[interval.reg.index()] = slot;
         }
     }
+    coalesce_edges(function, live, locations, budget)?;
     let plan = allocate_plan(
         function,
         live,
@@ -185,13 +232,17 @@ pub fn allocate_with_options(function: mach::Function, options: Options) -> Resu
         machine: function,
         locations,
         live,
-        register_limit: options.registers,
+        register_limit,
+        class_limit: options.registers,
         slots: slot_owners.len(),
         spilled_values,
         plan,
     };
+    let allocation_ns = allocation_started.elapsed().as_nanoseconds();
+    let checking_started = time::Instant::now();
     verify_with_budget(allocation, budget)?;
-    Result::Ok(allocation)
+    let checker_ns = checking_started.elapsed().as_nanoseconds();
+    Result::Ok(ProfiledAllocation { allocation, liveness_ns, allocation_ns, checker_ns })
 }
 
 pub fn verify(allocation: Allocation) -> Result[(), ir::Error] {
@@ -201,7 +252,10 @@ pub fn verify(allocation: Allocation) -> Result[(), ir::Error] {
 fn verify_with_budget(allocation: Allocation, budget: Ref[isize]) -> Result[(), ir::Error] {
     if allocation.locations.len() != allocation.machine.register_count()
         || allocation.register_limit < 0
-        || allocation.register_limit > 7
+        || allocation.register_limit > 14
+        || allocation.class_limit < 0
+        || allocation.class_limit > 7
+        || allocation.register_limit != pool_size(allocation.machine, allocation.class_limit)?
         || allocation.slots < 0
         || allocation.slots > allocation.locations.len() {
         return Result::Err(ir::error(ir::ErrorKind::InvalidArgument, "invalid allocation shape"))
@@ -214,7 +268,8 @@ fn verify_with_budget(allocation: Allocation, budget: Ref[isize]) -> Result[(), 
         let location = allocation.location(interval.reg)?;
         let lane = match location {
             Register(index) => {
-                if index < 0 || index >= allocation.register_limit {
+                if !valid_register(index, allocation.class_limit, allocation.register_limit)
+                    || location_class(location) != Option::Some(interval.reg.class()) {
                     return Result::Err(
                         ir::error(ir::ErrorKind::InvalidHandle, "invalid physical register"),
                     )
@@ -229,7 +284,7 @@ fn verify_with_budget(allocation: Allocation, budget: Ref[isize]) -> Result[(), 
                 }
                 allocation.register_limit + index
             },
-            Fixed(_) => return Result::Err(
+            Fixed(_) | Rematerialized { .. } => return Result::Err(
                 ir::error(ir::ErrorKind::InvalidHandle, "fixed register cannot be a canonical home"),
             ),
         };

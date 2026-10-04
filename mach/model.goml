@@ -6,9 +6,20 @@ use ecosystem::goir as ir;
 pub struct Reg {
     slot: isize,
     owner: Ref[()],
+    class_value: RegClass,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum RegClass {
+    Integer,
+    Float,
 }
 
 impl Reg {
+    pub fn class(self: Reg) -> RegClass {
+        self.class_value
+    }
+
     pub fn index(self: Reg) -> isize {
         self.slot
     }
@@ -25,6 +36,9 @@ pub enum FixedReg {
     AX,
     CX,
     DX,
+    X0,
+    X1,
+    X2,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -67,11 +81,26 @@ pub enum Instruction {
         dst: Reg,
         value: i64,
     },
+    FloatImmediate {
+        dst: Reg,
+        bits: i64,
+    },
     Binary {
         dst: Reg,
         op: ir::BinaryOp,
         left: Reg,
         right: Reg,
+    },
+    BinaryImmediate {
+        dst: Reg,
+        op: ir::BinaryOp,
+        left: Reg,
+        value: i64,
+    },
+    Lea {
+        dst: Reg,
+        value: Reg,
+        scale: isize,
     },
     Compare {
         dst: Reg,
@@ -85,6 +114,37 @@ pub enum Instruction {
         yes: Reg,
         no: Reg,
     },
+    FloatBinary {
+        dst: Reg,
+        op: ir::FloatOp,
+        left: Reg,
+        right: Reg,
+    },
+    FloatCompare {
+        dst: Reg,
+        cc: ir::FloatCC,
+        left: Reg,
+        right: Reg,
+    },
+    FloatSelect {
+        dst: Reg,
+        condition: Reg,
+        yes: Reg,
+        no: Reg,
+    },
+    Convert {
+        dst: Reg,
+        op: ir::IntConversion,
+        value: Reg,
+    },
+    StackLoad {
+        dst: Reg,
+        slot: ir::StackSlot,
+    },
+    StackStore {
+        slot: ir::StackSlot,
+        value: Reg,
+    },
     Call {
         target: ir::FuncRef,
         arguments: Vec[Reg],
@@ -95,9 +155,16 @@ pub enum Instruction {
 impl Instruction {
     pub fn definitions(self: Instruction) -> Vec[Reg] {
         match self {
-            Immediate { dst, .. } | Binary { dst, .. } | Compare { dst, .. } | Select { dst, .. } => Vec::from_array(
+            Immediate { dst, .. } | FloatImmediate { dst, .. } | Binary { dst, .. } | BinaryImmediate {
+                dst,
+                ..,
+            } | Lea { dst, .. } | Compare { dst, .. } | Select { dst, .. } | FloatBinary { dst, .. } | FloatCompare {
+                dst,
+                ..,
+            } | FloatSelect { dst, .. } | Convert { dst, .. } | StackLoad { dst, .. } => Vec::from_array(
                 [dst],
             ),
+            StackStore { .. } => Vec::new(),
             Call { results, .. } => copy_vec(results),
         }
     }
@@ -105,7 +172,7 @@ impl Instruction {
     pub fn operands(self: Instruction) -> Vec[Operand] {
         let uses = self.uses();
         let constraints = match self {
-            Immediate { .. } => Vec::new(),
+            Immediate { .. } | FloatImmediate { .. } | StackLoad { .. } => Vec::new(),
             Binary { op, .. } => Vec::from_array(
                 [
                     Constraint::Register,
@@ -115,10 +182,20 @@ impl Instruction {
                     },
                 ],
             ),
-            Compare { .. } => Vec::from_array([Constraint::Register, Constraint::Any]),
+            BinaryImmediate { .. } | Lea { .. } => Vec::from_array([Constraint::Register]),
+            Compare { .. } | FloatBinary { .. } => Vec::from_array(
+                [Constraint::Register, Constraint::Any],
+            ),
             Select { .. } => Vec::from_array(
                 [Constraint::Any, Constraint::Register, Constraint::Any],
             ),
+            FloatCompare { .. } => Vec::from_array(
+                [Constraint::Fixed(FixedReg::X0), Constraint::Fixed(FixedReg::X1)],
+            ),
+            FloatSelect { .. } => Vec::from_array(
+                [Constraint::Any, Constraint::Fixed(FixedReg::X0), Constraint::Fixed(FixedReg::X1)],
+            ),
+            Convert { .. } | StackStore { .. } => Vec::from_array([Constraint::Any]),
             Call { .. } => {
                 let constraints = Vec::new();
                 for _ in uses {
@@ -139,11 +216,12 @@ impl Instruction {
             );
         }
         let constraint = match self {
-            Immediate { .. } => Constraint::Register,
-            Binary { .. } => Constraint::Reuse(0),
-            Compare { .. } => Constraint::Fixed(FixedReg::AX),
+            Binary { .. } | BinaryImmediate { .. } | FloatBinary { .. } => Constraint::Reuse(0),
+            Compare { .. } | FloatCompare { .. } => Constraint::Fixed(FixedReg::AX),
             Select { .. } => Constraint::Reuse(1),
+            FloatSelect { .. } => Constraint::Fixed(FixedReg::X0),
             Call { .. } => Constraint::Any,
+            _ => Constraint::Register,
         };
         for reg in self.definitions() {
             output.push(
@@ -155,13 +233,26 @@ impl Instruction {
 
     pub fn clobbers(self: Instruction) -> Vec[Clobber] {
         match self {
-            Immediate { .. } => Vec::new(),
+            Immediate { .. } | Lea { .. } | StackLoad { .. } | Convert { .. } => Vec::new(),
+            StackStore { .. } => Vec::from_array([Clobber::Fixed(FixedReg::AX)]),
+            FloatImmediate { .. } => Vec::from_array([Clobber::Fixed(FixedReg::AX)]),
+            FloatBinary { .. } => Vec::new(),
+            FloatCompare { .. } => Vec::from_array([Clobber::Flags, Clobber::Fixed(FixedReg::DX)]),
             Call { .. } => {
                 let output = Vec::new();
-                for index in 0..7 {
+                for index in 0..14 {
                     output.push(Clobber::Register(index));
                 }
-                for register in Vec::from_array([FixedReg::AX, FixedReg::CX, FixedReg::DX]) {
+                for register in Vec::from_array(
+                    [
+                        FixedReg::AX,
+                        FixedReg::CX,
+                        FixedReg::DX,
+                        FixedReg::X0,
+                        FixedReg::X1,
+                        FixedReg::X2,
+                    ],
+                ) {
                     output.push(Clobber::Fixed(register));
                 }
                 output.push(Clobber::Flags);
@@ -173,11 +264,19 @@ impl Instruction {
 
     pub fn uses(self: Instruction) -> Vec[Reg] {
         match self {
-            Immediate { .. } => Vec::new(),
-            Binary { left, right, .. } | Compare { left, right, .. } => Vec::from_array(
-                [left, right],
+            Immediate { .. } | FloatImmediate { .. } | StackLoad { .. } => Vec::new(),
+            Binary { left, right, .. } | Compare { left, right, .. } | FloatBinary {
+                left,
+                right,
+                ..,
+            } | FloatCompare { left, right, .. } => Vec::from_array([left, right]),
+            BinaryImmediate { left, .. } => Vec::from_array([left]),
+            Lea { value, .. } | Convert { value, .. } | StackStore { value, .. } => Vec::from_array(
+                [value],
             ),
-            Select { condition, yes, no, .. } => Vec::from_array([condition, yes, no]),
+            Select { condition, yes, no, .. } | FloatSelect { condition, yes, no, .. } => Vec::from_array(
+                [condition, yes, no],
+            ),
             Call { arguments, .. } => copy_vec(arguments),
         }
     }
@@ -200,6 +299,13 @@ pub enum Terminator {
         yes: Edge,
         no: Edge,
     },
+    CompareBranch {
+        cc: ir::IntCC,
+        left: Reg,
+        right: Reg,
+        yes: Edge,
+        no: Edge,
+    },
     Return(Vec[Reg]),
 }
 
@@ -207,7 +313,9 @@ impl Terminator {
     pub fn successors(self: Terminator) -> Vec[Edge] {
         match self {
             Jump(edge) => Vec::from_array([copy_edge(edge)]),
-            Branch { yes, no, .. } => Vec::from_array([copy_edge(yes), copy_edge(no)]),
+            Branch { yes, no, .. } | CompareBranch { yes, no, .. } => Vec::from_array(
+                [copy_edge(yes), copy_edge(no)],
+            ),
             Return(_) => Vec::new(),
         }
     }
@@ -216,6 +324,7 @@ impl Terminator {
         let values = match self {
             Return(values) => copy_vec(values),
             Branch { condition, .. } => Vec::from_array([condition]),
+            CompareBranch { left, right, .. } => Vec::from_array([left, right]),
             _ => Vec::new(),
         };
         for edge in self.successors() {
@@ -272,6 +381,13 @@ fn copy_term(term: Terminator) -> Terminator {
             yes: copy_edge(yes),
             no: copy_edge(no),
         },
+        CompareBranch { cc, left, right, yes, no } => Terminator::CompareBranch {
+            cc,
+            left,
+            right,
+            yes: copy_edge(yes),
+            no: copy_edge(no),
+        },
         Return(values) => Terminator::Return(copy_vec(values)),
     }
 }
@@ -289,7 +405,13 @@ impl Function {
         if index < 0 || index >= self.types.len() {
             return Result::Err(ir::error(ir::ErrorKind::InvalidHandle, "invalid machine register"))
         }
-        Result::Ok(Reg { slot: index, owner: self.identity })
+        Result::Ok(
+            Reg {
+                slot: index,
+                owner: self.identity,
+                class_value: class_for_type(self.types[index]),
+            },
+        )
     }
 
     pub fn register_type(self: Function, reg: Reg) -> Result[ir::Type, ir::Error] {
@@ -322,5 +444,13 @@ impl Function {
             );
         }
         blocks
+    }
+}
+
+fn class_for_type(ty: ir::Type) -> RegClass {
+    if ty == ir::Type::F64 {
+        RegClass::Float
+    } else {
+        RegClass::Integer
     }
 }
