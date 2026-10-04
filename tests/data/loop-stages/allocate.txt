@@ -1,0 +1,43 @@
+machine Countdown
+algorithm Algorithm::Global
+registers 7 stack_slots 2
+block0:
+    home r0 @ Location::Register(0)
+    home r1 @ Location::Register(1)
+    r1 = immediate 0
+        Operand { reg: r1, kind: OperandKind::Def, position: OperandPosition::Late, constraint: Constraint::Register } @ Location::Register(1)
+    jump block1
+    terminator Operand { reg: r0, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Any } @ Location::Register(0)
+    terminator Operand { reg: r1, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Any } @ Location::Register(1)
+    edge block1
+        edit Location::Register(1) -> Location::Register(2)
+block1:
+    home r1 @ Location::Register(1)
+    home r2 @ Location::Register(0)
+    home r3 @ Location::Register(2)
+    home r4 @ Location::Register(3)
+    home r5 @ Location::Register(4)
+    before edit Location::Register(0) -> Location::Stack(0)
+    r4 = isub_immediate r2, 1
+        clobber Clobber::Flags
+        Operand { reg: r2, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Register } @ Location::Register(0)
+        Operand { reg: r4, kind: OperandKind::Def, position: OperandPosition::Late, constraint: Constraint::Reuse(0) } @ Location::Register(0)
+    before edit Location::Register(2) -> Location::Stack(1)
+    r5 = iadd r3, r2
+        clobber Clobber::Flags
+        Operand { reg: r3, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Register } @ Location::Register(2)
+        Operand { reg: r2, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Any } @ Location::Stack(0)
+        Operand { reg: r5, kind: OperandKind::Def, position: OperandPosition::Late, constraint: Constraint::Reuse(0) } @ Location::Register(2)
+    compare_branch slt r1, r2, block1, block2
+    terminator Operand { reg: r1, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Any } @ Location::Register(1)
+    terminator Operand { reg: r2, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Any } @ Location::Stack(0)
+    terminator Operand { reg: r4, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Any } @ Location::Register(0)
+    terminator Operand { reg: r5, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Any } @ Location::Register(2)
+    terminator Operand { reg: r3, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Any } @ Location::Stack(1)
+    edge block1
+    edge block2
+        edit Location::Stack(1) -> Location::Register(2)
+block2:
+    home r6 @ Location::Register(2)
+    return r6
+    terminator Operand { reg: r6, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Any } @ Location::Register(2)

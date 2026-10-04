@@ -1,0 +1,38 @@
+machine Countdown
+block0:
+    parameter r0
+    r1 = immediate 0
+        Operand { reg: r1, kind: OperandKind::Def, position: OperandPosition::Late, constraint: Constraint::Register }
+    jump block1
+    terminator use r0
+    terminator use r1
+    edge block1
+        r0 -> r2
+        r1 -> r3
+block1:
+    parameter r2
+    parameter r3
+    r4 = isub_immediate r2, 1
+        Operand { reg: r2, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Register }
+        Operand { reg: r4, kind: OperandKind::Def, position: OperandPosition::Late, constraint: Constraint::Reuse(0) }
+        clobber Clobber::Flags
+    r5 = iadd r3, r2
+        Operand { reg: r3, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Register }
+        Operand { reg: r2, kind: OperandKind::Use, position: OperandPosition::Early, constraint: Constraint::Any }
+        Operand { reg: r5, kind: OperandKind::Def, position: OperandPosition::Late, constraint: Constraint::Reuse(0) }
+        clobber Clobber::Flags
+    compare_branch slt r1, r2, block1, block2
+    terminator use r1
+    terminator use r2
+    terminator use r4
+    terminator use r5
+    terminator use r3
+    edge block1
+        r4 -> r2
+        r5 -> r3
+    edge block2
+        r3 -> r6
+block2:
+    parameter r6
+    return r6
+    terminator use r6
