@@ -1,0 +1,64 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::filetest;
+use ecosystem::goir::reader;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::testing;
+use std::text;
+
+#[test]
+fn native_failure_reduction_keeps_the_trigger_and_rejects_compile_errors() -> () {
+    let directory = path::join(
+        "_artifact",
+        "goir-reducer-"
+            + hash::sha256(testing::expect_ok(rand::bytes(16), "unique reducer artifact")),
+    );
+    testing::assert_ok(fs::create_dir_all(directory));
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "go.mod"),
+            "module goir-reducer-test\n\ngo 1.26.0\n",
+        ),
+    );
+    let function = testing::expect_ok(
+        reader::read(
+            "function Trigger(i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\nv2: i64 = imul v0, v1\nv3: i64 = iadd v0, v1\nreturn v3\n}",
+        ),
+        "reducer source",
+    );
+    let arguments = Vec::from_array([ir::Datum::I64(2), ir::Datum::I64(3)]);
+    let predicate = |candidate: ir::Function| {
+        let output = amd64::emit_stack_package("reproduce", Vec::from_array([candidate]))?;
+        reproduce_emitted(
+            directory,
+            candidate,
+            arguments,
+            amd64::Package {
+                assembly: text::replace(output.assembly, "ADDQ CX, AX", "SUBQ CX, AX"),
+                declarations: output.declarations,
+            },
+        )
+    };
+    let reduced = testing::expect_ok(
+        filetest::reduce(function, 8, predicate),
+        "reduce injected native arithmetic failure",
+    );
+    testing::assert(reduced.accepted > 0 && reduced.function.value_count() < function.value_count());
+    testing::assert(testing::expect_ok(predicate(reduced.function), "native mismatch preserved"));
+    let broken = amd64::Package {
+        declarations: "package reproduce\n",
+        assembly: "invalid assembly\n",
+    };
+    testing::assert(
+        !testing::expect_ok(
+            reproduce_emitted(directory, reduced.function, arguments, broken),
+            "compile error is not a matching runtime failure",
+        ),
+    );
+    testing::assert_ok(fs::remove_dir_all(directory));
+}

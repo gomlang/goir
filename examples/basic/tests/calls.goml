@@ -1,0 +1,272 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use std::testing;
+
+fn call_signature(inputs: Vec[ir::Type], outputs: Vec[ir::Type]) -> ir::Signature {
+    testing::expect_ok(ir::Signature::new(inputs, outputs), "call signature")
+}
+
+fn define_call(
+    module: ir::ModuleBuilder,
+    reference: ir::FuncRef,
+    builder: ir::Builder,
+    optimize: bool,
+) -> () {
+    let function = testing::expect_ok(builder.finish(), "call function");
+    testing::assert_ok(
+        module.define(
+            reference,
+            if optimize {
+                testing::expect_ok(opt::simplify(function), "optimize calls")
+            } else {
+                function
+            },
+        ),
+    );
+}
+
+fn calls_module(optimize: bool) -> ir::Module {
+    let module = ir::ModuleBuilder::new();
+    let scalar = Vec::from_array([ir::Type::I64]);
+    let pair_types = Vec::from_array([ir::Type::I64, ir::Type::I64]);
+    let mixed = Vec::from_array([ir::Type::Bool, ir::Type::I64, ir::Type::Bool]);
+    let pair = testing::expect_ok(
+        module.declare(
+            "CallPair",
+            call_signature(
+                pair_types,
+                Vec::from_array([ir::Type::I64, ir::Type::Bool, ir::Type::I64]),
+            ),
+        ),
+        "pair reference",
+    );
+    let nested = testing::expect_ok(
+        module.declare("CallNested", call_signature(pair_types, scalar)),
+        "nested reference",
+    );
+    let recursive = testing::expect_ok(
+        module.declare("CallRecursive", call_signature(scalar, scalar)),
+        "recursive reference",
+    );
+    let collect = testing::expect_ok(
+        module.declare("CallCollect", call_signature(scalar, scalar)),
+        "collect reference",
+    );
+    let touch = testing::expect_ok(
+        module.declare("CallEffect", call_signature(scalar, Vec::new())),
+        "effect reference",
+    );
+    let no_args = testing::expect_ok(
+        module.declare("CallNoArgs", call_signature(Vec::new(), Vec::new())),
+        "no-argument reference",
+    );
+    let go_no_args = testing::expect_ok(
+        module.import("GoNoArgs", call_signature(Vec::new(), Vec::new())),
+        "Go no-argument reference",
+    );
+    let go_mix = testing::expect_ok(
+        module.import("GoMix", call_signature(mixed, mixed)),
+        "Go mix reference",
+    );
+    let go_touch = testing::expect_ok(
+        module.import("GoTouch", call_signature(scalar, Vec::new())),
+        "Go effect reference",
+    );
+    let go_collect = testing::expect_ok(
+        module.import("GoCollect", call_signature(scalar, scalar)),
+        "Go GC reference",
+    );
+    let builder = testing::expect_ok(ir::Builder::for_function(no_args), "no-argument builder");
+    let _ = testing::expect_ok(builder.call(go_no_args, Vec::new()), "no-argument call");
+    testing::assert_ok(builder.ret(Vec::new()));
+    define_call(module, no_args, builder, optimize);
+    let builder = testing::expect_ok(ir::Builder::for_function(pair), "pair builder");
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "pair args");
+    let sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, args[0], args[1]), "sum");
+    let less = testing::expect_ok(builder.icmp(ir::IntCC::SignedLess, args[0], args[1]), "less");
+    let difference = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Sub, args[0], args[1]),
+        "difference",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([sum, less, difference])));
+    define_call(module, pair, builder, optimize);
+    let builder = testing::expect_ok(ir::Builder::for_function(nested), "nested builder");
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "nested args");
+    let alive = Vec::new();
+    for index in 0..12 {
+        let constant = testing::expect_ok(builder.iconst(index.to_i64() * 13 + 1), "live constant");
+        alive.push(
+            testing::expect_ok(builder.binary(ir::BinaryOp::Xor, args[0], constant), "live value"),
+        );
+    }
+    let returned = testing::expect_ok(builder.call(pair, args), "multiple results");
+    let _ = testing::expect_ok(
+        builder.call(go_touch, Vec::from_array([returned[2]])),
+        "zero results",
+    );
+    let truth = testing::expect_ok(builder.bconst(true), "boolean");
+    let mixed_results = testing::expect_ok(
+        builder.call(go_mix, Vec::from_array([returned[1], returned[0], truth])),
+        "Go mixed results",
+    );
+    let chosen = testing::expect_ok(
+        builder.select(mixed_results[0], mixed_results[1], returned[2]),
+        "mixed selection",
+    );
+    let mut value = chosen;
+    for other in alive {
+        value = testing::expect_ok(
+            builder.binary(ir::BinaryOp::Add, value, other),
+            "across-call value",
+        );
+    }
+    testing::assert_ok(builder.ret(Vec::from_array([value])));
+    define_call(module, nested, builder, optimize);
+    let builder = testing::expect_ok(ir::Builder::for_function(touch), "effect builder");
+    let _ = testing::expect_ok(
+        builder.call(
+            go_touch,
+            testing::expect_ok(builder.parameters(builder.entry()), "effect args"),
+        ),
+        "effect",
+    );
+    testing::assert_ok(builder.ret(Vec::new()));
+    define_call(module, touch, builder, optimize);
+    let builder = testing::expect_ok(ir::Builder::for_function(collect), "collect builder");
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "collect args");
+    let alive = Vec::new();
+    for index in 0..20 {
+        let constant = testing::expect_ok(builder.iconst(index.to_i64()), "GC constant");
+        alive.push(
+            testing::expect_ok(
+                builder.binary(ir::BinaryOp::Add, args[0], constant),
+                "GC live value",
+            ),
+        );
+    }
+    let returned = testing::expect_ok(builder.call(go_collect, args), "GC call");
+    let mut value = returned[0];
+    for other in alive {
+        value = testing::expect_ok(
+            builder.binary(ir::BinaryOp::Add, value, other),
+            "GC preserved value",
+        );
+    }
+    testing::assert_ok(builder.ret(Vec::from_array([value])));
+    define_call(module, collect, builder, optimize);
+    let builder = testing::expect_ok(ir::Builder::for_function(recursive), "recursive builder");
+    let arg = testing::expect_ok(builder.parameters(builder.entry()), "recursive args")[0];
+    let base = testing::expect_ok(builder.append_block(Vec::new()), "base");
+    let next = testing::expect_ok(builder.append_block(Vec::new()), "recurse");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let condition = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLessEqual, arg, zero),
+        "base condition",
+    );
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: base, arguments: Vec::new() },
+            ir::Edge { target: next, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(base));
+    let base_value = testing::expect_ok(
+        builder.call(go_collect, Vec::from_array([zero])),
+        "GC at recursion depth",
+    );
+    testing::assert_ok(builder.ret(base_value));
+    testing::assert_ok(builder.switch_to(next));
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let previous = testing::expect_ok(builder.binary(ir::BinaryOp::Sub, arg, one), "previous");
+    let returned = testing::expect_ok(
+        builder.call(recursive, Vec::from_array([previous])),
+        "recursive call",
+    );
+    let sum = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, arg, returned[0]),
+        "recursive sum",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([sum])));
+    define_call(module, recursive, builder, optimize);
+    for seed in 0..4 {
+        let reference = testing::expect_ok(
+            module.declare(f"CallProgram{seed}", call_signature(pair_types, scalar)),
+            "generated call reference",
+        );
+        let builder = testing::expect_ok(
+            ir::Builder::for_function(reference),
+            "call program builder",
+        );
+        let args = testing::expect_ok(builder.parameters(builder.entry()), "program args");
+        let header = testing::expect_ok(
+            builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64, ir::Type::I64])),
+            "header",
+        );
+        let body = testing::expect_ok(builder.append_block(Vec::new()), "body");
+        let exit = testing::expect_ok(builder.append_block(scalar), "exit");
+        let zero = testing::expect_ok(builder.iconst(0), "zero");
+        let one = testing::expect_ok(builder.iconst(1), "one");
+        let mask = testing::expect_ok(builder.iconst(7), "bounded count");
+        let salt = testing::expect_ok(
+            builder.iconst(next_seed(Ref::new(seed.to_u64() + 0x1f83d9abfb41bd6b)).to_i64()),
+            "seed salt",
+        );
+        let count = testing::expect_ok(builder.binary(ir::BinaryOp::And, args[1], mask), "count");
+        testing::assert_ok(builder.jump(header, Vec::from_array([count, args[0], args[1]])));
+        testing::assert_ok(builder.switch_to(header));
+        let values = testing::expect_ok(builder.parameters(header), "loop params");
+        let more = testing::expect_ok(
+            builder.icmp(ir::IntCC::SignedLess, zero, values[0]),
+            "loop check",
+        );
+        testing::assert_ok(
+            builder.branch(
+                more,
+                ir::Edge { target: body, arguments: Vec::new() },
+                ir::Edge { target: exit, arguments: Vec::from_array([values[1]]) },
+            ),
+        );
+        testing::assert_ok(builder.switch_to(body));
+        let returned = testing::expect_ok(
+            builder.call(pair, Vec::from_array([values[1], values[2]])),
+            "loop call",
+        );
+        let choice = testing::expect_ok(
+            builder.select(returned[1], returned[0], returned[2]),
+            "loop choice",
+        );
+        let updated = testing::expect_ok(builder.binary(ir::BinaryOp::Xor, choice, salt), "salt");
+        let count = testing::expect_ok(
+            builder.binary(ir::BinaryOp::Sub, values[0], one),
+            "decrement",
+        );
+        testing::assert_ok(builder.jump(header, Vec::from_array([count, updated, values[1]])));
+        testing::assert_ok(builder.switch_to(exit));
+        testing::assert_ok(builder.ret(testing::expect_ok(builder.parameters(exit), "loop result")));
+        define_call(module, reference, builder, optimize);
+    }
+    testing::expect_ok(module.finish(), "complete call module")
+}
+
+fn call_host(target: ir::FuncRef, arguments: Vec[ir::Datum]) -> Result[Vec[ir::Datum], ir::Error] {
+    match target.name() {
+        "GoTouch" | "GoNoArgs" => Result::Ok(Vec::new()),
+        "GoCollect" => Result::Ok(arguments),
+        "GoMix" => match (arguments[0], arguments[1], arguments[2]) {
+            (ir::Datum::Bool(left), ir::Datum::I64(value), ir::Datum::Bool(right)) => Result::Ok(
+                Vec::from_array(
+                    [
+                        ir::Datum::Bool(!left),
+                        ir::Datum::I64((value.to_u64() * 3 + 5).to_i64()),
+                        ir::Datum::Bool(!right),
+                    ],
+                ),
+            ),
+            _ => Result::Err(ir::error(ir::ErrorKind::TypeMismatch, "host arguments")),
+        },
+        _ => Result::Err(ir::error(ir::ErrorKind::Unsupported, "unknown host")),
+    }
+}

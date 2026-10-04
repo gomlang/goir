@@ -1,0 +1,233 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::filetest;
+use ecosystem::goir::opt;
+use ecosystem::goir::regalloc;
+use std::fs;
+use std::num;
+use std::path;
+use std::process;
+use std::testing;
+use std::text;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+struct ProgramCases {
+    function: ir::Function,
+    cases: Vec[Vec[ir::Datum]],
+}
+
+struct NativeCorpus {
+    directory: string,
+    programs: Vec[ProgramCases],
+}
+
+struct GoResult {
+    success: bool,
+    output: string,
+}
+
+fn go_result(directory: string, arguments: Vec[string], seconds: i64) -> GoResult {
+    match process::Command::new("go").args(arguments).current_dir(directory).env("GOWORK", "off").env(
+        "GOTOOLCHAIN",
+        "local",
+    ).output_timeout_structured(time::Duration::from_seconds(seconds)) {
+        Ok(output) => GoResult {
+            success: output.status().code().unwrap_or(-1) == 0,
+            output: output.stdout().to_string_utf8().unwrap_or("invalid stdout")
+                + output.stderr().to_string_utf8().unwrap_or("invalid stderr"),
+        },
+        Err(problem) => GoResult { success: false, output: problem.to_string() },
+    }
+}
+
+fn reproduce_native(
+    directory: string,
+    candidate: ir::Function,
+    arguments: Vec[ir::Datum],
+    backend: string,
+) -> Result[bool, ir::Error] {
+    let function = if backend == "optimized." || backend == "optstack." || backend == "spilled." {
+        opt::simplify(candidate)?
+    } else {
+        candidate
+    };
+    let output = if backend == "baseline." || backend == "optstack." {
+        amd64::emit_stack_package("reproduce", Vec::from_array([function]))?
+    } else {
+        amd64::emit_package_with_options(
+            "reproduce",
+            Vec::from_array([function]),
+            regalloc::Options {
+                registers: if backend == "constrained." {
+                    1
+                } else if backend == "spilled." {
+                    0
+                } else {
+                    7
+                },
+                ..regalloc::Options::standard(),
+            },
+        )?
+    };
+    reproduce_emitted(directory, candidate, arguments, output)
+}
+
+fn reproduce_emitted(
+    directory: string,
+    candidate: ir::Function,
+    arguments: Vec[ir::Datum],
+    output: amd64::Package,
+) -> Result[bool, ir::Error] {
+    let expected = ir::interpret(candidate, arguments, 100000)?;
+    let inputs = Vec::new();
+    let names = Vec::new();
+    let lines = Vec::from_array(
+        ["package reproduce", "import \"testing\"", "func TestReproduce(t *testing.T) {"],
+    );
+    for value in arguments {
+        inputs.push(literal(value));
+    }
+    for index in 0..expected.len() {
+        names.push(f"got{index}");
+    }
+    let call = candidate.name() + "(" + inputs.join(", ") + ")";
+    lines.push(
+        if names.is_empty() {
+            call
+        } else {
+            names.join(", ") + " := " + call
+        },
+    );
+    for index in 0..expected.len() {
+        lines.push(
+            f"if got{index} != " + literal(expected[index])
+                + f" {{ t.Fatalf(\"goir mismatch result {index}: %v\", got{index}) }}",
+        );
+    }
+    lines.push("}");
+    let failure = |message: string| ir::error(ir::ErrorKind::InvalidState, message);
+    fs::write_file_structured(path::join(directory, "generated.go"), output.declarations).map_err(
+        |error| failure(error.to_string()),
+    )?;
+    fs::write_file_structured(path::join(directory, "generated_amd64.s"), output.assembly).map_err(
+        |error| failure(error.to_string()),
+    )?;
+    fs::write_file_structured(path::join(directory, "reproduce_test.go"), lines.join("\n") + "\n").map_err(
+        |error| failure(error.to_string()),
+    )?;
+    let result = go_result(
+        directory,
+        Vec::from_array(["test", "-count=1", "-run=^TestReproduce$", "-timeout=5s"]),
+        15,
+    );
+    Result::Ok(!result.success && result.output.contains("goir mismatch result"))
+}
+
+fn reduce_native_failure(corpus: NativeCorpus, output: string) -> () {
+    let mut active = "";
+    for line in output.split("\n") {
+        if line.starts_with("=== RUN   TestDifferential") {
+            active = text::trim(line.byte_slice("=== RUN   TestDifferential".len(), line.len()));
+        }
+        if !line.contains("case ") || !line.contains(", result ") {
+            continue
+        }
+        let parts = line.split("case ");
+        if parts.len() != 2 {
+            continue
+        }
+        let parsed = num::parse_int_structured(parts[1].split(",")[0]);
+        let mut backend = "";
+        for name in Vec::from_array(
+            ["baseline.", "constrained.", "spilled.", "optimized.", "optstack."],
+        ) {
+            if parts[0].ends_with(name) {
+                backend = name;
+            }
+        }
+        if let Ok(index) = parsed {
+            for program in corpus.programs {
+                if program.function.name() != active || index < 0 || index >= program.cases.len() {
+                    continue
+                }
+                let destination = path::join(corpus.directory, "reduced");
+                testing::assert_ok(fs::create_dir_all(destination));
+                testing::assert_ok(
+                    fs::write_file_structured(
+                        path::join(destination, "go.mod"),
+                        "module goir-reproduction\n\ngo 1.26.0\n",
+                    ),
+                );
+                let arguments = program.cases[index];
+                let selected_backend = backend;
+                let started = time::Instant::now();
+                let predicate = |candidate: ir::Function| {
+                    if started.elapsed().as_nanoseconds() > 30000000000 {
+                        Result::Err(
+                            ir::error(
+                                ir::ErrorKind::LimitExceeded,
+                                "native reduction exceeded 30 seconds",
+                            ),
+                        )
+                    } else {
+                        reproduce_native(destination, candidate, arguments, selected_backend)
+                    }
+                };
+                match filetest::reduce(program.function, 24, predicate) {
+                    Ok(reduced) => {
+                        testing::assert_ok(
+                            fs::write_file_structured(
+                                path::join(destination, "reduced.goir"),
+                                testing::expect_ok(ir::display(reduced.function), "reduced IR"),
+                            ),
+                        );
+                        let _ = reproduce_native(
+                            destination,
+                            reduced.function,
+                            arguments,
+                            selected_backend,
+                        );
+                        testing::assert_ok(
+                            fs::write_file_structured(
+                                path::join(destination, "reduction.txt"),
+                                f"backend: {selected_backend}\ncase: {index}\nattempts: {reduced.attempts}\naccepted: {reduced.accepted}\n",
+                            ),
+                        );
+                    },
+                    Err(problem) => testing::assert_ok(
+                        fs::write_file_structured(
+                            path::join(destination, "reduction.txt"),
+                            problem.to_string(),
+                        ),
+                    ),
+                }
+                return
+            }
+        }
+    }
+}
+
+fn reduce_interpreter_failure(directory: string, function: ir::Function, arguments: Vec[ir::Datum]) -> () {
+    let predicate = |candidate: ir::Function| {
+        let optimized = opt::simplify(candidate)?;
+        Result::Ok(
+            ir::interpret(candidate, arguments, 100000)?
+                != ir::interpret(optimized, arguments, 100000)?,
+        )
+    };
+    match filetest::reduce(function, 128, predicate) {
+        Ok(reduced) => testing::assert_ok(
+            fs::write_file_structured(
+                path::join(directory, "reduced-interpreter.goir"),
+                testing::expect_ok(ir::display(reduced.function), "reduced interpreter IR"),
+            ),
+        ),
+        Err(problem) => testing::assert_ok(
+            fs::write_file_structured(path::join(directory, "reduction.txt"), problem.to_string()),
+        ),
+    };
+}

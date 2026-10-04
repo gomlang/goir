@@ -128,3 +128,65 @@ fn simplification_chain() -> ir::Function {
     testing::assert_ok(builder.ret(Vec::from_array([value])));
     testing::expect_ok(builder.finish(), "chain function")
 }
+
+fn generated_loop(seed: isize) -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            f"Loop{seed}",
+            Vec::from_array([ir::Type::I64, ir::Type::I64, ir::Type::Bool]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "loop program",
+    );
+    let inputs = testing::expect_ok(builder.parameters(builder.entry()), "inputs");
+    let header = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64, ir::Type::I64])),
+        "header",
+    );
+    let body = testing::expect_ok(builder.append_block(Vec::new()), "body");
+    let exit = testing::expect_ok(builder.append_block(Vec::from_array([ir::Type::I64])), "exit");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let mask = testing::expect_ok(builder.iconst(7), "loop bound");
+    let iterations = testing::expect_ok(
+        builder.binary(ir::BinaryOp::And, inputs[1], mask),
+        "bounded count",
+    );
+    testing::assert_ok(builder.jump(header, Vec::from_array([iterations, inputs[0], inputs[1]])));
+    testing::assert_ok(builder.switch_to(header));
+    let values = testing::expect_ok(builder.parameters(header), "loop values");
+    let more = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, zero, values[0]),
+        "loop condition",
+    );
+    testing::assert_ok(
+        builder.branch(
+            more,
+            ir::Edge { target: body, arguments: Vec::new() },
+            ir::Edge { target: exit, arguments: Vec::from_array([values[1]]) },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(body));
+    let state = Ref::new(seed.to_u64() + 0x510e527fade682d1);
+    let mut current = values[1];
+    let operations = Vec::from_array(
+        [
+            ir::BinaryOp::Add,
+            ir::BinaryOp::Sub,
+            ir::BinaryOp::Xor,
+            ir::BinaryOp::Shl,
+            ir::BinaryOp::ShrS,
+            ir::BinaryOp::Mul,
+        ],
+    );
+    for _ in 0..8 {
+        let op = operations[(next_seed(state) % operations.len().to_u64()).to_isize()];
+        current = testing::expect_ok(builder.binary(op, current, values[2]), "loop operation");
+    }
+    let updated = testing::expect_ok(builder.select(inputs[2], current, values[2]), "loop select");
+    let next = testing::expect_ok(builder.binary(ir::BinaryOp::Sub, values[0], one), "decrement");
+    testing::assert_ok(builder.jump(header, Vec::from_array([next, updated, values[1]])));
+    testing::assert_ok(builder.switch_to(exit));
+    testing::assert_ok(builder.ret(testing::expect_ok(builder.parameters(exit), "results")));
+    testing::expect_ok(builder.finish(), "bounded loop")
+}

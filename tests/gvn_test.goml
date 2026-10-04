@@ -1,0 +1,180 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use std::testing;
+
+fn binary_count(function: ir::Function) -> isize {
+    let mut count = 0;
+    for block in function.blocks() {
+        for instruction in block.instructions {
+            match instruction.operation {
+                Binary(_, _, _) => {
+                    count = count + 1;
+                },
+                _ => (),
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn gvn_normalizes_commutative_operations_without_reordering_subtraction() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Commutative",
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64, ir::Type::I64, ir::Type::I64, ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "args");
+    let add = testing::expect_ok(builder.binary(ir::BinaryOp::Add, args[0], args[1]), "add");
+    let reversed = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, args[1], args[0]),
+        "reversed",
+    );
+    let sub = testing::expect_ok(builder.binary(ir::BinaryOp::Sub, args[0], args[1]), "subtract");
+    let reversed_sub = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Sub, args[1], args[0]),
+        "reverse subtract",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([add, reversed, sub, reversed_sub])));
+    let source = testing::expect_ok(builder.finish(), "source");
+    let optimized = testing::expect_ok(opt::simplify(source), "simplify");
+    testing::assert_eq(binary_count(optimized), 3);
+    let arguments = Vec::from_array([ir::Datum::I64(7), ir::Datum::I64(-2)]);
+    testing::assert(sccp_interpret(source, arguments) == sccp_interpret(optimized, arguments));
+}
+
+#[test]
+fn gvn_reuses_dominating_expressions_in_out_of_order_blocks() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Dominating",
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "args");
+    let exit = testing::expect_ok(builder.append_block(Vec::new()), "exit");
+    let middle = testing::expect_ok(builder.append_block(Vec::new()), "middle");
+    testing::assert_ok(builder.jump(middle, Vec::new()));
+    testing::assert_ok(builder.switch_to(middle));
+    let first = testing::expect_ok(builder.binary(ir::BinaryOp::Mul, args[0], args[1]), "first");
+    testing::assert_ok(builder.jump(exit, Vec::new()));
+    testing::assert_ok(builder.switch_to(exit));
+    let second = testing::expect_ok(builder.binary(ir::BinaryOp::Mul, args[1], args[0]), "second");
+    testing::assert_ok(builder.ret(Vec::from_array([first, second])));
+    let source = testing::expect_ok(builder.finish(), "source");
+    let optimized = testing::expect_ok(opt::simplify(source), "simplify");
+    testing::assert_eq(binary_count(optimized), 1);
+    let arguments = Vec::from_array([ir::Datum::I64(6), ir::Datum::I64(7)]);
+    testing::assert(sccp_interpret(source, arguments) == sccp_interpret(optimized, arguments));
+    testing::assert_eq(
+        testing::expect_ok(ir::display(optimized), "first"),
+        testing::expect_ok(
+            ir::display(testing::expect_ok(opt::simplify(optimized), "repeat")),
+            "second",
+        ),
+    );
+}
+
+#[test]
+fn gvn_does_not_reuse_sibling_expressions_at_a_join() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Siblings",
+            Vec::from_array([ir::Type::Bool, ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "args");
+    let yes = testing::expect_ok(builder.append_block(Vec::new()), "yes");
+    let no = testing::expect_ok(builder.append_block(Vec::new()), "no");
+    let join = testing::expect_ok(builder.append_block(Vec::from_array([ir::Type::I64])), "join");
+    testing::assert_ok(
+        builder.branch(
+            args[0],
+            ir::Edge { target: yes, arguments: Vec::new() },
+            ir::Edge { target: no, arguments: Vec::new() },
+        ),
+    );
+    for block in Vec::from_array([yes, no]) {
+        testing::assert_ok(builder.switch_to(block));
+        let value = testing::expect_ok(
+            builder.binary(ir::BinaryOp::Add, args[1], args[2]),
+            "sibling expression",
+        );
+        testing::assert_ok(builder.jump(join, Vec::from_array([value])));
+    }
+    testing::assert_ok(builder.switch_to(join));
+    let phi = testing::expect_ok(builder.parameters(join), "phi")[0];
+    let local = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, args[1], args[2]),
+        "join expression",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([phi, local])));
+    let source = testing::expect_ok(builder.finish(), "source");
+    let optimized = testing::expect_ok(opt::simplify(source), "simplify");
+    testing::assert_eq(binary_count(optimized), 3);
+    for condition in Vec::from_array([false, true]) {
+        let arguments = Vec::from_array(
+            [ir::Datum::Bool(condition), ir::Datum::I64(7), ir::Datum::I64(11)],
+        );
+        testing::assert(sccp_interpret(source, arguments) == sccp_interpret(optimized, arguments));
+    }
+}
+
+#[test]
+fn optimization_preserves_unused_multi_result_and_zero_result_calls() -> () {
+    let module_builder = ir::ModuleBuilder::new();
+    let signature = testing::expect_ok(
+        ir::Signature::new(
+            Vec::from_array([ir::Type::I64]),
+            Vec::from_array([ir::Type::I64, ir::Type::Bool]),
+        ),
+        "multi signature",
+    );
+    let helper = testing::expect_ok(module_builder.import("Effects", signature), "helper");
+    let empty = testing::expect_ok(ir::Signature::new(Vec::new(), Vec::new()), "empty signature");
+    let notify = testing::expect_ok(module_builder.import("Notify", empty), "notify");
+    let main_signature = testing::expect_ok(
+        ir::Signature::new(
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+        ),
+        "main signature",
+    );
+    let main = testing::expect_ok(module_builder.declare("CallRoots", main_signature), "main");
+    let builder = testing::expect_ok(ir::Builder::for_function(main), "builder");
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "args");
+    let first = testing::expect_ok(builder.binary(ir::BinaryOp::Add, args[0], args[1]), "first");
+    testing::expect_ok(builder.call(helper, Vec::from_array([first])), "multi call");
+    let second = testing::expect_ok(builder.binary(ir::BinaryOp::Add, args[1], args[0]), "second");
+    testing::expect_ok(builder.call(notify, Vec::new()), "zero call");
+    testing::expect_ok(builder.call(helper, Vec::from_array([second])), "repeated call");
+    testing::assert_ok(builder.ret(Vec::from_array([first, second])));
+    let source = testing::expect_ok(builder.finish(), "source");
+    let optimized = testing::expect_ok(opt::simplify(source), "simplify");
+    testing::assert_eq(binary_count(optimized), 1);
+    let calls = Vec::new();
+    for instruction in optimized.blocks()[0].instructions {
+        match instruction.operation {
+            Call(target, _) => calls.push((target.name(), instruction.results.len())),
+            _ => (),
+        }
+    }
+    testing::assert(calls == Vec::from_array([("Effects", 2), ("Notify", 0), ("Effects", 2)]));
+    testing::assert_ok(ir::verify(optimized));
+    testing::assert_eq(
+        testing::expect_ok(ir::display(optimized), "first"),
+        testing::expect_ok(
+            ir::display(testing::expect_ok(opt::simplify(optimized), "repeat")),
+            "second",
+        ),
+    );
+}

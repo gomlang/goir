@@ -13,6 +13,7 @@ use std::path;
 use std::process;
 use std::testing;
 use std::time;
+use std::text;
 use std::utf8;
 use utf8::BytesUtf8;
 
@@ -93,7 +94,33 @@ fn literal(value: ir::Datum) -> string {
     }
 }
 
-fn add_differential(lines: Vec[string], function: ir::Function, cases: Vec[Vec[ir::Datum]]) -> () {
+fn add_differential(
+    corpus: NativeCorpus,
+    lines: Vec[string],
+    function: ir::Function,
+    cases: Vec[Vec[ir::Datum]],
+) -> () {
+    corpus.programs.push(ProgramCases { function, cases });
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(corpus.directory, function.name() + ".goir"),
+            testing::expect_ok(ir::display(function), "save IR reproducer"),
+        ),
+    );
+    let inputs = Vec::new();
+    for arguments in cases {
+        let values = Vec::new();
+        for value in arguments {
+            values.push(literal(value));
+        }
+        inputs.push(values.join(", "));
+    }
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(corpus.directory, function.name() + ".cases"),
+            inputs.join("\n") + "\n",
+        ),
+    );
     let optimized = testing::expect_ok(opt::simplify(function), "optimize differential function");
     testing::assert_eq(
         testing::expect_ok(ir::display(optimized), "optimized IR"),
@@ -109,13 +136,14 @@ fn add_differential(lines: Vec[string], function: ir::Function, cases: Vec[Vec[i
             ir::interpret(function, arguments, 100000),
             "reference interpretation",
         );
-        testing::assert(
-            expected
-                == testing::expect_ok(
-                    ir::interpret(optimized, arguments, 100000),
-                    "optimized interpretation",
-                ),
+        let optimized_values = testing::expect_ok(
+            ir::interpret(optimized, arguments, 100000),
+            "optimized interpretation",
         );
+        if expected != optimized_values {
+            reduce_interpreter_failure(corpus.directory, function, arguments);
+            testing::fail("optimized interpretation differs; reproducer in " + corpus.directory);
+        }
         let inputs = Vec::new();
         for value in arguments {
             inputs.push(literal(value));
@@ -217,6 +245,7 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
     let version = run_go(directory, Vec::from_array(["env", "GOVERSION", "GOOS", "GOARCH"]));
     testing::assert(version.contains("go1.26.") && version.contains("\nlinux\namd64\n"));
     let functions = Vec::new();
+    let corpus = NativeCorpus { directory, programs: Vec::new() };
     let lines = Vec::from_array(
         [
             "package generated",
@@ -239,7 +268,7 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
     for index in 0..ops.len() {
         let function = native_scalar(f"Op{index}", Option::Some(ops[index]), ir::IntCC::Equal);
         functions.push(function);
-        add_differential(lines, function, integer_cases());
+        add_differential(corpus, lines, function, integer_cases());
     }
     let comparisons = Vec::from_array(
         [
@@ -254,7 +283,7 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
     for index in 0..comparisons.len() {
         let function = native_scalar(f"Cmp{index}", Option::None, comparisons[index]);
         functions.push(function);
-        add_differential(lines, function, integer_cases());
+        add_differential(corpus, lines, function, integer_cases());
     }
     let mixed = native_identity(
         "Mixed",
@@ -285,19 +314,21 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
     let many = native_identity("Many", many_types);
     functions.extend(Vec::from_array([pair, sink, constant, many]));
     add_differential(
+        corpus,
         lines,
         pair,
         Vec::from_array([Vec::from_array([ir::Datum::Bool(true), ir::Datum::Bool(false)])]),
     );
     add_differential(
+        corpus,
         lines,
         sink,
         Vec::from_array(
             [Vec::from_array([ir::Datum::Bool(false)]), Vec::from_array([ir::Datum::Bool(true)])],
         ),
     );
-    add_differential(lines, constant, Vec::from_array([Vec::new()]));
-    add_differential(lines, many, Vec::from_array([many_arguments]));
+    add_differential(corpus, lines, constant, Vec::from_array([Vec::new()]));
+    add_differential(corpus, lines, many, Vec::from_array([many_arguments]));
     let select_int = native_select("SelectInt", ir::Type::I64);
     let select_bool = native_select("SelectBool", ir::Type::Bool);
     let sum = testing::expect_ok(example::sum_function(), "sum");
@@ -332,17 +363,18 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
             }
         }
     }
-    add_differential(lines, mixed, mixed_cases);
+    add_differential(corpus, lines, mixed, mixed_cases);
     add_differential(
+        corpus,
         lines,
         single,
         Vec::from_array(
             [Vec::from_array([ir::Datum::Bool(false)]), Vec::from_array([ir::Datum::Bool(true)])],
         ),
     );
-    add_differential(lines, empty, Vec::from_array([Vec::new()]));
-    add_differential(lines, select_int, select_cases);
-    add_differential(lines, select_bool, boolean_cases);
+    add_differential(corpus, lines, empty, Vec::from_array([Vec::new()]));
+    add_differential(corpus, lines, select_int, select_cases);
+    add_differential(corpus, lines, select_bool, boolean_cases);
     let sum_cases = Vec::new();
     let swap_cases = Vec::new();
     for n in 0..32 {
@@ -351,9 +383,10 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
             Vec::from_array([ir::Datum::I64(11), ir::Datum::I64(29), ir::Datum::I64(n.to_i64())]),
         );
     }
-    add_differential(lines, sum, sum_cases);
-    add_differential(lines, swap, swap_cases);
+    add_differential(corpus, lines, sum, sum_cases);
+    add_differential(corpus, lines, swap, swap_cases);
     add_differential(
+        corpus,
         lines,
         large,
         Vec::from_array(
@@ -375,16 +408,17 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
         args.push(ir::Datum::I64(n.to_i64()));
         rotation_cases.push(args);
     }
-    add_differential(lines, rotation, rotation_cases);
+    add_differential(corpus, lines, rotation, rotation_cases);
     let diamond_cases = Vec::new();
     for values in integer_cases() {
         diamond_cases.push(Vec::from_array([ir::Datum::Bool(true), values[0], values[1]]));
         diamond_cases.push(Vec::from_array([ir::Datum::Bool(false), values[0], values[1]]));
     }
-    add_differential(lines, diamond, diamond_cases);
+    add_differential(corpus, lines, diamond, diamond_cases);
     let chain = simplification_chain();
     functions.push(chain);
     add_differential(
+        corpus,
         lines,
         chain,
         Vec::from_array(
@@ -403,7 +437,26 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
             let values = inputs[(index * 7 + seed) % inputs.len()];
             cases.push(Vec::from_array([values[0], values[1], ir::Datum::Bool(index % 2 == 0)]));
         }
-        add_differential(lines, function, cases);
+        add_differential(corpus, lines, function, cases);
+    }
+    for seed in 0..8 {
+        let function = generated_loop(seed);
+        functions.push(function);
+        let cases = Vec::new();
+        let inputs = integer_cases();
+        for index in 0..16 {
+            let values = inputs[(index * 7 + seed) % inputs.len()];
+            cases.push(Vec::from_array([values[0], values[1], ir::Datum::Bool(index % 2 == 0)]));
+        }
+        add_differential(corpus, lines, function, cases);
+    }
+    for function in functions {
+        testing::assert_ok(
+            fs::write_file_structured(
+                path::join(directory, function.name() + ".goir"),
+                testing::expect_ok(ir::display(function), "save reproducer"),
+            ),
+        );
     }
     let optimized_functions = Vec::new();
     for function in functions {
@@ -457,13 +510,27 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
     }
     let report = Vec::from_array(
         [
-            "function\tbackend\tframe_bytes\tstack_reads\tstack_writes\tinstructions\tassembly_bytes\tssa_values\toptimize_ns\temit_ns",
+            "function\tbackend\tframe_bytes\tstack_reads\tstack_writes\tinstructions\tassembly_bytes\tssa_values\toptimize_ns_median\temit_ns_median\tcompile_samples",
         ],
     );
     for function in functions {
-        let started = time::Instant::now();
-        let optimized = testing::expect_ok(opt::simplify(function), "measure optimization");
-        let optimize_ns = started.elapsed().as_nanoseconds();
+        let optimization_times = Vec::new();
+        let mut optimized = function;
+        for _ in 0..3 {
+            let started = time::Instant::now();
+            optimized = testing::expect_ok(opt::simplify(function), "measure optimization");
+            optimization_times.push(started.elapsed().as_nanoseconds());
+        }
+        optimization_times.sort_by(
+            |left, right| if left < right {
+                -1
+            } else if left > right {
+                1
+            } else {
+                0
+            },
+        );
+        let optimize_ns = optimization_times[1];
         for (name, source, use_stack) in Vec::from_array(
             [
                 ("registers", function, false),
@@ -472,16 +539,33 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
                 ("optimized_stack", optimized, true),
             ],
         ) {
-            let started = time::Instant::now();
-            let compiled = testing::expect_ok(
-                if use_stack {
-                    amd64::emit_stack(source)
+            let emission_times = Vec::new();
+            let outputs = Vec::new();
+            for _ in 0..3 {
+                let started = time::Instant::now();
+                outputs.push(
+                    testing::expect_ok(
+                        if use_stack {
+                            amd64::emit_stack(source)
+                        } else {
+                            amd64::emit(source)
+                        },
+                        "measure emission",
+                    ),
+                );
+                emission_times.push(started.elapsed().as_nanoseconds());
+            }
+            emission_times.sort_by(
+                |left, right| if left < right {
+                    -1
+                } else if left > right {
+                    1
                 } else {
-                    amd64::emit(source)
+                    0
                 },
-                "measure emission",
             );
-            let emit_ns = started.elapsed().as_nanoseconds();
+            let emit_ns = emission_times[1];
+            let compiled = outputs[0];
             let optimization_ns = if name.starts_with("optimized") {
                 optimize_ns
             } else {
@@ -492,7 +576,7 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
                 function.name()
                     + f"\t{name}\t{compiled.frame_bytes}\t{metrics.stack_reads}\t{metrics.stack_writes}\t{metrics.instructions}\t{metrics.assembly_bytes}\t"
                     + source.value_count().to_string()
-                    + f"\t{optimization_ns}\t{emit_ns}",
+                    + f"\t{optimization_ns}\t{emit_ns}\t3",
             );
         }
     }
@@ -529,11 +613,36 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
         fs::write_file_structured(path::join(directory, "reference_test.go"), oracle),
     );
     let _ = run_go(directory, Vec::from_array(["vet", "./..."]));
-    let output = run_go(
+    let result = go_result(
         directory,
         Vec::from_array(["test", "-count=1", "-timeout=60s", "-v", "./..."]),
+        90,
     );
-    testing::assert(output.contains("PASS"));
+    if !result.success {
+        testing::assert_ok(
+            fs::write_file_structured(path::join(directory, "failure.txt"), result.output),
+        );
+        reduce_native_failure(corpus, result.output);
+        testing::fail("Go integration failed in " + directory + "\n" + result.output);
+    }
+    testing::assert(result.output.contains("PASS"));
+    let _ = run_go(directory, Vec::from_array(["test", "-c", "-o", "native.test"]));
+    let symbols = run_go(directory, Vec::from_array(["tool", "nm", "-size", "native.test"]));
+    let encoded = Vec::from_array(["symbol\tencoded_bytes"]);
+    for line in symbols.split("\n") {
+        if !line.contains("goir-native-test") || !line.ends_with(".abi0") {
+            continue
+        }
+        let fields = testing::expect_ok(text::fields(line, 16), "symbol fields");
+        if fields.len() == 4 && fields[2] == "T" && fields[3].starts_with("goir-native-test")
+            && fields[3].ends_with(".abi0") {
+            encoded.push(fields[3] + "\t" + fields[1]);
+        }
+    }
+    testing::assert(encoded.len() > 1);
+    testing::assert_ok(
+        fs::write_file_structured("_artifact/encoded-code.tsv", encoded.join("\n") + "\n"),
+    );
     if env::var_structured("GOIR_BENCHMARK").unwrap_or("") == "1" {
         let benchmark = run_go(
             directory,

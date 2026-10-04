@@ -1,0 +1,215 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::reader;
+use ecosystem::goir::regalloc;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::testing;
+
+fn call_cases(target: ir::FuncRef) -> Vec[Vec[ir::Datum]] {
+    let cases = Vec::new();
+    if target.signature().parameter_types().is_empty() {
+        cases.push(Vec::new());
+    } else if target.name() == "CallRecursive" {
+        for value in Vec::from_array([0, 1, 17, 256, 512]) {
+            cases.push(Vec::from_array([ir::Datum::I64(value)]));
+        }
+    } else if target.signature().parameter_types().len() == 1 {
+        for value in Vec::from_array([-17, 0, 123456]) {
+            cases.push(Vec::from_array([ir::Datum::I64(value)]));
+        }
+    } else {
+        let inputs = integer_cases();
+        for index in 0..24 {
+            cases.push(inputs[(index * 13) % inputs.len()]);
+        }
+    }
+    cases
+}
+
+#[test]
+fn native_module_calls_match_interpreter_and_survive_go_gc() -> () {
+    let directory = path::join(
+        "_artifact",
+        "goir-calls-" + hash::sha256(testing::expect_ok(rand::bytes(16), "unique call artifact")),
+    );
+    testing::assert_ok(fs::create_dir_all(directory));
+    let source = calls_module(false);
+    let optimized = calls_module(true);
+    let prefixes = Vec::from_array(
+        ["", "baseline.", "constrained.", "spilled.", "optimized.", "optstack."],
+    );
+    let lines = Vec::from_array(
+        [
+            "package generated",
+            "import (\"testing\"; baseline \"goir-calls-test/baseline\"; constrained \"goir-calls-test/constrained\"; spilled \"goir-calls-test/spilled\"; optimized \"goir-calls-test/optimized\"; optstack \"goir-calls-test/optstack\")",
+        ],
+    );
+    for function in source.functions() {
+        let text = testing::expect_ok(ir::display(function), "call IR");
+        testing::assert_ok(
+            fs::write_file_structured(path::join(directory, function.name() + ".goir"), text),
+        );
+        let roundtrip = testing::expect_ok(
+            reader::read_with_references(text, source.references()),
+            "read call IR",
+        );
+        testing::assert_eq(testing::expect_ok(ir::display(roundtrip), "call roundtrip"), text);
+    }
+    for target in source.references() {
+        if target.is_imported() {
+            continue
+        }
+        let optimized_target = optimized.references()[target.index()];
+        lines.push("func Test" + target.name() + "(t *testing.T) {");
+        let cases = call_cases(target);
+        for index in 0..cases.len() {
+            let arguments = cases[index];
+            let expected = testing::expect_ok(
+                ir::interpret_module_with_host(source, target, arguments, 100000, 1024, call_host),
+                "module interpretation",
+            );
+            testing::assert(
+                expected
+                    == testing::expect_ok(
+                        ir::interpret_module_with_host(
+                            optimized,
+                            optimized_target,
+                            arguments,
+                            100000,
+                            1024,
+                            call_host,
+                        ),
+                        "optimized module interpretation",
+                    ),
+            );
+            let inputs = Vec::new();
+            let names = Vec::new();
+            for value in arguments {
+                inputs.push(literal(value));
+            }
+            for position in 0..expected.len() {
+                names.push(f"got{position}");
+            }
+            for prefix in prefixes {
+                lines.push("{");
+                let call = prefix + target.name() + "(" + inputs.join(", ") + ")";
+                lines.push(
+                    if names.is_empty() {
+                        call
+                    } else {
+                        names.join(", ") + " := " + call
+                    },
+                );
+                for position in 0..expected.len() {
+                    lines.push(
+                        f"if got{position} != " + literal(expected[position])
+                            + f" {{ t.Fatalf(\"{prefix}case {index}, result {position}: %v\", got{position}) }}",
+                    );
+                }
+                lines.push("}");
+            }
+        }
+        lines.push("}");
+    }
+    lines.push("func TestEffectRetention(t *testing.T) {");
+    for prefix in prefixes {
+        lines.push(
+            "{ before := " + prefix + "NativeEffects(); " + prefix + "CallEffect(17); if " + prefix
+                + "NativeEffects() != before+1 { t.Fatal(\"effect removed: "
+                + prefix
+                + "\") } }",
+        );
+    }
+    for prefix in prefixes {
+        lines.push(
+            "{ before := " + prefix + "NativeEffects(); " + prefix + "CallNoArgs(); if " + prefix
+                + "NativeEffects() != before+1 { t.Fatal(\"no-argument effect removed: "
+                + prefix
+                + "\") } }",
+        );
+    }
+    lines.push("}");
+    let prefix = if fs::is_dir("examples/basic") {
+        "examples/basic/"
+    } else {
+        ""
+    };
+    let helper_body = testing::expect_ok(
+        fs::read_file_structured(prefix + "tests/data/call_helpers.go.txt"),
+        "Go call helpers",
+    );
+    for (name, module, stack, registers) in Vec::from_array(
+        [
+            ("generated", source, false, 7),
+            ("baseline", source, true, 7),
+            ("constrained", source, false, 1),
+            ("spilled", optimized, false, 0),
+            ("optimized", optimized, false, 7),
+            ("optstack", optimized, true, 7),
+        ],
+    ) {
+        let output = testing::expect_ok(
+            if stack {
+                amd64::emit_stack_module(name, module)
+            } else {
+                amd64::emit_module_with_options(
+                    name,
+                    module,
+                    regalloc::Options { registers, ..regalloc::Options::standard() },
+                )
+            },
+            "emit call module",
+        );
+        let destination = if name == "generated" {
+            directory
+        } else {
+            path::join(directory, name)
+        };
+        testing::assert_ok(fs::create_dir_all(destination));
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated.go"), output.declarations),
+        );
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated_amd64.s"), output.assembly),
+        );
+        testing::assert_ok(
+            fs::write_file_structured(
+                path::join(destination, "helpers.go"),
+                "package " + name + "\n\n" + helper_body,
+            ),
+        );
+    }
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "go.mod"),
+            "module goir-calls-test\n\ngo 1.26.0\n",
+        ),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "differential_test.go"),
+            lines.join("\n") + "\n",
+        ),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "runtime_test.go"),
+            testing::expect_ok(
+                fs::read_file_structured(prefix + "tests/data/call_runtime_test.go"),
+                "runtime call oracle",
+            ),
+        ),
+    );
+    let _ = run_go(directory, Vec::from_array(["vet", "./..."]));
+    let output = run_go(
+        directory,
+        Vec::from_array(["test", "-count=1", "-timeout=60s", "-v", "./..."]),
+    );
+    testing::assert(output.contains("PASS"));
+    testing::assert_ok(fs::remove_dir_all(directory));
+}

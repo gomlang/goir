@@ -1,0 +1,78 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::mach;
+use ecosystem::goir::regalloc;
+use ecosystem::goir::amd64;
+use std::testing;
+
+#[test]
+fn disjoint_control_flow_segments_reuse_registers_inside_interval_holes() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Holes",
+            Vec::from_array([ir::Type::Bool]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let condition = testing::expect_ok(builder.parameters(builder.entry()), "entry")[0];
+    let left = testing::expect_ok(builder.append_block(Vec::new()), "left");
+    let right = testing::expect_ok(builder.append_block(Vec::new()), "right");
+    let tail = testing::expect_ok(builder.append_block(Vec::new()), "tail");
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: left, arguments: Vec::new() },
+            ir::Edge { target: right, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(left));
+    let a = testing::expect_ok(builder.iconst(41), "a");
+    testing::assert_ok(builder.jump(tail, Vec::new()));
+    testing::assert_ok(builder.switch_to(right));
+    let b = testing::expect_ok(builder.iconst(42), "b");
+    testing::assert_ok(builder.ret(Vec::from_array([b])));
+    testing::assert_ok(builder.switch_to(tail));
+    testing::assert_ok(builder.ret(Vec::from_array([a])));
+    let function = testing::expect_ok(builder.finish(), "function");
+    let machine = testing::expect_ok(mach::lower(function), "machine");
+    let allocation = testing::expect_ok(
+        regalloc::allocate_with_options(
+            machine,
+            regalloc::Options { registers: 1, ..regalloc::Options::standard() },
+        ),
+        "allocate",
+    );
+    let ra = testing::expect_ok(machine.register(a.index()), "a register");
+    let rb = testing::expect_ok(machine.register(b.index()), "b register");
+    testing::assert_eq(testing::expect_ok(allocation.liveness().segments(ra), "segments").len(), 2);
+    testing::assert_eq(
+        testing::expect_ok(allocation.location(ra), "a home"),
+        testing::expect_ok(allocation.location(rb), "b home"),
+    );
+    testing::assert_eq(allocation.stack_slots(), 0);
+    let snapshot = testing::expect_ok(allocation.liveness().segments(ra), "snapshot");
+    snapshot.clear();
+    testing::assert_eq(testing::expect_ok(allocation.liveness().segments(ra), "unchanged").len(), 2);
+    testing::assert_ok(amd64::emit_allocation(allocation));
+    for condition in Vec::from_array([false, true]) {
+        testing::assert(
+            testing::expect_ok(
+                ir::interpret(function, Vec::from_array([ir::Datum::Bool(condition)]), 20),
+                "run",
+            )
+                == Vec::from_array(
+                    [
+                        ir::Datum::I64(
+                            if condition {
+                                41
+                            } else {
+                                42
+                            },
+                        ),
+                    ],
+                ),
+        );
+    }
+}

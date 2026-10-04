@@ -1,0 +1,100 @@
+package regalloc;
+
+use module::mach;
+use std::testing;
+
+fn test_location(index: isize) -> Location {
+    if index % 2 == 0 {
+        Location::Register(index / 2)
+    } else {
+        Location::Stack(index / 2)
+    }
+}
+
+fn test_index(location: Location) -> isize {
+    match location {
+        Register(index) => index * 2,
+        Stack(index) => index * 2 + 1,
+        Fixed(register) => match register {
+            AX => 4,
+            CX => 5,
+            DX => 6,
+        },
+    }
+}
+
+#[test]
+fn parallel_edits_preserve_cycles_broadcasts_and_memory_scratch() -> () {
+    for combination in 0..256 {
+        let values: Vec[isize] = Vec::from_array([11, 29, 47, 83, 0, 0, 0]);
+        let before: Vec[isize] = Vec::from_array([11, 29, 47, 83]);
+        let moves = Vec::new();
+        let expected = Vec::new();
+        let mut code = combination;
+        for destination in 0..4 {
+            let source = code % 4;
+            code = code / 4;
+            moves.push(
+                Edit { source: test_location(source), destination: test_location(destination) },
+            );
+            expected.push(before[source]);
+        }
+        for edit in testing::expect_ok(parallel_edits(moves, Ref::new(10000)), "schedule") {
+            testing::assert(
+                !(match (edit.source, edit.destination) {
+                    (Stack(_), Stack(_)) => true,
+                    _ => false,
+                }),
+            );
+            values[test_index(edit.destination)] = values[test_index(edit.source)];
+        }
+        for index in 0..4 {
+            testing::assert_eq(values[index], expected[index]);
+        }
+    }
+    testing::assert_err(
+        parallel_edits(
+            Vec::from_array(
+                [
+                    Edit { source: Location::Register(0), destination: Location::Stack(0) },
+                    Edit { source: Location::Register(1), destination: Location::Stack(0) },
+                ],
+            ),
+            Ref::new(100),
+        ),
+    );
+    testing::assert_err(
+        parallel_edits(
+            Vec::from_array(
+                [
+                    Edit { source: Location::Stack(0), destination: Location::Stack(1) },
+                    Edit { source: Location::Stack(1), destination: Location::Stack(0) },
+                ],
+            ),
+            Ref::new(1),
+        ),
+    );
+    let cycle = testing::expect_ok(
+        parallel_edits(
+            Vec::from_array(
+                [
+                    Edit { source: Location::Stack(0), destination: Location::Stack(1) },
+                    Edit { source: Location::Stack(1), destination: Location::Stack(0) },
+                ],
+            ),
+            Ref::new(100),
+        ),
+        "memory cycle",
+    );
+    let mut saves_cycle = false;
+    let mut memory_scratch = false;
+    for edit in cycle {
+        if edit.destination == Location::Fixed(mach::FixedReg::DX) {
+            saves_cycle = true;
+        }
+        if edit.destination == Location::Fixed(mach::FixedReg::AX) {
+            memory_scratch = true;
+        }
+    }
+    testing::assert(saves_cycle && memory_scratch);
+}

@@ -1,0 +1,39 @@
+import (
+    "runtime"
+    "sync/atomic"
+)
+
+var nativeEffects atomic.Int64
+
+func GoMix(left bool, value int64, right bool) (bool, int64, bool) {
+    scratch := make([]int64, 128)
+    scratch[17] = value
+    result := scratch[17]*3 + 5
+    runtime.KeepAlive(scratch)
+    return !left, result, !right
+}
+
+func GoTouch(value int64) {
+    nativeEffects.Add(1)
+    runtime.KeepAlive(value)
+}
+
+func GoCollect(value int64) int64 {
+    scratch := make([]byte, 32768)
+    scratch[123] = byte(value)
+    runtime.GC()
+    if scratch[123] != byte(value) {
+        panic("Go helper live allocation changed")
+    }
+    runtime.KeepAlive(scratch)
+    return value
+}
+
+func NativeEffects() int64 {
+    return nativeEffects.Load()
+}
+
+func GoNoArgs() {
+    runtime.GC()
+    nativeEffects.Add(1)
+}

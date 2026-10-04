@@ -1,0 +1,175 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::mach;
+use ecosystem::goir::regalloc;
+use std::testing;
+
+fn constrained_shift() -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "ConstrainedShift",
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let arguments = testing::expect_ok(builder.parameters(builder.entry()), "parameters");
+    let shifted = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Shl, arguments[0], arguments[1]),
+        "shift",
+    );
+    let sum = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, shifted, arguments[0]),
+        "preserved input",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([sum])));
+    testing::expect_ok(builder.finish(), "function")
+}
+
+#[test]
+fn fixed_shift_and_two_address_constraints_preserve_live_inputs() -> () {
+    let function = constrained_shift();
+    for registers in Vec::from_array([0, 1, 7]) {
+        let allocation = testing::expect_ok(
+            regalloc::allocate_with_options(
+                testing::expect_ok(mach::lower(function), "machine"),
+                regalloc::Options { registers, ..regalloc::Options::standard() },
+            ),
+            "allocation",
+        );
+        testing::assert_ok(regalloc::verify(allocation));
+        let shift = allocation.blocks()[0].instructions[0];
+        testing::assert_eq(
+            shift.operands[1].location,
+            regalloc::Location::Fixed(mach::FixedReg::CX),
+        );
+        testing::assert_eq(
+            shift.operands[1].operand.constraint,
+            mach::Constraint::Fixed(mach::FixedReg::CX),
+        );
+        testing::assert_eq(shift.operands[0].location, shift.operands[2].location);
+        testing::assert_eq(shift.operands[2].operand.constraint, mach::Constraint::Reuse(0));
+        if registers == 7 {
+            let original = allocation.location(allocation.function().blocks()[0].parameters[0]);
+            let original = testing::expect_ok(original, "entry home");
+            let mut saved = false;
+            for edit in shift.before {
+                if edit.source == original {
+                    if let regalloc::Location::Stack(_) = edit.destination {
+                        saved = true;
+                    }
+                }
+            }
+            testing::assert(saved);
+        }
+        let compiled = testing::expect_ok(
+            amd64::emit_allocation(allocation),
+            "emit checked allocation",
+        );
+        testing::assert(compiled.assembly.contains("SHLQ CX, "));
+    }
+    testing::assert(
+        testing::expect_ok(
+            ir::interpret(function, Vec::from_array([ir::Datum::I64(7), ir::Datum::I64(65)]), 8),
+            "reference",
+        )
+            == Vec::from_array([ir::Datum::I64(21)]),
+    );
+}
+
+fn allocated_call() -> regalloc::Allocation {
+    let module = ir::ModuleBuilder::new();
+    let signature = testing::expect_ok(
+        ir::Signature::new(
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "signature",
+    );
+    let target = testing::expect_ok(module.declare("AcrossCall", signature), "caller");
+    let helper = testing::expect_ok(
+        module.import(
+            "HostCall",
+            testing::expect_ok(
+                ir::Signature::new(
+                    Vec::from_array([ir::Type::I64]),
+                    Vec::from_array([ir::Type::I64]),
+                ),
+                "helper signature",
+            ),
+        ),
+        "helper",
+    );
+    let builder = testing::expect_ok(ir::Builder::for_function(target), "builder");
+    let arguments = testing::expect_ok(builder.parameters(builder.entry()), "parameters");
+    let result = testing::expect_ok(builder.call(helper, Vec::from_array([arguments[0]])), "call")[0];
+    let first = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, arguments[0], result),
+        "first preserved argument",
+    );
+    let second = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, first, arguments[1]),
+        "second preserved argument",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([second])));
+    let function = testing::expect_ok(builder.finish(), "function");
+    testing::assert_ok(module.define(target, function));
+    let module = testing::expect_ok(module.finish(), "module");
+    testing::assert(
+        testing::expect_ok(amd64::emit_module("fixture", module), "module emit").assembly.contains(
+            "CALL ·HostCall(SB)",
+        ),
+    );
+    testing::expect_ok(
+        regalloc::allocate(testing::expect_ok(mach::lower(function), "machine")),
+        "allocation",
+    )
+}
+
+#[test]
+fn call_clobbers_split_and_preserve_values_live_across_calls() -> () {
+    let allocation = allocated_call();
+    testing::assert_ok(regalloc::verify(allocation));
+    let call = allocation.blocks()[0].instructions[0];
+    for parameter in allocation.function().blocks()[0].parameters {
+        let home = testing::expect_ok(allocation.location(parameter), "entry home");
+        let mut saved = false;
+        for edit in call.before {
+            if edit.source == home {
+                if let regalloc::Location::Stack(_) = edit.destination {
+                    saved = true;
+                }
+            }
+        }
+        testing::assert(saved);
+    }
+    testing::assert(call.instruction.clobbers().contains(mach::Clobber::Fixed(mach::FixedReg::AX)));
+    testing::assert(call.instruction.clobbers().contains(mach::Clobber::Register(0)));
+    testing::assert(allocation.stack_slots() >= 2);
+}
+
+#[test]
+fn allocated_operand_edit_and_call_snapshots_do_not_mutate_the_plan() -> () {
+    let allocation = allocated_call();
+    let blocks = allocation.blocks();
+    let call = blocks[0].instructions[0];
+    call.operands.clear();
+    call.before.clear();
+    call.after.clear();
+    match call.instruction {
+        Call { arguments, results, .. } => {
+            arguments.clear();
+            results.clear();
+        },
+        _ => testing::assert(false),
+    }
+    blocks[0].terminator_operands.clear();
+    blocks[0].instructions.clear();
+    testing::assert_ok(regalloc::verify(allocation));
+    testing::assert_eq(allocation.blocks()[0].instructions[0].operands.len(), 2);
+    testing::assert_eq(allocation.blocks()[0].instructions[0].instruction.definitions().len(), 1);
+    testing::assert_eq(allocation.blocks()[0].instructions[0].instruction.uses().len(), 1);
+    testing::assert_eq(allocation.blocks()[0].terminator_operands.len(), 1);
+}

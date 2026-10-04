@@ -1,0 +1,199 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+use std::testing;
+
+fn checker_spilled_add() -> Allocation {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "SpilledAdd",
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "args");
+    let sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, args[0], args[1]), "sum");
+    testing::assert_ok(builder.ret(Vec::from_array([sum])));
+    let machine = testing::expect_ok(
+        mach::lower(testing::expect_ok(builder.finish(), "source")),
+        "machine",
+    );
+    testing::expect_ok(
+        allocate_with_options(machine, Options { registers: 0, max_steps: 10000000 }),
+        "allocation",
+    )
+}
+
+#[test]
+fn checker_rejects_missing_reloads_wrong_moves_and_operand_constraints() -> () {
+    let allocation = checker_spilled_add();
+    testing::assert_ok(check(allocation));
+    testing::assert(!allocation.plan[0].instructions[0].before.is_empty());
+    allocation.plan[0].instructions[0].before.clear();
+    testing::assert_eq(
+        testing::expect_err(check(allocation), "missing reload").kind,
+        ir::ErrorKind::InvalidState,
+    );
+    let allocation = checker_spilled_add();
+    let instruction = allocation.plan[0].instructions[0];
+    let wrong = testing::expect_ok(
+        allocation.location(allocation.machine.blocks()[0].parameters[1]),
+        "other input",
+    );
+    instruction.before[0] = Edit { source: wrong, destination: instruction.before[0].destination };
+    testing::assert_err(check(allocation));
+    let allocation = checker_spilled_add();
+    let instruction = allocation.plan[0].instructions[0];
+    let old = instruction.operands[0];
+    instruction.operands[0] = Binding { operand: old.operand, location: Location::Stack(0) };
+    testing::assert_err(check(allocation));
+}
+
+#[test]
+fn checker_tracks_call_clobbers_independently_of_live_intervals() -> () {
+    let module_builder = ir::ModuleBuilder::new();
+    let helper = testing::expect_ok(
+        module_builder.import(
+            "Effect",
+            testing::expect_ok(ir::Signature::new(Vec::new(), Vec::new()), "helper signature"),
+        ),
+        "helper",
+    );
+    let target = testing::expect_ok(
+        module_builder.declare(
+            "AcrossCall",
+            testing::expect_ok(
+                ir::Signature::new(
+                    Vec::from_array([ir::Type::I64]),
+                    Vec::from_array([ir::Type::I64]),
+                ),
+                "signature",
+            ),
+        ),
+        "target",
+    );
+    let builder = testing::expect_ok(ir::Builder::for_function(target), "builder");
+    let input = testing::expect_ok(builder.parameters(builder.entry()), "input")[0];
+    testing::expect_ok(builder.call(helper, Vec::new()), "call");
+    testing::assert_ok(builder.ret(Vec::from_array([input])));
+    let machine = testing::expect_ok(
+        mach::lower(testing::expect_ok(builder.finish(), "source")),
+        "machine",
+    );
+    let allocation = testing::expect_ok(allocate(machine), "allocation");
+    testing::assert_ok(check(allocation));
+    allocation.plan[0].instructions[0].before.clear();
+    allocation.plan[0].instructions[0].after.clear();
+    let old = allocation.plan[0].terminator_operands[0];
+    allocation.plan[0].terminator_operands[0] = Binding {
+        operand: old.operand,
+        location: testing::expect_ok(allocation.location(old.operand.reg), "canonical register"),
+    };
+    testing::assert_eq(
+        testing::expect_err(check(allocation), "unpreserved caller value").kind,
+        ir::ErrorKind::InvalidState,
+    );
+}
+
+fn checker_rotation(registers: isize) -> Allocation {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Rotate",
+            Vec::from_array([ir::Type::I64, ir::Type::I64, ir::Type::Bool]),
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "args");
+    let header = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64])),
+        "header",
+    );
+    let exit = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64])),
+        "exit",
+    );
+    testing::assert_ok(builder.jump(header, Vec::from_array([args[0], args[1]])));
+    testing::assert_ok(builder.switch_to(header));
+    let parameters = testing::expect_ok(builder.parameters(header), "parameters");
+    testing::assert_ok(
+        builder.branch(
+            args[2],
+            ir::Edge { target: exit, arguments: parameters },
+            ir::Edge { target: header, arguments: Vec::from_array([parameters[1], parameters[0]]) },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(exit));
+    testing::assert_ok(builder.ret(testing::expect_ok(builder.parameters(exit), "results")));
+    let machine = testing::expect_ok(
+        mach::lower(testing::expect_ok(builder.finish(), "source")),
+        "machine",
+    );
+    testing::expect_ok(
+        allocate_with_options(machine, Options { registers, max_steps: 10000000 }),
+        "allocation",
+    )
+}
+
+#[test]
+fn checker_validates_parallel_phi_renaming_and_cycle_edits() -> () {
+    for registers in Vec::from_array([0, 1, 7]) {
+        let allocation = checker_rotation(registers);
+        testing::assert_ok(check(allocation));
+        allocation.plan[1].edges[1].edits.clear();
+        testing::assert_err(check(allocation));
+    }
+    let allocation = checker_rotation(1);
+    testing::assert_eq(
+        testing::expect_err(check_with_budget(allocation, Ref::new(1)), "bounded checker").kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+}
+
+#[test]
+fn checker_intersects_symbols_at_control_flow_joins() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Join",
+            Vec::from_array([ir::Type::I64, ir::Type::I64, ir::Type::Bool]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "args");
+    let yes = testing::expect_ok(builder.append_block(Vec::new()), "yes");
+    let no = testing::expect_ok(builder.append_block(Vec::new()), "no");
+    let join = testing::expect_ok(builder.append_block(Vec::new()), "join");
+    testing::assert_ok(
+        builder.branch(
+            args[2],
+            ir::Edge { target: yes, arguments: Vec::new() },
+            ir::Edge { target: no, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(yes));
+    testing::assert_ok(builder.jump(join, Vec::new()));
+    testing::assert_ok(builder.switch_to(no));
+    testing::assert_ok(builder.jump(join, Vec::new()));
+    testing::assert_ok(builder.switch_to(join));
+    testing::assert_ok(builder.ret(Vec::from_array([args[0]])));
+    let machine = testing::expect_ok(
+        mach::lower(testing::expect_ok(builder.finish(), "source")),
+        "machine",
+    );
+    let allocation = testing::expect_ok(allocate(machine), "allocation");
+    testing::assert_ok(check(allocation));
+    let inputs = machine.blocks()[0].parameters;
+    allocation.plan[2].edges[0].edits.push(
+        Edit {
+            source: testing::expect_ok(allocation.location(inputs[1]), "wrong value"),
+            destination: testing::expect_ok(allocation.location(inputs[0]), "required value"),
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(check(allocation), "one incoming edge corrupts a live value").kind,
+        ir::ErrorKind::InvalidState,
+    );
+}

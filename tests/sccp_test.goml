@@ -1,0 +1,225 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use std::testing;
+
+fn sccp_interpret(function: ir::Function, arguments: Vec[ir::Datum]) -> Vec[ir::Datum] {
+    testing::expect_ok(ir::interpret(function, arguments, 1000), "interpret")
+}
+
+#[test]
+fn sccp_merges_equal_constants_through_out_of_order_diamonds() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "ConstantDiamond",
+            Vec::from_array([ir::Type::Bool]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let condition = testing::expect_ok(builder.parameters(builder.entry()), "condition")[0];
+    let join = testing::expect_ok(builder.append_block(Vec::from_array([ir::Type::I64])), "join");
+    let yes = testing::expect_ok(builder.append_block(Vec::new()), "yes");
+    let no = testing::expect_ok(builder.append_block(Vec::new()), "no");
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: yes, arguments: Vec::new() },
+            ir::Edge { target: no, arguments: Vec::new() },
+        ),
+    );
+    for block in Vec::from_array([yes, no]) {
+        testing::assert_ok(builder.switch_to(block));
+        let value = testing::expect_ok(builder.iconst(42), "constant");
+        testing::assert_ok(builder.jump(join, Vec::from_array([value])));
+    }
+    testing::assert_ok(builder.switch_to(join));
+    testing::assert_ok(builder.ret(testing::expect_ok(builder.parameters(join), "result")));
+    let source = testing::expect_ok(builder.finish(), "source");
+    let optimized = testing::expect_ok(opt::simplify(source), "simplify");
+    testing::assert_eq(optimized.value_count(), 2);
+    testing::assert(optimized.blocks()[1].parameters.is_empty());
+    for condition in Vec::from_array([false, true]) {
+        let arguments = Vec::from_array([ir::Datum::Bool(condition)]);
+        testing::assert(sccp_interpret(source, arguments) == sccp_interpret(optimized, arguments));
+    }
+    testing::assert_eq(
+        testing::expect_ok(ir::display(optimized), "display"),
+        testing::expect_ok(
+            ir::display(testing::expect_ok(opt::simplify(optimized), "repeat")),
+            "repeat display",
+        ),
+    );
+}
+
+#[test]
+fn sccp_ignores_unexecutable_phi_inputs_and_removes_dead_cycles() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new("ExecutableEdges", Vec::new(), Vec::from_array([ir::Type::I64])),
+        "builder",
+    );
+    let live = testing::expect_ok(builder.append_block(Vec::new()), "live");
+    let dead = testing::expect_ok(builder.append_block(Vec::new()), "dead");
+    let join = testing::expect_ok(builder.append_block(Vec::from_array([ir::Type::Bool])), "join");
+    let exit = testing::expect_ok(builder.append_block(Vec::new()), "exit");
+    let forever = testing::expect_ok(builder.append_block(Vec::new()), "forever");
+    let condition = testing::expect_ok(builder.bconst(true), "true");
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: live, arguments: Vec::new() },
+            ir::Edge { target: dead, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(live));
+    testing::assert_ok(builder.jump(join, Vec::from_array([condition])));
+    testing::assert_ok(builder.switch_to(dead));
+    let conflicting = testing::expect_ok(builder.bconst(false), "false");
+    testing::assert_ok(builder.jump(join, Vec::from_array([conflicting])));
+    testing::assert_ok(builder.switch_to(join));
+    let merged = testing::expect_ok(builder.parameters(join), "merged")[0];
+    testing::assert_ok(
+        builder.branch(
+            merged,
+            ir::Edge { target: exit, arguments: Vec::new() },
+            ir::Edge { target: forever, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(forever));
+    testing::assert_ok(builder.jump(forever, Vec::new()));
+    testing::assert_ok(builder.switch_to(exit));
+    let answer = testing::expect_ok(builder.iconst(42), "answer");
+    testing::assert_ok(builder.ret(Vec::from_array([answer])));
+    let optimized = testing::expect_ok(
+        opt::simplify(testing::expect_ok(builder.finish(), "source")),
+        "simplify",
+    );
+    testing::assert_eq(optimized.blocks().len(), 4);
+    testing::assert_eq(optimized.value_count(), 1);
+    testing::assert(sccp_interpret(optimized, Vec::new()) == Vec::from_array([ir::Datum::I64(42)]));
+}
+
+#[test]
+fn sccp_loop_constants_converge_without_freezing_recurrences() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "LoopConstants",
+            Vec::from_array([ir::Type::I64]),
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let count = testing::expect_ok(builder.parameters(builder.entry()), "count")[0];
+    let header = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64, ir::Type::I64])),
+        "header",
+    );
+    let body = testing::expect_ok(builder.append_block(Vec::new()), "body");
+    let exit = testing::expect_ok(builder.append_block(Vec::new()), "exit");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let seven = testing::expect_ok(builder.iconst(7), "seven");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    testing::assert_ok(builder.jump(header, Vec::from_array([zero, seven])));
+    testing::assert_ok(builder.switch_to(header));
+    let parameters = testing::expect_ok(builder.parameters(header), "parameters");
+    let condition = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, parameters[0], count),
+        "condition",
+    );
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: body, arguments: Vec::new() },
+            ir::Edge { target: exit, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(body));
+    let next = testing::expect_ok(builder.binary(ir::BinaryOp::Add, parameters[0], one), "next");
+    testing::assert_ok(builder.jump(header, Vec::from_array([next, parameters[1]])));
+    testing::assert_ok(builder.switch_to(exit));
+    testing::assert_ok(builder.ret(parameters));
+    let source = testing::expect_ok(builder.finish(), "source");
+    let optimized = testing::expect_ok(opt::simplify(source), "simplify");
+    testing::assert_eq(optimized.blocks()[1].parameters.len(), 1);
+    for count in Vec::from_array([0, 1, 3, 17]) {
+        let arguments = Vec::from_array([ir::Datum::I64(count)]);
+        testing::assert(sccp_interpret(source, arguments) == sccp_interpret(optimized, arguments));
+    }
+}
+
+#[test]
+fn sccp_distinguishes_parallel_edges_to_the_same_block() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "ParallelEdges",
+            Vec::from_array([ir::Type::Bool]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let condition = testing::expect_ok(builder.parameters(builder.entry()), "condition")[0];
+    let join = testing::expect_ok(builder.append_block(Vec::from_array([ir::Type::I64])), "join");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let two = testing::expect_ok(builder.iconst(2), "two");
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: join, arguments: Vec::from_array([one]) },
+            ir::Edge { target: join, arguments: Vec::from_array([two]) },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(join));
+    testing::assert_ok(builder.ret(testing::expect_ok(builder.parameters(join), "return")));
+    let source = testing::expect_ok(builder.finish(), "source");
+    let optimized = testing::expect_ok(opt::simplify(source), "simplify");
+    testing::assert_eq(optimized.blocks()[1].parameters.len(), 1);
+    testing::assert(
+        sccp_interpret(optimized, Vec::from_array([ir::Datum::Bool(true)]))
+            == Vec::from_array([ir::Datum::I64(1)]),
+    );
+    testing::assert(
+        sccp_interpret(optimized, Vec::from_array([ir::Datum::Bool(false)]))
+            == Vec::from_array([ir::Datum::I64(2)]),
+    );
+}
+
+#[test]
+fn sccp_revisits_constant_branches_when_loop_values_become_overdefined() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new("ChangingBranch", Vec::new(), Vec::from_array([ir::Type::I64])),
+        "builder",
+    );
+    let header = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64])),
+        "header",
+    );
+    let body = testing::expect_ok(builder.append_block(Vec::new()), "body");
+    let exit = testing::expect_ok(builder.append_block(Vec::new()), "exit");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let three = testing::expect_ok(builder.iconst(3), "three");
+    testing::assert_ok(builder.jump(header, Vec::from_array([zero])));
+    testing::assert_ok(builder.switch_to(header));
+    let current = testing::expect_ok(builder.parameters(header), "current")[0];
+    let condition = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, current, three),
+        "condition",
+    );
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: body, arguments: Vec::new() },
+            ir::Edge { target: exit, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(body));
+    let next = testing::expect_ok(builder.binary(ir::BinaryOp::Add, current, one), "next");
+    testing::assert_ok(builder.jump(header, Vec::from_array([next])));
+    testing::assert_ok(builder.switch_to(exit));
+    testing::assert_ok(builder.ret(Vec::from_array([current])));
+    let source = testing::expect_ok(builder.finish(), "source");
+    let optimized = testing::expect_ok(opt::simplify(source), "simplify");
+    testing::assert(sccp_interpret(optimized, Vec::new()) == Vec::from_array([ir::Datum::I64(3)]));
+    testing::assert_eq(optimized.blocks()[1].parameters.len(), 1);
+}

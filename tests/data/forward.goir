@@ -1,0 +1,10 @@
+function Forward(i64) -> (i64) {
+block0(v0: i64):
+    jump block2()
+block1():
+    v2: i64 = iadd v1, v0
+    return v2
+block2():
+    v1: i64 = iadd v0, v0
+    jump block1()
+}

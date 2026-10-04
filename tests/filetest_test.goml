@@ -1,0 +1,128 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::reader;
+use ecosystem::goir::filetest;
+use std::fs;
+use std::testing;
+
+fn fixture(name: string) -> string {
+    testing::expect_ok(fs::read_file_structured("tests/data/" + name + ".goir"), "IR fixture")
+}
+
+#[test]
+fn text_ir_runs_stage_tests_and_roundtrips_non_topological_blocks() -> () {
+    for name in Vec::from_array(["loop", "layout", "forward"]) {
+        let source = fixture(name);
+        let function = testing::expect_ok(reader::read(source), "parse IR");
+        let text = testing::expect_ok(ir::display(function), "display IR");
+        testing::assert_eq(
+            testing::expect_ok(
+                ir::display(testing::expect_ok(reader::read(text), "roundtrip")),
+                "roundtrip text",
+            ),
+            text,
+        );
+        for stage in Vec::from_array(
+            [filetest::Stage::Verify, filetest::Stage::Optimize, filetest::Stage::Compile],
+        ) {
+            testing::assert(
+                testing::expect_ok(filetest::run(source, stage, Vec::new(), 100), "stage").text.len()
+                    > 0,
+            );
+        }
+    }
+    testing::assert(
+        testing::expect_ok(
+            filetest::run(
+                fixture("loop"),
+                filetest::Stage::Run,
+                Vec::from_array([ir::Datum::I64(10)]),
+                100,
+            ),
+            "run loop",
+        ).values
+            == Vec::from_array([ir::Datum::I64(55)]),
+    );
+    testing::assert(
+        testing::expect_ok(
+            filetest::run(
+                fixture("layout"),
+                filetest::Stage::Run,
+                Vec::from_array([ir::Datum::Bool(true), ir::Datum::I64(7)]),
+                100,
+            ),
+            "run layout",
+        ).values
+            == Vec::from_array([ir::Datum::I64(98)]),
+    );
+    testing::assert(
+        testing::expect_ok(
+            filetest::run(
+                fixture("forward"),
+                filetest::Stage::Run,
+                Vec::from_array([ir::Datum::I64(7)]),
+                100,
+            ),
+            "run forward dependency",
+        ).values
+            == Vec::from_array([ir::Datum::I64(21)]),
+    );
+}
+
+#[test]
+fn reader_rejects_malformed_input_and_bounded_resource_exhaustion() -> () {
+    for text in Vec::from_array(
+        [
+            "",
+            "function X() -> () {\nblock0():\nreturn\n",
+            "function X() -> () {\nblock0():\nreturn\n}\nextra",
+            "function X() -> (i64) {\nblock0():\nv0: i64 = iadd v1, v1\nreturn v0\n}",
+            "function X() -> (i64) {\nblock0():\nv0: i64 = iconst 9223372036854775808\nreturn v0\n}",
+            "function X() -> (i64) {\nblock0():\nv0: bool = iconst 1\nreturn v0\n}",
+            "function X() -> (i64) {\nblock0():\nv0: i64 = iconst 1\nv0: i64 = iconst 2\nreturn v0\n}",
+            "function X() -> () {\nblock0():\njump block256()\n}",
+            "function X() -> () {\nblock0():\nv4096: i64 = iconst 1\nreturn\n}",
+            "function X() -> () {\nblock0():\nv0: i64 = unknown\nreturn\n}",
+            "function X() -> () {\nblock0():\ncall Missing()\nreturn\n}",
+        ],
+    ) {
+        testing::assert_err(reader::read(text));
+    }
+    let mut oversized = " ";
+    for _ in 0..21 {
+        oversized = oversized + oversized;
+    }
+    testing::assert_eq(
+        testing::expect_err(reader::read(oversized), "input bound").kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+}
+
+fn contains_xor(function: ir::Function) -> Result[bool, ir::Error] {
+    for block in function.blocks() {
+        for instruction in block.instructions {
+            if let ir::Operation::Binary(ir::BinaryOp::Xor, _, _) = instruction.operation {
+                return Result::Ok(true)
+            }
+        }
+    }
+    Result::Ok(false)
+}
+
+#[test]
+fn reducer_preserves_failure_and_removes_ir_with_bounded_attempts() -> () {
+    let source = "function Reproduce(i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\nv2: i64 = iconst 17\nv3: i64 = imul v0, v2\nv4: i64 = bxor v0, v1\nreturn v4\n}";
+    let function = testing::expect_ok(reader::read(source), "reproducer");
+    let reduced = testing::expect_ok(filetest::reduce(function, 32, contains_xor), "reduce");
+    testing::assert(reduced.accepted > 0 && reduced.attempts <= 32);
+    testing::assert(reduced.function.value_count() < function.value_count());
+    testing::assert(testing::expect_ok(contains_xor(reduced.function), "failure retained"));
+    testing::assert_ok(ir::verify(reduced.function));
+    testing::assert_eq(
+        testing::expect_ok(filetest::reduce(function, 1, contains_xor), "bounded reduction").attempts,
+        1,
+    );
+    testing::assert_err(filetest::reduce(function, 0, contains_xor));
+    testing::assert_err(filetest::reduce(function, 4, |_| Result::Ok(false)));
+}

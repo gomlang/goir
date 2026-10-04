@@ -16,10 +16,10 @@ fn fixture_function() -> Function {
 #[test]
 fn verifier_checks_instruction_order_and_rejects_forged_operands() -> () {
     let function = fixture_function();
-    let first = function.body[0].instructions[0].result;
-    let second = function.body[0].instructions[1].result;
+    let first = function.body[0].instructions[0].results[0];
+    let second = function.body[0].instructions[1].results[0];
     function.body[0].instructions[0] = Instruction {
-        result: first,
+        results: Vec::from_array([first]),
         operation: Operation::Binary(BinaryOp::Add, second, second),
     };
     testing::assert_eq(
@@ -27,7 +27,7 @@ fn verifier_checks_instruction_order_and_rejects_forged_operands() -> () {
         ErrorKind::Dominance,
     );
     function.body[0].instructions[0] = Instruction {
-        result: first,
+        results: Vec::from_array([first]),
         operation: Operation::Binary(
             BinaryOp::Add,
             Value { owner: function.identity, slot: 1000000 },

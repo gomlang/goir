@@ -1,0 +1,216 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::abi;
+use ecosystem::goir::amd64;
+use ecosystem::goir::mach;
+use std::testing;
+
+fn scalar_signature() -> ir::Signature {
+    testing::expect_ok(
+        ir::Signature::new(Vec::from_array([ir::Type::I64]), Vec::from_array([ir::Type::I64])),
+        "signature",
+    )
+}
+
+fn recursive_module() -> (ir::Module, ir::FuncRef) {
+    let module = ir::ModuleBuilder::new();
+    let target = testing::expect_ok(module.declare("RecursiveSum", scalar_signature()), "declare");
+    let builder = testing::expect_ok(ir::Builder::for_function(target), "builder");
+    let input = testing::expect_ok(builder.parameters(builder.entry()), "parameters")[0];
+    let done = testing::expect_ok(builder.append_block(Vec::new()), "done");
+    let recurse = testing::expect_ok(builder.append_block(Vec::new()), "recurse");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let positive = testing::expect_ok(builder.icmp(ir::IntCC::SignedLess, zero, input), "positive");
+    testing::assert_ok(
+        builder.branch(
+            positive,
+            ir::Edge { target: recurse, arguments: Vec::new() },
+            ir::Edge { target: done, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(done));
+    testing::assert_ok(builder.ret(Vec::from_array([zero])));
+    testing::assert_ok(builder.switch_to(recurse));
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let next = testing::expect_ok(builder.binary(ir::BinaryOp::Sub, input, one), "next");
+    let result = testing::expect_ok(builder.call(target, Vec::from_array([next])), "recursive call")[0];
+    let result = testing::expect_ok(builder.binary(ir::BinaryOp::Add, input, result), "sum");
+    testing::assert_ok(builder.ret(Vec::from_array([result])));
+    testing::assert_ok(module.define(target, testing::expect_ok(builder.finish(), "function")));
+    (testing::expect_ok(module.finish(), "module"), target)
+}
+
+#[test]
+fn module_interpreter_executes_recursion_with_shared_fuel_and_depth_bounds() -> () {
+    let (module, target) = recursive_module();
+    testing::assert(
+        testing::expect_ok(
+            ir::interpret_module(module, target, Vec::from_array([ir::Datum::I64(20)]), 200),
+            "interpret",
+        )
+            == Vec::from_array([ir::Datum::I64(210)]),
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            ir::interpret_module(module, target, Vec::from_array([ir::Datum::I64(20)]), 30),
+            "shared fuel",
+        ).kind,
+        ir::ErrorKind::FuelExhausted,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            ir::interpret_module_with_host(
+                module,
+                target,
+                Vec::from_array([ir::Datum::I64(20)]),
+                200,
+                5,
+                |_, _| Result::Ok(Vec::new()),
+            ),
+            "depth bound",
+        ).kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+    let assembly = testing::expect_ok(amd64::emit_stack_module("fixture", module), "emit");
+    testing::assert(assembly.assembly.contains("CALL ·RecursiveSum(SB)"));
+}
+
+#[test]
+fn module_rejects_foreign_references_unresolved_definitions_and_conflicting_symbols() -> () {
+    let module = ir::ModuleBuilder::new();
+    let target = testing::expect_ok(module.declare("Identity", scalar_signature()), "declare");
+    testing::assert_err(module.import("Identity", scalar_signature()));
+    testing::assert_eq(
+        testing::expect_err(module.finish(), "unresolved").kind,
+        ir::ErrorKind::InvalidState,
+    );
+    let foreign = ir::ModuleBuilder::new();
+    let other = testing::expect_ok(foreign.import("Other", scalar_signature()), "foreign import");
+    let builder = testing::expect_ok(ir::Builder::for_function(target), "builder");
+    let value = testing::expect_ok(builder.parameters(builder.entry()), "parameters")[0];
+    testing::assert_eq(
+        testing::expect_err(builder.call(other, Vec::from_array([value])), "foreign call").kind,
+        ir::ErrorKind::WrongFunction,
+    );
+    testing::assert_err(builder.call(target, Vec::new()));
+    testing::assert_ok(builder.ret(Vec::from_array([value])));
+    let function = testing::expect_ok(builder.finish(), "function");
+    testing::assert_err(foreign.define(other, function));
+    testing::assert_ok(module.define(target, function));
+    testing::assert_err(module.define(target, function));
+    let finished = testing::expect_ok(module.finish(), "module");
+    testing::assert_err(module.declare("Later", scalar_signature()));
+    testing::assert_err(finished.function(other));
+    let references = finished.references();
+    references.clear();
+    testing::assert_eq(finished.references().len(), 1);
+}
+
+#[test]
+fn calls_preserve_multiple_results_effects_and_immutable_snapshots() -> () {
+    let module = ir::ModuleBuilder::new();
+    let inputs = Vec::from_array([ir::Type::Bool, ir::Type::I64]);
+    let outputs = Vec::from_array([ir::Type::I64, ir::Type::Bool]);
+    let signature = testing::expect_ok(ir::Signature::new(inputs, outputs), "signature");
+    inputs.clear();
+    outputs.clear();
+    let target = testing::expect_ok(module.declare("Entry", signature), "declare");
+    let helper = testing::expect_ok(module.import("Helper", signature), "import");
+    let effect = testing::expect_ok(
+        module.import(
+            "Effect",
+            testing::expect_ok(ir::Signature::new(Vec::new(), Vec::new()), "effect signature"),
+        ),
+        "effect import",
+    );
+    let builder = testing::expect_ok(ir::Builder::for_function(target), "builder");
+    let arguments = testing::expect_ok(builder.parameters(builder.entry()), "parameters");
+    let results = testing::expect_ok(builder.call(helper, arguments), "call");
+    arguments.clear();
+    testing::assert(testing::expect_ok(builder.call(effect, Vec::new()), "effect").is_empty());
+    testing::assert_ok(builder.ret(results));
+    results.clear();
+    let function = testing::expect_ok(builder.finish(), "function");
+    let snapshot = function.blocks();
+    snapshot[0].instructions[0].results.clear();
+    match snapshot[0].instructions[0].operation {
+        Call(_, values) => values.clear(),
+        _ => testing::assert(false),
+    }
+    testing::assert_ok(ir::verify(function));
+    testing::assert(function.blocks()[0].instructions[1].operation.has_effects());
+    let machine = testing::expect_ok(mach::lower(function), "lower calls");
+    let instructions = machine.blocks()[0].instructions;
+    testing::assert_eq(instructions[0].definitions().len(), 2);
+    testing::assert_eq(instructions[0].uses().len(), 2);
+    testing::assert_eq(instructions[0].operands().len(), 4);
+    testing::assert_eq(instructions[0].clobbers().len(), 11);
+    testing::assert(instructions[1].definitions().is_empty());
+    testing::assert(instructions[1].operands().is_empty());
+    match instructions[0] {
+        Call { arguments, results, .. } => {
+            arguments.clear();
+            results.clear();
+        },
+        _ => testing::assert(false),
+    }
+    testing::assert_eq(machine.blocks()[0].instructions[0].definitions().len(), 2);
+    testing::assert_eq(machine.blocks()[0].instructions[0].uses().len(), 2);
+    let rewritten = testing::expect_ok(ir::rewrite(function, function.blocks()), "rewrite");
+    testing::assert_ok(module.define(target, rewritten));
+    let module = testing::expect_ok(module.finish(), "module");
+    let calls = Ref::new(0);
+    let result = testing::expect_ok(
+        ir::interpret_module_with_host(
+            module,
+            target,
+            Vec::from_array([ir::Datum::Bool(true), ir::Datum::I64(42)]),
+            10,
+            4,
+            |callee, values| {
+                calls.set(calls.get() + 1);
+                if callee == helper {
+                    Result::Ok(Vec::from_array([values[1], values[0]]))
+                } else {
+                    Result::Ok(Vec::new())
+                }
+            },
+        ),
+        "host",
+    );
+    testing::assert_eq(calls.get(), 2);
+    testing::assert(result == Vec::from_array([ir::Datum::I64(42), ir::Datum::Bool(true)]));
+    testing::assert_eq(
+        testing::expect_err(
+            ir::interpret_module(
+                module,
+                target,
+                Vec::from_array([ir::Datum::Bool(false), ir::Datum::I64(3)]),
+                10,
+            ),
+            "missing host",
+        ).kind,
+        ir::ErrorKind::Unsupported,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            ir::interpret_module_with_host(
+                module,
+                target,
+                Vec::from_array([ir::Datum::Bool(false), ir::Datum::I64(3)]),
+                10,
+                4,
+                |_, _| Result::Ok(Vec::new()),
+            ),
+            "host result arity",
+        ).kind,
+        ir::ErrorKind::TypeMismatch,
+    );
+    let plan = testing::expect_ok(abi::amd64_abi0_signature(signature), "layout");
+    testing::assert_eq(plan.parameters[0].offset, 0);
+    testing::assert_eq(plan.parameters[1].offset, 8);
+    testing::assert_eq(plan.results[0].offset, 16);
+    testing::assert_eq(plan.results[1].offset, 24);
+    testing::assert_eq(plan.argument_bytes, 25);
+}
