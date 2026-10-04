@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   verify:
-    uses: gomlang/verification/.github/workflows/ecosystem-ci.yml@d7ee3a434f407da66a5e62ec590ed09adf5a164c
+    uses: gomlang/verification/.github/workflows/ecosystem-ci.yml@5759fbca8db81054763382a143d86a160559873e
     with:
       module: goir
-      verification-ref: d7ee3a434f407da66a5e62ec590ed09adf5a164c
+      verification-ref: 5759fbca8db81054763382a143d86a160559873e
