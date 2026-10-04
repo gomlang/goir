@@ -1,0 +1,182 @@
+package goir;
+
+pub struct Builder {
+    function: Function,
+    current: Ref[Block],
+    finished: Ref[bool],
+}
+
+impl Builder {
+    pub fn new(name: string, inputs: Vec[Type], outputs: Vec[Type]) -> Result[Builder, Error] {
+        Builder::with_limits(name, inputs, outputs, Limits::standard())
+    }
+
+    pub fn with_limits(name: string, inputs: Vec[Type], outputs: Vec[Type], limits: Limits) -> Result[
+        Builder,
+        Error,
+    ] {
+        if name.len() == 0 || name.len() > 128 {
+            return Result::Err(
+                error(ErrorKind::InvalidArgument, "function name must contain 1..128 bytes"),
+            )
+        }
+        if limits.max_blocks < 1 || limits.max_blocks > 1024 || limits.max_values < 1
+            || limits.max_values > 65536
+            || limits.max_block_parameters < 0
+            || limits.max_block_parameters > 1024
+            || limits.max_signature_values < 0
+            || limits.max_signature_values > 1024
+            || limits.max_verify_steps < 1
+            || limits.max_verify_steps > 100000000 {
+            return Result::Err(error(ErrorKind::InvalidArgument, "invalid IR limits"))
+        }
+        if inputs.len() > limits.max_signature_values || outputs.len() > limits.max_signature_values
+            || inputs.len() > limits.max_values
+            || inputs.len() > limits.max_block_parameters {
+            return Result::Err(error(ErrorKind::LimitExceeded, "function signature exceeds limits"))
+        }
+        let identity = Ref::new(());
+        let entry = Block { slot: 0, owner: identity };
+        let values = Vec::new();
+        let parameters = Vec::new();
+        for ty in inputs {
+            parameters.push(Value { slot: values.len(), owner: identity });
+            values.push(ValueData { ty, block: entry, position: -1 });
+        }
+        let function = Function {
+            identity,
+            name_value: name,
+            inputs: copy_vec(inputs),
+            outputs: copy_vec(outputs),
+            body: Vec::from_array(
+                [
+                    BlockData {
+                        id: entry,
+                        parameters,
+                        instructions: Vec::new(),
+                        terminator: Option::None,
+                    },
+                ],
+            ),
+            values,
+            limits,
+        };
+        Result::Ok(Builder { function, current: Ref::new(entry), finished: Ref::new(false) })
+    }
+
+    pub fn entry(self: Builder) -> Block {
+        self.function.body[0].id
+    }
+
+    pub fn parameters(self: Builder, block: Block) -> Result[Vec[Value], Error] {
+        check_block(self.function, block)?;
+        Result::Ok(copy_vec(self.function.body[block.slot].parameters))
+    }
+
+    pub fn append_block(self: Builder, types: Vec[Type]) -> Result[Block, Error] {
+        self.require_open()?;
+        let function = self.function;
+        if function.body.len() >= function.limits.max_blocks
+            || types.len() > function.limits.max_block_parameters
+            || types.len() > function.limits.max_values - function.values.len() {
+            return Result::Err(error(ErrorKind::LimitExceeded, "block exceeds IR limits"))
+        }
+        let block = Block { slot: function.body.len(), owner: function.identity };
+        let parameters = Vec::new();
+        for ty in types {
+            parameters.push(Value { slot: function.values.len(), owner: function.identity });
+            function.values.push(ValueData { ty, block, position: -1 });
+        }
+        function.body.push(
+            BlockData { id: block, parameters, instructions: Vec::new(), terminator: Option::None },
+        );
+        Result::Ok(block)
+    }
+
+    pub fn switch_to(self: Builder, block: Block) -> Result[(), Error] {
+        self.require_open()?;
+        check_block(self.function, block)?;
+        self.current.set(block);
+        Result::Ok(())
+    }
+
+    pub fn ins(self: Builder, operation: Operation) -> Result[Value, Error] {
+        self.require_insertion()?;
+        let function = self.function;
+        let ty = operation_type(function, operation)?;
+        if function.values.len() >= function.limits.max_values {
+            return Result::Err(error(ErrorKind::LimitExceeded, "value count exceeds IR limit"))
+        }
+        let block = self.current.get();
+        let value = Value { slot: function.values.len(), owner: function.identity };
+        function.values.push(
+            ValueData { ty, block, position: function.body[block.slot].instructions.len() },
+        );
+        function.body[block.slot].instructions.push(Instruction { result: value, operation });
+        Result::Ok(value)
+    }
+
+    pub fn iconst(self: Builder, value: i64) -> Result[Value, Error] {
+        self.ins(Operation::Constant(Datum::I64(value)))
+    }
+
+    pub fn bconst(self: Builder, value: bool) -> Result[Value, Error] {
+        self.ins(Operation::Constant(Datum::Bool(value)))
+    }
+
+    pub fn binary(self: Builder, op: BinaryOp, left: Value, right: Value) -> Result[Value, Error] {
+        self.ins(Operation::Binary(op, left, right))
+    }
+
+    pub fn icmp(self: Builder, cc: IntCC, left: Value, right: Value) -> Result[Value, Error] {
+        self.ins(Operation::Compare(cc, left, right))
+    }
+
+    pub fn select(self: Builder, condition: Value, yes: Value, no: Value) -> Result[Value, Error] {
+        self.ins(Operation::Select(condition, yes, no))
+    }
+
+    pub fn terminate(self: Builder, term: Terminator) -> Result[(), Error] {
+        self.require_insertion()?;
+        check_terminator(self.function, term)?;
+        let index = self.current.get().slot;
+        let mut block = self.function.body[index];
+        block.terminator = Option::Some(copy_terminator(term));
+        self.function.body[index] = block;
+        Result::Ok(())
+    }
+
+    pub fn jump(self: Builder, target: Block, arguments: Vec[Value]) -> Result[(), Error] {
+        self.terminate(Terminator::Jump(Edge { target, arguments }))
+    }
+
+    pub fn branch(self: Builder, condition: Value, yes: Edge, no: Edge) -> Result[(), Error] {
+        self.terminate(Terminator::Branch(condition, yes, no))
+    }
+
+    pub fn ret(self: Builder, values: Vec[Value]) -> Result[(), Error] {
+        self.terminate(Terminator::Return(values))
+    }
+
+    pub fn finish(self: Builder) -> Result[Function, Error] {
+        self.require_open()?;
+        verify(self.function)?;
+        self.finished.set(true);
+        Result::Ok(self.function)
+    }
+
+    fn require_open(self: Builder) -> Result[(), Error] {
+        if self.finished.get() {
+            return Result::Err(error(ErrorKind::InvalidState, "builder is already finished"))
+        }
+        Result::Ok(())
+    }
+
+    fn require_insertion(self: Builder) -> Result[(), Error] {
+        self.require_open()?;
+        if self.function.body[self.current.get().slot].terminator.is_some() {
+            return Result::Err(error(ErrorKind::InvalidState, "block already has a terminator"))
+        }
+        Result::Ok(())
+    }
+}

@@ -1,0 +1,304 @@
+package goir;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Type {
+    I64,
+    Bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Or,
+    Xor,
+    Shl,
+    ShrU,
+    ShrS,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum IntCC {
+    Equal,
+    NotEqual,
+    SignedLess,
+    SignedLessEqual,
+    UnsignedLess,
+    UnsignedLessEqual,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub struct Value {
+    slot: isize,
+    owner: Ref[()],
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub struct Block {
+    slot: isize,
+    owner: Ref[()],
+}
+
+impl Value {
+    pub fn index(self: Value) -> isize {
+        self.slot
+    }
+}
+
+impl Block {
+    pub fn index(self: Block) -> isize {
+        self.slot
+    }
+}
+
+impl Debug for Value {
+    fn debug(self: Value) -> string {
+        f"v{self.slot}"
+    }
+}
+
+impl Debug for Block {
+    fn debug(self: Block) -> string {
+        f"block{self.slot}"
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ErrorKind {
+    InvalidArgument,
+    WrongFunction,
+    InvalidHandle,
+    InvalidState,
+    TypeMismatch,
+    ControlFlow,
+    Dominance,
+    LimitExceeded,
+    FuelExhausted,
+    Unsupported,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Error {
+    pub kind: ErrorKind,
+    pub message: string,
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        self.message
+    }
+}
+
+pub fn error(kind: ErrorKind, message: string) -> Error {
+    Error { kind, message }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Datum {
+    I64(i64),
+    Bool(bool),
+}
+
+impl Datum {
+    pub fn value_type(self: Datum) -> Type {
+        match self {
+            I64(_) => Type::I64,
+            Bool(_) => Type::Bool,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Operation {
+    Constant(Datum),
+    Binary(BinaryOp, Value, Value),
+    Compare(IntCC, Value, Value),
+    Select(Value, Value, Value),
+}
+
+#[derive(Debug)]
+pub struct Instruction {
+    pub result: Value,
+    pub operation: Operation,
+}
+
+pub struct Edge {
+    pub target: Block,
+    pub arguments: Vec[Value],
+}
+
+pub enum Terminator {
+    Jump(Edge),
+    Branch(Value, Edge, Edge),
+    Return(Vec[Value]),
+}
+
+pub struct BlockData {
+    pub id: Block,
+    pub parameters: Vec[Value],
+    pub instructions: Vec[Instruction],
+    pub terminator: Option[Terminator],
+}
+
+struct ValueData {
+    ty: Type,
+    block: Block,
+    position: isize,
+}
+
+pub struct Limits {
+    pub max_blocks: isize,
+    pub max_values: isize,
+    pub max_block_parameters: isize,
+    pub max_signature_values: isize,
+    pub max_verify_steps: isize,
+}
+
+impl Limits {
+    pub fn standard() -> Limits {
+        Limits {
+            max_blocks: 256,
+            max_values: 4096,
+            max_block_parameters: 256,
+            max_signature_values: 256,
+            max_verify_steps: 10000000,
+        }
+    }
+}
+
+pub struct Function {
+    identity: Ref[()],
+    name_value: string,
+    inputs: Vec[Type],
+    outputs: Vec[Type],
+    body: Vec[BlockData],
+    values: Vec[ValueData],
+    limits: Limits,
+}
+
+fn copy_vec[T](values: Vec[T]) -> Vec[T] {
+    let output = Vec::new();
+    for value in values {
+        output.push(value);
+    }
+    output
+}
+
+fn copy_edge(edge: Edge) -> Edge {
+    Edge { target: edge.target, arguments: copy_vec(edge.arguments) }
+}
+
+fn copy_terminator(term: Terminator) -> Terminator {
+    match term {
+        Jump(edge) => Terminator::Jump(copy_edge(edge)),
+        Branch(condition, yes, no) => Terminator::Branch(condition, copy_edge(yes), copy_edge(no)),
+        Return(values) => Terminator::Return(copy_vec(values)),
+    }
+}
+
+fn copy_block(block: BlockData) -> BlockData {
+    BlockData {
+        id: block.id,
+        parameters: copy_vec(block.parameters),
+        instructions: copy_vec(block.instructions),
+        terminator: block.terminator.map(|term| copy_terminator(term)),
+    }
+}
+
+impl Function {
+    pub fn name(self: Function) -> string {
+        self.name_value
+    }
+
+    pub fn parameter_types(self: Function) -> Vec[Type] {
+        copy_vec(self.inputs)
+    }
+
+    pub fn result_types(self: Function) -> Vec[Type] {
+        copy_vec(self.outputs)
+    }
+
+    pub fn value_count(self: Function) -> isize {
+        self.values.len()
+    }
+
+    pub fn blocks(self: Function) -> Vec[BlockData] {
+        let output = Vec::new();
+        for block in self.body {
+            output.push(copy_block(block));
+        }
+        output
+    }
+
+    pub fn value_type(self: Function, value: Value) -> Result[Type, Error] {
+        check_value(self, value)?;
+        Result::Ok(self.values[value.slot].ty)
+    }
+}
+
+fn check_value(function: Function, value: Value) -> Result[(), Error] {
+    if !ptr_eq(function.identity, value.owner) {
+        return Result::Err(error(ErrorKind::WrongFunction, "value belongs to another function"))
+    }
+    if value.slot < 0 || value.slot >= function.values.len() {
+        return Result::Err(error(ErrorKind::InvalidHandle, "invalid value"))
+    }
+    Result::Ok(())
+}
+
+fn check_block(function: Function, block: Block) -> Result[(), Error] {
+    if !ptr_eq(function.identity, block.owner) {
+        return Result::Err(error(ErrorKind::WrongFunction, "block belongs to another function"))
+    }
+    if block.slot < 0 || block.slot >= function.body.len() {
+        return Result::Err(error(ErrorKind::InvalidHandle, "invalid block"))
+    }
+    Result::Ok(())
+}
+
+pub fn operands(operation: Operation) -> Vec[Value] {
+    match operation {
+        Constant(_) => Vec::new(),
+        Binary(_, left, right) | Compare(_, left, right) => Vec::from_array([left, right]),
+        Select(condition, yes, no) => Vec::from_array([condition, yes, no]),
+    }
+}
+
+pub fn successors(term: Terminator) -> Vec[Edge] {
+    match term {
+        Jump(edge) => Vec::from_array([copy_edge(edge)]),
+        Branch(_, yes, no) => Vec::from_array([copy_edge(yes), copy_edge(no)]),
+        Return(_) => Vec::new(),
+    }
+}
+
+fn require_type(function: Function, value: Value, ty: Type) -> Result[(), Error] {
+    if function.value_type(value)? != ty {
+        return Result::Err(error(ErrorKind::TypeMismatch, f"incorrect type for v{value.slot}"))
+    }
+    Result::Ok(())
+}
+
+fn operation_type(function: Function, operation: Operation) -> Result[Type, Error] {
+    match operation {
+        Constant(value) => Result::Ok(value.value_type()),
+        Binary(_, left, right) => {
+            require_type(function, left, Type::I64)?;
+            require_type(function, right, Type::I64)?;
+            Result::Ok(Type::I64)
+        },
+        Compare(_, left, right) => {
+            require_type(function, left, Type::I64)?;
+            require_type(function, right, Type::I64)?;
+            Result::Ok(Type::Bool)
+        },
+        Select(condition, yes, no) => {
+            require_type(function, condition, Type::Bool)?;
+            let ty = function.value_type(yes)?;
+            require_type(function, no, ty)?;
+            Result::Ok(ty)
+        },
+    }
+}

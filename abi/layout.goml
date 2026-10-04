@@ -1,0 +1,130 @@
+package abi;
+
+use ecosystem::goir::{Error, ErrorKind, Function, Type, error};
+
+#[derive(Debug, PartialEq)]
+pub struct Slot {
+    pub ty: Type,
+    pub offset: isize,
+    pub size: isize,
+}
+
+pub struct Plan {
+    pub parameters: Vec[Slot],
+    pub results: Vec[Slot],
+    pub argument_bytes: isize,
+}
+
+fn align_up(value: isize, alignment: isize) -> isize {
+    (value + alignment - 1) / alignment * alignment
+}
+
+fn slots(types: Vec[Type], offset: Ref[isize]) -> Vec[Slot] {
+    let result = Vec::new();
+    for ty in types {
+        let size = match ty {
+            I64 => 8,
+            Bool => 1,
+        };
+        let position = align_up(offset.get(), size);
+        result.push(Slot { ty, offset: position, size });
+        offset.set(position + size);
+    }
+    result
+}
+
+pub fn amd64_abi0(function: Function) -> Result[Plan, Error] {
+    let offset = Ref::new(0);
+    let parameters = slots(function.parameter_types(), offset);
+    let result_types = function.result_types();
+    if !result_types.is_empty() {
+        offset.set(align_up(offset.get(), 8));
+    }
+    let results = slots(result_types, offset);
+    Result::Ok(Plan { parameters, results, argument_bytes: offset.get() })
+}
+
+pub fn go_type(ty: Type) -> string {
+    match ty {
+        I64 => "int64",
+        Bool => "bool",
+    }
+}
+
+pub fn validate_identifier(name: string) -> Result[(), Error] {
+    if name.len() < 1 || name.len() > 128 || name == "_" {
+        return Result::Err(error(ErrorKind::InvalidArgument, "invalid Go identifier"))
+    }
+    for index in 0..name.len() {
+        let ch = name[index];
+        let letter = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_';
+        if !letter && !(index > 0 && ch >= '0' && ch <= '9') {
+            return Result::Err(
+                error(
+                    ErrorKind::InvalidArgument,
+                    "Go identifier must contain ASCII letters, digits or underscores",
+                ),
+            )
+        }
+    }
+    if Vec::from_array(
+        [
+            "break",
+            "default",
+            "func",
+            "interface",
+            "select",
+            "case",
+            "defer",
+            "go",
+            "map",
+            "struct",
+            "chan",
+            "else",
+            "goto",
+            "package",
+            "switch",
+            "const",
+            "fallthrough",
+            "if",
+            "range",
+            "type",
+            "continue",
+            "for",
+            "import",
+            "return",
+            "var",
+        ],
+    ).contains(name) {
+        return Result::Err(error(ErrorKind::InvalidArgument, "reserved Go identifier"))
+    }
+    Result::Ok(())
+}
+
+pub fn declaration(function: Function) -> Result[string, Error] {
+    validate_identifier(function.name())?;
+    if Vec::from_array(["init", "main", "int64", "bool"]).contains(function.name()) {
+        return Result::Err(
+            error(
+                ErrorKind::InvalidArgument,
+                "function name conflicts with generated Go declarations",
+            ),
+        )
+    }
+    let inputs = Vec::new();
+    let types = function.parameter_types();
+    for index in 0..types.len() {
+        inputs.push(f"p{index} " + go_type(types[index]));
+    }
+    let outputs = Vec::new();
+    let results = function.result_types();
+    for index in 0..results.len() {
+        outputs.push(f"r{index} " + go_type(results[index]));
+    }
+    let suffix = if outputs.is_empty() {
+        ""
+    } else {
+        " (" + outputs.join(", ") + ")"
+    };
+    Result::Ok("func " + function.name() + "(" + inputs.join(", ") + ")" + suffix + "\n")
+}

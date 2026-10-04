@@ -1,0 +1,108 @@
+package goir;
+
+impl Type {
+    pub fn name(self: Type) -> string {
+        match self {
+            I64 => "i64",
+            Bool => "bool",
+        }
+    }
+}
+
+impl BinaryOp {
+    pub fn name(self: BinaryOp) -> string {
+        match self {
+            Add => "iadd",
+            Sub => "isub",
+            Mul => "imul",
+            And => "band",
+            Or => "bor",
+            Xor => "bxor",
+            Shl => "ishl",
+            ShrU => "ushr",
+            ShrS => "sshr",
+        }
+    }
+}
+
+impl IntCC {
+    pub fn name(self: IntCC) -> string {
+        match self {
+            Equal => "eq",
+            NotEqual => "ne",
+            SignedLess => "slt",
+            SignedLessEqual => "sle",
+            UnsignedLess => "ult",
+            UnsignedLessEqual => "ule",
+        }
+    }
+}
+
+fn value_list(values: Vec[Value]) -> string {
+    let items = Vec::new();
+    for value in values {
+        items.push(f"v{value.slot}");
+    }
+    items.join(", ")
+}
+
+fn edge_text(edge: Edge) -> string {
+    f"block{edge.target.slot}(" + value_list(edge.arguments) + ")"
+}
+
+fn operation_text(operation: Operation) -> string {
+    match operation {
+        Constant(Datum::I64(value)) => f"iconst {value}",
+        Constant(Datum::Bool(value)) => f"bconst {value}",
+        Binary(op, left, right) => op.name() + f" v{left.slot}, v{right.slot}",
+        Compare(cc, left, right) => "icmp " + cc.name() + f" v{left.slot}, v{right.slot}",
+        Select(condition, yes, no) => f"select v{condition.slot}, v{yes.slot}, v{no.slot}",
+    }
+}
+
+pub fn display(function: Function) -> Result[string, Error] {
+    verify(function)?;
+    let inputs = Vec::new();
+    for ty in function.inputs {
+        inputs.push(ty.name());
+    }
+    let outputs = Vec::new();
+    for ty in function.outputs {
+        outputs.push(ty.name());
+    }
+    let lines = Vec::from_array(
+        [
+            "function " + function.name_value + "(" + inputs.join(", ") + ") -> ("
+                + outputs.join(", ")
+                + ") {",
+        ],
+    );
+    for block in function.body {
+        let parameters = Vec::new();
+        for value in block.parameters {
+            parameters.push(f"v{value.slot}: " + function.value_type(value)?.name());
+        }
+        lines.push(f"block{block.id.slot}(" + parameters.join(", ") + "):");
+        for instruction in block.instructions {
+            lines.push(
+                f"    v{instruction.result.slot}: "
+                    + function.value_type(instruction.result)?.name()
+                    + " = "
+                    + operation_text(instruction.operation),
+            );
+        }
+        let term = block.terminator.ok_or(error(ErrorKind::ControlFlow, "missing terminator"))?;
+        lines.push(
+            "    "
+                + match term {
+                    Jump(edge) => "jump " + edge_text(edge),
+                    Branch(condition, yes, no) => f"brif v{condition.slot}, " + edge_text(yes)
+                        + ", "
+                        + edge_text(no),
+                    Return(values) => "return " + value_list(values),
+                },
+        );
+    }
+    lines.push("}");
+    Result::Ok(lines.join("\n") + "\n")
+}

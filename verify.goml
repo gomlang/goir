@@ -1,0 +1,240 @@
+package goir;
+
+fn check_edge(function: Function, edge: Edge) -> Result[(), Error] {
+    check_block(function, edge.target)?;
+    if edge.target.slot == 0 {
+        return Result::Err(error(ErrorKind::ControlFlow, "entry block cannot have predecessors"))
+    }
+    let parameters = function.body[edge.target.slot].parameters;
+    if edge.arguments.len() != parameters.len() {
+        return Result::Err(
+            error(
+                ErrorKind::TypeMismatch,
+                "branch argument count differs from block parameter count",
+            ),
+        )
+    }
+    for index in 0..parameters.len() {
+        require_type(function, edge.arguments[index], function.value_type(parameters[index])?)?;
+    }
+    Result::Ok(())
+}
+
+fn check_terminator(function: Function, term: Terminator) -> Result[(), Error] {
+    match term {
+        Jump(edge) => check_edge(function, edge),
+        Branch(condition, yes, no) => {
+            require_type(function, condition, Type::Bool)?;
+            check_edge(function, yes)?;
+            check_edge(function, no)
+        },
+        Return(values) => {
+            if values.len() != function.outputs.len() {
+                return Result::Err(
+                    error(ErrorKind::TypeMismatch, "return value count differs from signature"),
+                )
+            }
+            for index in 0..values.len() {
+                require_type(function, values[index], function.outputs[index])?;
+            }
+            Result::Ok(())
+        },
+    }
+}
+
+fn charge(remaining: Ref[isize]) -> Result[(), Error] {
+    if remaining.get() == 0 {
+        return Result::Err(error(ErrorKind::LimitExceeded, "verification work limit exceeded"))
+    }
+    remaining.set(remaining.get() - 1);
+    Result::Ok(())
+}
+
+fn check_use(
+    function: Function,
+    value: Value,
+    block: Block,
+    position: isize,
+    dominators: Vec[Vec[bool]],
+) -> Result[(), Error] {
+    check_value(function, value)?;
+    let definition = function.values[value.slot];
+    if definition.block == block {
+        if definition.position >= position {
+            return Result::Err(
+                error(
+                    ErrorKind::Dominance,
+                    f"v{value.slot} is used before its definition in block{block.slot}",
+                ),
+            )
+        }
+    } else if !dominators[block.slot][definition.block.slot] {
+        return Result::Err(
+            error(
+                ErrorKind::Dominance,
+                f"v{value.slot} does not dominate its use in block{block.slot}",
+            ),
+        )
+    }
+    Result::Ok(())
+}
+
+pub fn verify(function: Function) -> Result[(), Error] {
+    let count = function.body.len();
+    if count == 0 || count > function.limits.max_blocks
+        || function.values.len() > function.limits.max_values {
+        return Result::Err(error(ErrorKind::LimitExceeded, "invalid function size"))
+    }
+    let remaining = Ref::new(function.limits.max_verify_steps);
+    let predecessors: Vec[Vec[isize]] = Vec::new();
+    let reachable: Vec[bool] = Vec::new();
+    let definitions: Vec[bool] = Vec::new();
+    for _ in function.values {
+        definitions.push(false);
+    }
+    for _ in 0..count {
+        predecessors.push(Vec::new());
+        reachable.push(false);
+    }
+    for index in 0..count {
+        charge(remaining)?;
+        let block = function.body[index];
+        check_block(function, block.id)?;
+        if block.id.slot != index {
+            return Result::Err(
+                error(ErrorKind::InvalidHandle, "block ID does not match its position"),
+            )
+        }
+        if block.parameters.len() > function.limits.max_block_parameters {
+            return Result::Err(error(ErrorKind::LimitExceeded, "too many block parameters"))
+        }
+        if index == 0 && block.parameters.len() != function.inputs.len() {
+            return Result::Err(
+                error(ErrorKind::TypeMismatch, "entry parameters differ from signature"),
+            )
+        }
+        for p in 0..block.parameters.len() {
+            let value = block.parameters[p];
+            check_definition(function, definitions, value, block.id, -1)?;
+            if index == 0 {
+                require_type(function, value, function.inputs[p])?;
+            }
+        }
+        for position in 0..block.instructions.len() {
+            charge(remaining)?;
+            let instruction = block.instructions[position];
+            check_definition(function, definitions, instruction.result, block.id, position)?;
+            require_type(
+                function,
+                instruction.result,
+                operation_type(function, instruction.operation)?,
+            )?;
+        }
+        let term = block.terminator.ok_or(
+            error(ErrorKind::ControlFlow, f"block{index} has no terminator"),
+        )?;
+        check_terminator(function, term)?;
+        for edge in successors(term) {
+            predecessors[edge.target.slot].push(index);
+        }
+    }
+    for defined in definitions {
+        if !defined {
+            return Result::Err(error(ErrorKind::InvalidHandle, "value has no definition"))
+        }
+    }
+    let pending = Vec::from_array([0]);
+    reachable[0] = true;
+    let mut cursor = 0;
+    while cursor < pending.len() {
+        let index = pending[cursor];
+        cursor = cursor + 1;
+        let term = function.body[index].terminator.ok_or(
+            error(ErrorKind::ControlFlow, "missing terminator"),
+        )?;
+        for edge in successors(term) {
+            let target = edge.target.slot;
+            if !reachable[target] {
+                reachable[target] = true;
+                pending.push(target);
+            }
+        }
+    }
+    for index in 0..count {
+        if !reachable[index] {
+            return Result::Err(error(ErrorKind::ControlFlow, f"block{index} is unreachable"))
+        }
+    }
+    let dominators: Vec[Vec[bool]] = Vec::new();
+    for index in 0..count {
+        let row = Vec::new();
+        for other in 0..count {
+            charge(remaining)?;
+            row.push(index != 0 || other == 0);
+        }
+        dominators.push(row);
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in 1..count {
+            for other in 0..count {
+                let mut present = true;
+                for predecessor in predecessors[index] {
+                    charge(remaining)?;
+                    if !dominators[predecessor][other] {
+                        present = false;
+                        break;
+                    }
+                }
+                if index == other {
+                    present = true;
+                }
+                if dominators[index][other] != present {
+                    dominators[index][other] = present;
+                    changed = true;
+                }
+            }
+        }
+    }
+    for block in function.body {
+        for position in 0..block.instructions.len() {
+            for operand in operands(block.instructions[position].operation) {
+                charge(remaining)?;
+                check_use(function, operand, block.id, position, dominators)?;
+            }
+        }
+        let term = block.terminator.ok_or(error(ErrorKind::ControlFlow, "missing terminator"))?;
+        let used = match term {
+            Return(values) => copy_vec(values),
+            Branch(condition, _, _) => Vec::from_array([condition]),
+            _ => Vec::new(),
+        };
+        for edge in successors(term) {
+            used.extend(edge.arguments);
+        }
+        for value in used {
+            charge(remaining)?;
+            check_use(function, value, block.id, block.instructions.len(), dominators)?;
+        }
+    }
+    Result::Ok(())
+}
+
+fn check_definition(
+    function: Function,
+    definitions: Vec[bool],
+    value: Value,
+    block: Block,
+    position: isize,
+) -> Result[(), Error] {
+    check_value(function, value)?;
+    let definition = function.values[value.slot];
+    if definitions[value.slot] || definition.block != block || definition.position != position {
+        return Result::Err(
+            error(ErrorKind::InvalidHandle, "inconsistent or duplicate value definition"),
+        )
+    }
+    definitions[value.slot] = true;
+    Result::Ok(())
+}

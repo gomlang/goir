@@ -1,0 +1,125 @@
+package goir;
+
+fn encode(value: Datum) -> i64 {
+    match value {
+        I64(integer) => integer,
+        Bool(boolean) => if boolean {
+            1
+        } else {
+            0
+        },
+    }
+}
+
+fn binary_value(op: BinaryOp, left: i64, right: i64) -> i64 {
+    let shift = (right.to_u64() & 63).to_isize();
+    match op {
+        Add => (left.to_u64() + right.to_u64()).to_i64(),
+        Sub => (left.to_u64() - right.to_u64()).to_i64(),
+        Mul => (left.to_u64() * right.to_u64()).to_i64(),
+        And => left & right,
+        Or => left | right,
+        Xor => left ^ right,
+        Shl => (left.to_u64() << shift).to_i64(),
+        ShrU => (left.to_u64() >> shift).to_i64(),
+        ShrS => left >> shift,
+    }
+}
+
+fn compare_value(cc: IntCC, left: i64, right: i64) -> bool {
+    match cc {
+        Equal => left == right,
+        NotEqual => left != right,
+        SignedLess => left < right,
+        SignedLessEqual => left <= right,
+        UnsignedLess => left.to_u64() < right.to_u64(),
+        UnsignedLessEqual => left.to_u64() <= right.to_u64(),
+    }
+}
+
+fn evaluate(operation: Operation, values: Vec[i64]) -> i64 {
+    match operation {
+        Constant(value) => encode(value),
+        Binary(op, left, right) => binary_value(op, values[left.slot], values[right.slot]),
+        Compare(cc, left, right) => if compare_value(cc, values[left.slot], values[right.slot]) {
+            1
+        } else {
+            0
+        },
+        Select(condition, yes, no) => if values[condition.slot] != 0 {
+            values[yes.slot]
+        } else {
+            values[no.slot]
+        },
+    }
+}
+
+fn spend_fuel(fuel: Ref[u64]) -> Result[(), Error] {
+    if fuel.get() == 0 {
+        return Result::Err(error(ErrorKind::FuelExhausted, "IR execution fuel exhausted"))
+    }
+    fuel.set(fuel.get() - 1);
+    Result::Ok(())
+}
+
+pub fn interpret(function: Function, arguments: Vec[Datum], fuel: u64) -> Result[Vec[Datum], Error] {
+    verify(function)?;
+    if arguments.len() != function.inputs.len() {
+        return Result::Err(
+            error(ErrorKind::TypeMismatch, "interpreter argument count differs from signature"),
+        )
+    }
+    let values: Vec[i64] = Vec::new();
+    for _ in function.values {
+        values.push(0);
+    }
+    for index in 0..arguments.len() {
+        if arguments[index].value_type() != function.inputs[index] {
+            return Result::Err(
+                error(ErrorKind::TypeMismatch, "interpreter argument type differs from signature"),
+            )
+        }
+        values[function.body[0].parameters[index].slot] = encode(arguments[index]);
+    }
+    let remaining = Ref::new(fuel);
+    let mut current = 0;
+    loop {
+        let block = function.body[current];
+        for instruction in block.instructions {
+            spend_fuel(remaining)?;
+            values[instruction.result.slot] = evaluate(instruction.operation, values);
+        }
+        spend_fuel(remaining)?;
+        let term = block.terminator.ok_or(error(ErrorKind::ControlFlow, "missing terminator"))?;
+        let edge = match term {
+            Return(results) => {
+                let output = Vec::new();
+                for index in 0..results.len() {
+                    let value = values[results[index].slot];
+                    output.push(
+                        match function.outputs[index] {
+                            I64 => Datum::I64(value),
+                            Bool => Datum::Bool(value != 0),
+                        },
+                    );
+                }
+                return Result::Ok(output)
+            },
+            Jump(edge) => edge,
+            Branch(condition, yes, no) => if values[condition.slot] != 0 {
+                yes
+            } else {
+                no
+            },
+        };
+        let incoming = Vec::new();
+        for value in edge.arguments {
+            incoming.push(values[value.slot]);
+        }
+        let parameters = function.body[edge.target.slot].parameters;
+        for index in 0..incoming.len() {
+            values[parameters[index].slot] = incoming[index];
+        }
+        current = edge.target.slot;
+    }
+}

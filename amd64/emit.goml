@@ -1,0 +1,207 @@
+package amd64;
+
+use ecosystem::goir as ir;
+use module::abi;
+
+pub struct Compiled {
+    pub assembly: string,
+    pub declaration: string,
+    pub frame_bytes: isize,
+    pub stack_slots: isize,
+}
+
+fn load(lines: Vec[string], value: ir::Value, register: string) -> () {
+    let offset = value.index() * 8;
+    lines.push(f"    MOVQ {offset}(SP), {register}");
+}
+
+fn save(lines: Vec[string], value: ir::Value, register: string) -> () {
+    let offset = value.index() * 8;
+    lines.push(f"    MOVQ {register}, {offset}(SP)");
+}
+
+fn binary_opcode(op: ir::BinaryOp) -> string {
+    match op {
+        Add => "ADDQ",
+        Sub => "SUBQ",
+        Mul => "IMULQ",
+        And => "ANDQ",
+        Or => "ORQ",
+        Xor => "XORQ",
+        Shl => "SHLQ",
+        ShrU => "SHRQ",
+        ShrS => "SARQ",
+    }
+}
+
+fn comparison_opcode(cc: ir::IntCC) -> string {
+    match cc {
+        Equal => "SETEQ",
+        NotEqual => "SETNE",
+        SignedLess => "SETLT",
+        SignedLessEqual => "SETLE",
+        UnsignedLess => "SETCS",
+        UnsignedLessEqual => "SETLS",
+    }
+}
+
+fn instruction(lines: Vec[string], value: ir::Instruction) -> () {
+    match value.operation {
+        Constant(datum) => {
+            let integer = match datum {
+                I64(integer) => integer,
+                Bool(boolean) => if boolean {
+                    1
+                } else {
+                    0
+                },
+            };
+            lines.push("    MOVQ $" + integer.to_string() + ", AX");
+        },
+        Binary(op, left, right) => {
+            load(lines, left, "AX");
+            load(lines, right, "CX");
+            lines.push("    " + binary_opcode(op) + " CX, AX");
+        },
+        Compare(cc, left, right) => {
+            load(lines, left, "AX");
+            load(lines, right, "CX");
+            lines.push("    CMPQ AX, CX");
+            lines.push("    " + comparison_opcode(cc) + " AL");
+            lines.push("    MOVBQZX AL, AX");
+        },
+        Select(condition, yes, no) => {
+            load(lines, condition, "DX");
+            load(lines, yes, "AX");
+            load(lines, no, "CX");
+            lines.push("    CMPQ DX, $0");
+            lines.push("    CMOVQEQ CX, AX");
+        },
+    }
+    save(lines, value.result, "AX");
+}
+
+fn transfer(lines: Vec[string], edge: ir::Edge, blocks: Vec[ir::BlockData], scratch: isize) -> () {
+    for index in 0..edge.arguments.len() {
+        load(lines, edge.arguments[index], "AX");
+        let offset = scratch + index * 8;
+        lines.push(f"    MOVQ AX, {offset}(SP)");
+    }
+    let parameters = blocks[edge.target.index()].parameters;
+    for index in 0..parameters.len() {
+        let offset = scratch + index * 8;
+        lines.push(f"    MOVQ {offset}(SP), AX");
+        save(lines, parameters[index], "AX");
+    }
+    let target = edge.target.index();
+    lines.push(f"    JMP block{target}");
+}
+
+pub fn emit(function: ir::Function) -> Result[Compiled, ir::Error] {
+    emit_function(function, true)
+}
+
+fn emit_function(function: ir::Function, header: bool) -> Result[Compiled, ir::Error] {
+    ir::verify(function)?;
+    let declaration = abi::declaration(function)?;
+    let plan = abi::amd64_abi0(function)?;
+    let blocks = function.blocks();
+    let mut temporary_slots = 0;
+    for block in blocks {
+        if block.id.index() != 0 && block.parameters.len() > temporary_slots {
+            temporary_slots = block.parameters.len();
+        }
+    }
+    let stack_slots = function.value_count() + temporary_slots;
+    let frame_bytes = stack_slots * 8;
+    if frame_bytes > 32768 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "amd64 stack frame exceeds 32768 bytes"),
+        )
+    }
+    let name = function.name();
+    let argument_bytes = plan.argument_bytes;
+    let lines = Vec::new();
+    if header {
+        lines.push("#include \"funcdata.h\"");
+        lines.push("");
+    }
+    lines.push(f"TEXT ·{name}(SB), $" + frame_bytes.to_string() + f"-{argument_bytes}");
+    lines.push("    NO_LOCAL_POINTERS");
+    for index in 0..plan.parameters.len() {
+        let slot = plan.parameters[index];
+        let offset = slot.offset;
+        let opcode = match slot.ty {
+            I64 => "MOVQ",
+            Bool => "MOVBQZX",
+        };
+        lines.push(f"    {opcode} p{index}+{offset}(FP), AX");
+        save(lines, blocks[0].parameters[index], "AX");
+    }
+    for block in blocks {
+        let index = block.id.index();
+        lines.push(f"block{index}:");
+        for value in block.instructions {
+            instruction(lines, value);
+        }
+        let term = block.terminator.ok_or(
+            ir::error(ir::ErrorKind::ControlFlow, "missing terminator"),
+        )?;
+        match term {
+            Return(values) => {
+                for position in 0..values.len() {
+                    load(lines, values[position], "AX");
+                    let slot = plan.results[position];
+                    let offset = slot.offset;
+                    let opcode = match slot.ty {
+                        I64 => "MOVQ",
+                        Bool => "MOVB",
+                    };
+                    lines.push(f"    {opcode} AX, r{position}+{offset}(FP)");
+                }
+                lines.push("    RET");
+            },
+            Jump(edge) => transfer(lines, edge, blocks, function.value_count() * 8),
+            Branch(condition, yes, no) => {
+                load(lines, condition, "AX");
+                lines.push("    CMPQ AX, $0");
+                lines.push(f"    JNE edge_yes{index}");
+                transfer(lines, no, blocks, function.value_count() * 8);
+                lines.push(f"edge_yes{index}:");
+                transfer(lines, yes, blocks, function.value_count() * 8);
+            },
+        }
+    }
+    Result::Ok(
+        Compiled { assembly: lines.join("\n") + "\n", declaration, frame_bytes, stack_slots },
+    )
+}
+
+pub struct Package {
+    pub assembly: string,
+    pub declarations: string,
+}
+
+pub fn emit_package(name: string, functions: Vec[ir::Function]) -> Result[Package, ir::Error] {
+    abi::validate_identifier(name)?;
+    if functions.is_empty() || functions.len() > 256 {
+        return Result::Err(
+            ir::error(ir::ErrorKind::LimitExceeded, "package requires 1..256 functions"),
+        )
+    }
+    let symbols = Vec::new();
+    let assembly = Vec::from_array(["#include \"funcdata.h\"\n"]);
+    let declarations = Vec::from_array(["package " + name + "\n"]);
+    for function in functions {
+        if symbols.contains(function.name()) {
+            return Result::Err(
+                ir::error(ir::ErrorKind::InvalidArgument, "duplicate function symbol"),
+            )
+        }
+        symbols.push(function.name());
+        let compiled = emit_function(function, false)?;
+        assembly.push(compiled.assembly);
+        declarations.push(compiled.declaration);
+    }
+    Result::Ok(Package { assembly: assembly.join("\n"), declarations: declarations.join("\n") })
+}
