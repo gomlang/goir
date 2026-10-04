@@ -40,13 +40,20 @@ fn native_module_calls_match_interpreter_and_survive_go_gc() -> () {
     testing::assert_ok(fs::create_dir_all(directory));
     let source = calls_module(false);
     let optimized = calls_module(true);
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "module.goir"),
+            testing::expect_ok(reader::display_module(source), "complete module reproducer"),
+        ),
+    );
     let prefixes = Vec::from_array(
         ["", "baseline.", "constrained.", "spilled.", "optimized.", "optstack."],
     );
     let lines = Vec::from_array(
         [
             "package generated",
-            "import (\"testing\"; baseline \"goir-calls-test/baseline\"; constrained \"goir-calls-test/constrained\"; spilled \"goir-calls-test/spilled\"; optimized \"goir-calls-test/optimized\"; optstack \"goir-calls-test/optstack\")",
+            "import (\"testing\"; \"math\"; baseline \"goir-calls-test/baseline\"; constrained \"goir-calls-test/constrained\"; spilled \"goir-calls-test/spilled\"; optimized \"goir-calls-test/optimized\"; optstack \"goir-calls-test/optstack\")",
+            "var _ = math.Float64bits",
         ],
     );
     for function in source.functions() {
@@ -107,7 +114,7 @@ fn native_module_calls_match_interpreter_and_survive_go_gc() -> () {
                 );
                 for position in 0..expected.len() {
                     lines.push(
-                        f"if got{position} != " + literal(expected[position])
+                        "if " + result_mismatch(f"got{position}", expected[position])
                             + f" {{ t.Fatalf(\"{prefix}case {index}, result {position}: %v\", got{position}) }}",
                     );
                 }
@@ -206,10 +213,18 @@ fn native_module_calls_match_interpreter_and_survive_go_gc() -> () {
         ),
     );
     let _ = run_go(directory, Vec::from_array(["vet", "./..."]));
-    let output = run_go(
+    let result = go_result(
         directory,
         Vec::from_array(["test", "-count=1", "-timeout=60s", "-v", "./..."]),
+        90,
     );
-    testing::assert(output.contains("PASS"));
+    if !result.success {
+        testing::assert_ok(
+            fs::write_file_structured(path::join(directory, "failure.txt"), result.output),
+        );
+        reduce_module_native_failure(directory, source, result.output, helper_body);
+    }
+    testing::assert(result.success);
+    testing::assert(result.output.contains("PASS"));
     testing::assert_ok(fs::remove_dir_all(directory));
 }

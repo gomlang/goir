@@ -1,0 +1,73 @@
+package tests;
+
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::testing;
+
+#[test]
+fn runtime_boundary_probes_typed_pointer_leaf_and_abi_internal_rejection() -> () {
+    let directory = path::join(
+        "_artifact",
+        "goir-runtime-probe-" + hash::sha256(testing::expect_ok(rand::bytes(16), "random")),
+    );
+    let valid = path::join(directory, "pointer");
+    let invalid = path::join(directory, "abiinternal");
+    testing::assert_ok(fs::create_dir_all(valid));
+    testing::assert_ok(fs::create_dir_all(invalid));
+    for destination in Vec::from_array([valid, invalid]) {
+        testing::assert_ok(
+            fs::write_file_structured(
+                path::join(destination, "go.mod"),
+                "module goir-runtime-probe\n\ngo 1.26.0\n",
+            ),
+        );
+    }
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(valid, "probe.go"),
+            "package probe\n\nfunc Read(p *int64) int64\n",
+        ),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(valid, "probe_amd64.s"),
+            "#include \"textflag.h\"\n\nTEXT ·Read(SB), NOSPLIT, $0-16\n    MOVQ p+0(FP), AX\n    MOVQ (AX), AX\n    MOVQ AX, ret+8(FP)\n    RET\n",
+        ),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(valid, "probe_test.go"),
+            "package probe\n\nimport (\n    \"runtime\"\n    \"sync\"\n    \"testing\"\n)\n\nfunc TestTypedPointerPrototypeAcrossGC(t *testing.T) {\n    var workers sync.WaitGroup\n    done := make(chan struct{})\n    var collector sync.WaitGroup\n    collector.Add(1)\n    go func() {\n        defer collector.Done()\n        for {\n            select {\n            case <-done:\n                return\n            default:\n                runtime.GC()\n            }\n        }\n    }()\n    for worker := 0; worker < 8; worker++ {\n        workers.Add(1)\n        go func(worker int) {\n            defer workers.Done()\n            for iteration := 0; iteration < 2000; iteration++ {\n                value := new(int64)\n                *value = int64(worker*2000 + iteration)\n                if got := Read(value); got != *value {\n                    t.Errorf(\"Read = %d, want %d\", got, *value)\n                    return\n                }\n                runtime.KeepAlive(value)\n            }\n        }(worker)\n    }\n    workers.Wait()\n    close(done)\n    collector.Wait()\n}\n",
+        ),
+    );
+    let _ = run_go(valid, Vec::from_array(["vet", "./..."]));
+    let output = run_go(valid, Vec::from_array(["test", "-count=1", "-timeout=30s", "-v", "./..."]));
+    testing::assert(output.contains("PASS"));
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(invalid, "probe.go"),
+            "package probe\n\nfunc Probe() int64\n",
+        ),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(invalid, "probe_amd64.s"),
+            "#include \"textflag.h\"\n\nTEXT ·Probe<ABIInternal>(SB), NOSPLIT, $0-8\n    MOVQ $1, AX\n    RET\n",
+        ),
+    );
+    let rejected = go_result(invalid, Vec::from_array(["test", "./..."]), 30);
+    testing::assert(!rejected.success);
+    testing::assert(rejected.output.contains("ABI selector only permitted when compiling runtime"));
+    let version = run_go(valid, Vec::from_array(["version"]));
+    testing::assert_ok(
+        fs::write_file_structured(
+            "_artifact/runtime-boundary.txt",
+            version
+                + "Typed Go pointer prototype with no-call ABI0 leaf: passed vet, heap reads, concurrent GC.\nOrdinary package ABIInternal selector: rejected.\n"
+                + rejected.output,
+        ),
+    );
+    testing::assert_ok(fs::remove_dir_all(directory));
+}

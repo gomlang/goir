@@ -145,7 +145,7 @@ fn calls_preserve_multiple_results_effects_and_immutable_snapshots() -> () {
     testing::assert_eq(instructions[0].definitions().len(), 2);
     testing::assert_eq(instructions[0].uses().len(), 2);
     testing::assert_eq(instructions[0].operands().len(), 4);
-    testing::assert_eq(instructions[0].clobbers().len(), 11);
+    testing::assert_eq(instructions[0].clobbers().len(), 21);
     testing::assert(instructions[1].definitions().is_empty());
     testing::assert(instructions[1].operands().is_empty());
     match instructions[0] {

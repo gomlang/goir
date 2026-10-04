@@ -1,0 +1,137 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+use std::testing;
+
+fn rematerialized_constants() -> Allocation {
+    let module_builder = ir::ModuleBuilder::new();
+    let helper = testing::expect_ok(
+        module_builder.import(
+            "Effect",
+            testing::expect_ok(ir::Signature::new(Vec::new(), Vec::new()), "helper signature"),
+        ),
+        "helper",
+    );
+    let target = testing::expect_ok(
+        module_builder.declare(
+            "Constants",
+            testing::expect_ok(
+                ir::Signature::new(Vec::new(), Vec::from_array([ir::Type::I64, ir::Type::F64])),
+                "signature",
+            ),
+        ),
+        "target",
+    );
+    let b = testing::expect_ok(ir::Builder::for_function(target), "builder");
+    let integer = testing::expect_ok(b.iconst(12345678901234), "integer");
+    let floating = testing::expect_ok(b.fconst(-0.0), "float");
+    testing::expect_ok(b.call(helper, Vec::new()), "call");
+    testing::assert_ok(b.ret(Vec::from_array([integer, floating])));
+    let machine = testing::expect_ok(
+        mach::lower(testing::expect_ok(b.finish(), "function")),
+        "machine",
+    );
+    testing::expect_ok(
+        allocate_with_options(machine, Options { registers: 1, ..Options::standard() }),
+        "allocation",
+    )
+}
+
+#[test]
+fn constants_rematerialize_after_call_and_checker_rejects_corrupt_bits() -> () {
+    let allocation = rematerialized_constants();
+    testing::assert_ok(check(allocation));
+    testing::assert(
+        allocation.registers(mach::RegClass::Integer) == Vec::from_array([Location::Register(0)]),
+    );
+    testing::assert(
+        allocation.registers(mach::RegClass::Float) == Vec::from_array([Location::Register(7)]),
+    );
+    let instructions = allocation.plan[0].instructions;
+    testing::assert(instructions[instructions.len() - 1].before.is_empty());
+    let edits = allocation.plan[0].terminal_edits;
+    let mut recipes = 0;
+    for edit in edits {
+        if let Location::Rematerialized { .. } = edit.source {
+            recipes = recipes + 1;
+        }
+    }
+    testing::assert_eq(recipes, 2);
+    let mut changed = false;
+    for index in 0..edits.len() {
+        if let Location::Rematerialized { reg, bits } = edits[index].source {
+            edits[index] = Edit {
+                source: Location::Rematerialized { reg, bits: bits ^ 1 },
+                destination: edits[index].destination,
+            };
+            changed = true;
+            break;
+        }
+    }
+    testing::assert(changed);
+    testing::assert_err(check(allocation));
+    let allocation = rematerialized_constants();
+    allocation.plan[0].terminal_edits.clear();
+    testing::assert_err(check(allocation));
+}
+
+#[test]
+fn checker_rejects_integer_and_float_register_class_aliases() -> () {
+    let allocation = rematerialized_constants();
+    let float_reg = allocation.machine.blocks()[0].instructions[1].definitions()[0];
+    allocation.locations[float_reg.index()] = Location::Register(0);
+    testing::assert_err(check(allocation));
+    let allocation = rematerialized_constants();
+    let instruction = allocation.plan[0].instructions[1];
+    let binding = instruction.operands[0];
+    instruction.operands[0] = Binding { operand: binding.operand, location: Location::Register(0) };
+    testing::assert_err(check(allocation));
+}
+
+#[test]
+fn loop_weights_distinguish_nested_loops_from_entry_and_exit() -> () {
+    let b = testing::expect_ok(
+        ir::Builder::new("Nested", Vec::from_array([ir::Type::Bool]), Vec::new()),
+        "builder",
+    );
+    let condition = testing::expect_ok(b.parameters(b.entry()), "input")[0];
+    let outer = testing::expect_ok(b.append_block(Vec::new()), "outer");
+    let inner = testing::expect_ok(b.append_block(Vec::new()), "inner");
+    let body = testing::expect_ok(b.append_block(Vec::new()), "body");
+    let after = testing::expect_ok(b.append_block(Vec::new()), "after");
+    let exit = testing::expect_ok(b.append_block(Vec::new()), "exit");
+    testing::assert_ok(b.jump(outer, Vec::new()));
+    testing::assert_ok(b.switch_to(outer));
+    testing::assert_ok(
+        b.branch(
+            condition,
+            ir::Edge { target: inner, arguments: Vec::new() },
+            ir::Edge { target: exit, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(b.switch_to(inner));
+    testing::assert_ok(
+        b.branch(
+            condition,
+            ir::Edge { target: body, arguments: Vec::new() },
+            ir::Edge { target: after, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(b.switch_to(body));
+    testing::assert_ok(b.jump(inner, Vec::new()));
+    testing::assert_ok(b.switch_to(after));
+    testing::assert_ok(b.jump(outer, Vec::new()));
+    testing::assert_ok(b.switch_to(exit));
+    testing::assert_ok(b.ret(Vec::new()));
+    let machine = testing::expect_ok(
+        mach::lower(testing::expect_ok(b.finish(), "function")),
+        "machine",
+    );
+    testing::assert(
+        testing::expect_ok(loop_weights(machine, Ref::new(100000)), "weights")
+            == Vec::from_array([1, 8, 64, 64, 8, 1]),
+    );
+    testing::assert_err(loop_weights(machine, Ref::new(1)));
+    testing::assert_ok(allocate(machine));
+}

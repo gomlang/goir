@@ -86,7 +86,12 @@ fn reproduce_emitted(
     let inputs = Vec::new();
     let names = Vec::new();
     let lines = Vec::from_array(
-        ["package reproduce", "import \"testing\"", "func TestReproduce(t *testing.T) {"],
+        [
+            "package reproduce",
+            "import (\"testing\"; \"math\")",
+            "var _ = math.Float64bits",
+            "func TestReproduce(t *testing.T) {",
+        ],
     );
     for value in arguments {
         inputs.push(literal(value));
@@ -104,7 +109,7 @@ fn reproduce_emitted(
     );
     for index in 0..expected.len() {
         lines.push(
-            f"if got{index} != " + literal(expected[index])
+            "if " + result_mismatch(f"got{index}", expected[index])
                 + f" {{ t.Fatalf(\"goir mismatch result {index}: %v\", got{index}) }}",
         );
     }

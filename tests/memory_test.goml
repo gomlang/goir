@@ -1,0 +1,150 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use std::testing;
+
+#[test]
+fn stack_slots_are_typed_zero_initialized_and_not_commoned_across_writes() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Memory",
+            Vec::new(),
+            Vec::from_array(
+                [
+                    ir::Type::I64,
+                    ir::Type::I64,
+                    ir::Type::I64,
+                    ir::Type::Bool,
+                    ir::Type::I32,
+                    ir::Type::F64,
+                ],
+            ),
+        ),
+        "builder",
+    );
+    let slot = testing::expect_ok(builder.stack_slot(ir::Type::I64), "slot");
+    let boolean = testing::expect_ok(builder.stack_slot(ir::Type::Bool), "bool slot");
+    let narrow = testing::expect_ok(builder.stack_slot(ir::Type::I32), "i32 slot");
+    let floating = testing::expect_ok(builder.stack_slot(ir::Type::F64), "f64 slot");
+    let initial = testing::expect_ok(builder.stack_load(slot), "initial");
+    let first = testing::expect_ok(builder.iconst(17), "first");
+    testing::assert_ok(builder.stack_store(slot, first));
+    let loaded_first = testing::expect_ok(builder.stack_load(slot), "first load");
+    let second = testing::expect_ok(builder.iconst(29), "second");
+    testing::assert_ok(builder.stack_store(slot, second));
+    let loaded_second = testing::expect_ok(builder.stack_load(slot), "second load");
+    let bool_zero = testing::expect_ok(builder.stack_load(boolean), "bool zero");
+    let i32_zero = testing::expect_ok(builder.stack_load(narrow), "i32 zero");
+    let f64_zero = testing::expect_ok(builder.stack_load(floating), "f64 zero");
+    testing::assert_err(builder.stack_store(boolean, first));
+    testing::assert_ok(
+        builder.ret(
+            Vec::from_array([initial, loaded_first, loaded_second, bool_zero, i32_zero, f64_zero]),
+        ),
+    );
+    let function = testing::expect_ok(builder.finish(), "finish");
+    testing::assert_err(builder.stack_slot(ir::Type::I64));
+    let slots = function.stack_slots();
+    slots.clear();
+    testing::assert_eq(function.stack_slots().len(), 4);
+    let optimized = testing::expect_ok(opt::simplify(function), "optimize");
+    testing::assert_err(optimized.stack_slot_type(slot));
+    testing::assert_eq(optimized.stack_slots().len(), 4);
+    let expected = Vec::from_array(
+        [
+            ir::Datum::I64(0),
+            ir::Datum::I64(17),
+            ir::Datum::I64(29),
+            ir::Datum::Bool(false),
+            ir::Datum::I32(0),
+            ir::Datum::F64(0.0),
+        ],
+    );
+    for version in Vec::from_array([function, optimized]) {
+        assert_data(testing::expect_ok(ir::interpret(version, Vec::new(), 100), "memory"), expected);
+        assert_data(
+            testing::expect_ok(ir::interpret(version, Vec::new(), 100), "fresh frame"),
+            expected,
+        );
+    }
+    let effects = ir::Operation::StackLoad(slot).effects();
+    testing::assert(
+        effects.reads_memory && !effects.writes_memory && !effects.may_trap && !effects.call,
+    );
+    let effects = ir::Operation::StackStore(slot, first).effects();
+    testing::assert(
+        !effects.reads_memory && effects.writes_memory && !effects.may_trap && !effects.call,
+    );
+}
+
+#[test]
+fn stack_slots_reject_foreign_handles_and_enforce_function_limits() -> () {
+    let mut limits = ir::Limits::standard();
+    limits.max_values = 1;
+    let builder = testing::expect_ok(
+        ir::Builder::with_limits("LimitedSlots", Vec::new(), Vec::new(), limits),
+        "builder",
+    );
+    let slot = testing::expect_ok(builder.stack_slot(ir::Type::I64), "slot");
+    testing::assert_eq(
+        testing::expect_err(builder.stack_slot(ir::Type::I64), "slot limit").kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+    let other = testing::expect_ok(ir::Builder::new("Other", Vec::new(), Vec::new()), "other");
+    testing::assert_eq(
+        testing::expect_err(other.stack_load(slot), "foreign slot").kind,
+        ir::ErrorKind::WrongFunction,
+    );
+    testing::assert_ok(builder.ret(Vec::new()));
+    testing::assert_ok(builder.finish());
+}
+
+#[test]
+fn recursive_calls_keep_scalar_stack_slots_private() -> () {
+    let module = ir::ModuleBuilder::new();
+    let signature = testing::expect_ok(
+        ir::Signature::new(Vec::from_array([ir::Type::I64]), Vec::from_array([ir::Type::I64])),
+        "signature",
+    );
+    let target = testing::expect_ok(module.declare("SlotSum", signature), "declare");
+    let builder = testing::expect_ok(ir::Builder::for_function(target), "builder");
+    let value = testing::expect_ok(builder.parameters(builder.entry()), "parameter")[0];
+    let slot = testing::expect_ok(builder.stack_slot(ir::Type::I64), "slot");
+    testing::assert_ok(builder.stack_store(slot, value));
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let done = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLessEqual, value, zero),
+        "condition",
+    );
+    let exit = testing::expect_ok(builder.append_block(Vec::new()), "exit");
+    let recurse = testing::expect_ok(builder.append_block(Vec::new()), "recurse");
+    testing::assert_ok(
+        builder.branch(
+            done,
+            ir::Edge { target: exit, arguments: Vec::new() },
+            ir::Edge { target: recurse, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(exit));
+    testing::assert_ok(builder.ret(Vec::from_array([zero])));
+    testing::assert_ok(builder.switch_to(recurse));
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let next = testing::expect_ok(builder.binary(ir::BinaryOp::Sub, value, one), "next");
+    let result = testing::expect_ok(builder.call(target, Vec::from_array([next])), "call")[0];
+    let saved = testing::expect_ok(builder.stack_load(slot), "restore");
+    let sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, saved, result), "sum");
+    testing::assert_ok(builder.ret(Vec::from_array([sum])));
+    let function = testing::expect_ok(builder.finish(), "function");
+    testing::assert_ok(
+        module.define(target, testing::expect_ok(opt::simplify(function), "optimize")),
+    );
+    let finished = testing::expect_ok(module.finish(), "module");
+    assert_data(
+        testing::expect_ok(
+            ir::interpret_module(finished, target, Vec::from_array([ir::Datum::I64(10)]), 1000),
+            "recursive memory",
+        ),
+        Vec::from_array([ir::Datum::I64(55)]),
+    );
+}

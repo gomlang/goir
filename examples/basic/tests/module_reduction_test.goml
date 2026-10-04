@@ -1,0 +1,55 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::filetest;
+use ecosystem::goir::reader;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::testing;
+
+#[test]
+fn native_module_reduction_preserves_calls_and_runtime_mismatch() -> () {
+    let source = "module {\ndeclare Helper(i64) -> (i64)\ndeclare Main(i64) -> (i64)\nfunction Helper(i64) -> (i64) {\nblock0(v0: i64):\n v1: i64 = iconst 1\n v2: i64 = iadd v0, v1\n return v2\n}\nfunction Main(i64) -> (i64) {\nblock0(v0: i64):\n v1: i64 = iconst 99\n v2: i64 = call Helper(v0)\n return v2\n}\n}\n";
+    let module = testing::expect_ok(reader::read_module(source), "source");
+    let target = module.references()[1];
+    let arguments = Vec::from_array([ir::Datum::I64(7)]);
+    let directory = path::join(
+        "_artifact",
+        "goir-module-reduction-" + hash::sha256(testing::expect_ok(rand::bytes(16), "unique")),
+    );
+    testing::assert_ok(fs::create_dir_all(directory));
+    let predicate = |candidate: ir::Module| {
+        let output = amd64::emit_stack_module("reproduce", candidate)?;
+        let injected = amd64::Package {
+            assembly: output.assembly.replace("ADDQ", "SUBQ"),
+            declarations: output.declarations,
+        };
+        reproduce_module_emitted(directory, candidate, target, arguments, "", injected)
+    };
+    let reduced = testing::expect_ok(
+        filetest::reduce_module(module, 12, predicate),
+        "native module reducer",
+    );
+    testing::assert(reduced.accepted > 0);
+    testing::assert(
+        testing::expect_ok(reader::display_module(reduced.module), "reduced text").contains(
+            "call Helper",
+        ),
+    );
+    testing::assert(testing::expect_ok(predicate(reduced.module), "mismatch retained"));
+    let output = testing::expect_ok(
+        amd64::emit_stack_module("reproduce", reduced.module),
+        "valid output",
+    );
+    let invalid = amd64::Package { assembly: "invalid assembly", declarations: output.declarations };
+    testing::assert(
+        !testing::expect_ok(
+            reproduce_module_emitted(directory, reduced.module, target, arguments, "", invalid),
+            "compiler failure is not reproduction",
+        ),
+    );
+    testing::assert_ok(fs::remove_dir_all(directory));
+}

@@ -158,6 +158,8 @@ fn calls_module(optimize: bool) -> ir::Module {
     define_call(module, collect, builder, optimize);
     let builder = testing::expect_ok(ir::Builder::for_function(recursive), "recursive builder");
     let arg = testing::expect_ok(builder.parameters(builder.entry()), "recursive args")[0];
+    let slot = testing::expect_ok(builder.stack_slot(ir::Type::I64), "recursive private slot");
+    testing::assert_ok(builder.stack_store(slot, arg));
     let base = testing::expect_ok(builder.append_block(Vec::new()), "base");
     let next = testing::expect_ok(builder.append_block(Vec::new()), "recurse");
     let zero = testing::expect_ok(builder.iconst(0), "zero");
@@ -185,8 +187,9 @@ fn calls_module(optimize: bool) -> ir::Module {
         builder.call(recursive, Vec::from_array([previous])),
         "recursive call",
     );
+    let saved = testing::expect_ok(builder.stack_load(slot), "recursive private value");
     let sum = testing::expect_ok(
-        builder.binary(ir::BinaryOp::Add, arg, returned[0]),
+        builder.binary(ir::BinaryOp::Add, saved, returned[0]),
         "recursive sum",
     );
     testing::assert_ok(builder.ret(Vec::from_array([sum])));

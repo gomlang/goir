@@ -86,11 +86,20 @@ fn native_stack() -> ir::Function {
 fn literal(value: ir::Datum) -> string {
     match value {
         I64(integer) => integer.to_string(),
+        I32(integer) => f"int32({integer})",
+        F64(value) => f"math.Float64frombits({float64_to_bits(value)})",
         Bool(boolean) => if boolean {
             "true"
         } else {
             "false"
         },
+    }
+}
+
+fn result_mismatch(name: string, expected: ir::Datum) -> string {
+    match expected {
+        F64(value) => "math.Float64bits(" + name + f") != {float64_to_bits(value)}",
+        _ => name + " != " + literal(expected),
     }
 }
 
@@ -167,7 +176,7 @@ fn add_differential(
             );
             for position in 0..expected.len() {
                 lines.push(
-                    f"if got{position} != " + literal(expected[position])
+                    "if " + result_mismatch(f"got{position}", expected[position])
                         + f" {{ t.Fatalf(\"{backend}case {index}, result {position}: %v\", got{position}) }}",
                 );
             }
@@ -249,7 +258,8 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
     let lines = Vec::from_array(
         [
             "package generated",
-            "import (\"testing\"; baseline \"goir-native-test/baseline\"; constrained \"goir-native-test/constrained\"; spilled \"goir-native-test/spilled\"; optimized \"goir-native-test/optimized\"; optstack \"goir-native-test/optstack\")",
+            "import (\"testing\"; \"math\"; baseline \"goir-native-test/baseline\"; constrained \"goir-native-test/constrained\"; spilled \"goir-native-test/spilled\"; optimized \"goir-native-test/optimized\"; optstack \"goir-native-test/optstack\")",
+            "var _ = math.Float64bits",
         ],
     );
     let ops = Vec::from_array(

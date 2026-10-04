@@ -1,0 +1,144 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::mach;
+use ecosystem::goir::regalloc;
+use std::testing;
+
+fn instruction_selection_source(name: string, multiplier: i64) -> ir::Function {
+    let b = testing::expect_ok(
+        ir::Builder::new(name, Vec::from_array([ir::Type::I64]), Vec::from_array([ir::Type::I64])),
+        "builder",
+    );
+    let p = testing::expect_ok(b.parameters(b.entry()), "parameter")[0];
+    let c = testing::expect_ok(b.iconst(multiplier), "constant");
+    let product = testing::expect_ok(b.binary(ir::BinaryOp::Mul, p, c), "multiply");
+    let count = testing::expect_ok(b.iconst(-65), "shift count");
+    let shifted = testing::expect_ok(b.binary(ir::BinaryOp::ShrU, product, count), "shift");
+    let add = testing::expect_ok(b.iconst(17), "add constant");
+    let result = testing::expect_ok(b.binary(ir::BinaryOp::Add, shifted, add), "add");
+    testing::assert_ok(b.ret(Vec::from_array([result])));
+    testing::expect_ok(b.finish(), "function")
+}
+
+#[test]
+fn instruction_selection_folds_encodable_operands_and_compacts_values() -> () {
+    let source = instruction_selection_source("Selected", 5);
+    let machine = testing::expect_ok(mach::lower(source), "lower");
+    testing::assert_eq(machine.register_count(), 4);
+    testing::assert_eq(machine.blocks()[0].instructions.len(), 3);
+    testing::assert(
+        match machine.blocks()[0].instructions[0] {
+            Lea { scale, .. } => scale == 4,
+            _ => false,
+        },
+    );
+    testing::assert(
+        match machine.blocks()[0].instructions[1] {
+            BinaryImmediate { value, .. } => value == 63,
+            _ => false,
+        },
+    );
+    let output = testing::expect_ok(amd64::emit(source), "emit");
+    testing::assert(output.assembly.contains("LEAQ"));
+    testing::assert(output.assembly.contains("SHRQ $63"));
+    testing::assert(output.assembly.contains("ADDQ $17"));
+    let large = testing::expect_ok(
+        mach::lower(instruction_selection_source("Large", 2147483648)),
+        "large immediate",
+    );
+    testing::assert(
+        match large.blocks()[0].instructions[0] {
+            Immediate { value, .. } => value == 2147483648,
+            _ => false,
+        },
+    );
+    testing::assert(
+        match large.blocks()[0].instructions[1] {
+            Binary { .. } => true,
+            _ => false,
+        },
+    );
+}
+
+#[test]
+fn comparison_branches_keep_flags_adjacent_and_remove_fallthrough_jumps() -> () {
+    let b = testing::expect_ok(
+        ir::Builder::new(
+            "BranchCompare",
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(b.parameters(b.entry()), "args");
+    let yes = testing::expect_ok(b.append_block(Vec::new()), "yes");
+    let no = testing::expect_ok(b.append_block(Vec::new()), "no");
+    let condition = testing::expect_ok(b.icmp(ir::IntCC::SignedLess, args[0], args[1]), "compare");
+    testing::assert_ok(
+        b.branch(
+            condition,
+            ir::Edge { target: yes, arguments: Vec::new() },
+            ir::Edge { target: no, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(b.switch_to(yes));
+    testing::assert_ok(b.ret(Vec::from_array([args[0]])));
+    testing::assert_ok(b.switch_to(no));
+    testing::assert_ok(b.ret(Vec::from_array([args[1]])));
+    let function = testing::expect_ok(b.finish(), "finish");
+    let machine = testing::expect_ok(mach::lower(function), "lower");
+    testing::assert(machine.blocks()[0].instructions.is_empty());
+    testing::assert(
+        match machine.blocks()[0].terminator {
+            CompareBranch { .. } => true,
+            _ => false,
+        },
+    );
+    let output = testing::expect_ok(amd64::emit(function), "emit");
+    testing::assert(!output.assembly.contains("SETLT"));
+    testing::assert(output.assembly.contains("JLT edge_yes0"));
+    testing::assert(!output.assembly.contains("JMP block1"));
+}
+
+#[test]
+fn compilation_context_reuses_storage_and_keeps_previous_results_isolated() -> () {
+    let context = amd64::CompilerContext::new();
+    let first = testing::expect_ok(
+        context.compile_with_options(
+            instruction_selection_source("First", 5),
+            false,
+            regalloc::Options::standard(),
+        ),
+        "first compile",
+    );
+    let original = first.compiled.assembly;
+    let retained = context.retained_capacity();
+    testing::assert(retained > 0);
+    let second = testing::expect_ok(
+        context.compile(instruction_selection_source("Second", 9)),
+        "second compile",
+    );
+    testing::assert(context.retained_capacity() >= retained);
+    testing::assert_eq(context.completed_functions(), 2);
+    testing::assert_eq(first.compiled.assembly, original);
+    testing::assert(first.compiled.assembly.contains("First(SB)"));
+    testing::assert(second.compiled.assembly.contains("Second(SB)"));
+    testing::assert(!first.compiled.assembly.contains("Second(SB)"));
+    testing::assert_ok(regalloc::verify(first.allocation));
+    testing::assert_ok(regalloc::verify(second.allocation));
+    testing::assert(first.timings.total_ns >= first.timings.allocation_ns);
+    testing::assert(first.timings.total_ns >= first.timings.lowering_ns);
+    first.machine.blocks()[0].instructions.clear();
+    testing::assert_eq(first.machine.blocks()[0].instructions.len(), 3);
+    testing::assert_err(
+        context.compile_with_options(
+            instruction_selection_source("Invalid", 3),
+            false,
+            regalloc::Options { registers: -1, ..regalloc::Options::standard() },
+        ),
+    );
+    testing::assert_eq(context.completed_functions(), 2);
+    testing::assert_ok(context.compile(instruction_selection_source("Recovered", 3)));
+}

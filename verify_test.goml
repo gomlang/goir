@@ -64,3 +64,31 @@ fn verifier_rejects_duplicate_definitions_and_invalid_edges() -> () {
         ErrorKind::InvalidHandle,
     );
 }
+
+#[test]
+fn verifier_rejects_forged_stack_slot_operands() -> () {
+    let builder = testing::expect_ok(
+        Builder::new("ForgedSlot", Vec::new(), Vec::from_array([Type::I64])),
+        "builder",
+    );
+    let slot = testing::expect_ok(builder.stack_slot(Type::I64), "slot");
+    let value = testing::expect_ok(builder.stack_load(slot), "load");
+    testing::assert_ok(builder.ret(Vec::from_array([value])));
+    let function = testing::expect_ok(builder.finish(), "finish");
+    function.body[0].instructions[0] = Instruction {
+        results: Vec::from_array([value]),
+        operation: Operation::StackLoad(StackSlot { slot: 1000000, owner: function.identity }),
+    };
+    testing::assert_eq(
+        testing::expect_err(verify(function), "invalid stack slot").kind,
+        ErrorKind::InvalidHandle,
+    );
+    function.body[0].instructions[0] = Instruction {
+        results: Vec::from_array([value]),
+        operation: Operation::StackLoad(StackSlot { slot: 0, owner: Ref::new(()) }),
+    };
+    testing::assert_eq(
+        testing::expect_err(verify(function), "foreign stack slot").kind,
+        ErrorKind::WrongFunction,
+    );
+}

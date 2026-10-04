@@ -1,0 +1,155 @@
+package tests;
+
+use ecosystem::goir as ir;
+use std::testing;
+
+fn typed_narrow_immediates() -> ir::Function {
+    let results = Vec::new();
+    for _ in 0..6 {
+        results.push(ir::Type::I32);
+    }
+    results.push(ir::Type::Bool);
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "NarrowImmediates",
+            Vec::from_array([ir::Type::I32, ir::Type::I64]),
+            results,
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "arguments");
+    let two = testing::expect_ok(builder.i32const(2), "scale");
+    let offset = testing::expect_ok(builder.i32const(2147483647), "offset");
+    let negative_shift = testing::expect_ok(builder.i32const(-1), "negative shift");
+    let multiplier = testing::expect_ok(builder.i32const(5), "multiplier");
+    let doubled = testing::expect_ok(builder.binary(ir::BinaryOp::Shl, args[0], two), "scale shift");
+    let address = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, doubled, args[0]),
+        "LEA scale",
+    );
+    let large = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, args[0], offset),
+        "maximum signed immediate",
+    );
+    let product = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Mul, args[0], multiplier),
+        "LEA multiplication",
+    );
+    let shifted = testing::expect_ok(
+        builder.binary(ir::BinaryOp::ShrU, args[0], negative_shift),
+        "negative constant shift",
+    );
+    let signed = testing::expect_ok(
+        builder.binary(ir::BinaryOp::ShrS, args[0], negative_shift),
+        "constant signed shift",
+    );
+    let truncated = testing::expect_ok(
+        builder.convert(ir::IntConversion::Truncate, args[1]),
+        "truncate",
+    );
+    let less = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, args[0], offset),
+        "immediate compare",
+    );
+    testing::assert_ok(
+        builder.ret(Vec::from_array([address, large, product, shifted, signed, truncated, less])),
+    );
+    testing::expect_ok(builder.finish(), "narrow immediates")
+}
+
+fn typed_stack_loop() -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "StackLoop",
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "arguments");
+    let slot = testing::expect_ok(builder.stack_slot(ir::Type::I64), "slot");
+    let fresh = testing::expect_ok(builder.stack_load(slot), "fresh invocation");
+    testing::assert_ok(builder.stack_store(slot, args[0]));
+    let header = testing::expect_ok(
+        builder.append_block(Vec::from_array([ir::Type::I64])),
+        "header",
+    );
+    let body = testing::expect_ok(builder.append_block(Vec::new()), "body");
+    let exit = testing::expect_ok(builder.append_block(Vec::new()), "exit");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let mask = testing::expect_ok(builder.iconst(31), "mask");
+    let count = testing::expect_ok(
+        builder.binary(ir::BinaryOp::And, args[1], mask),
+        "bounded count",
+    );
+    testing::assert_ok(builder.jump(header, Vec::from_array([count])));
+    testing::assert_ok(builder.switch_to(header));
+    let remaining = testing::expect_ok(builder.parameters(header), "remaining")[0];
+    let condition = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, zero, remaining),
+        "condition",
+    );
+    testing::assert_ok(
+        builder.branch(
+            condition,
+            ir::Edge { target: body, arguments: Vec::new() },
+            ir::Edge { target: exit, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(body));
+    let previous = testing::expect_ok(builder.stack_load(slot), "loop load");
+    let current = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Add, previous, remaining),
+        "loop value",
+    );
+    testing::assert_ok(builder.stack_store(slot, current));
+    let loaded = testing::expect_ok(builder.stack_load(slot), "load after write");
+    let with_one = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Xor, loaded, one),
+        "post write value",
+    );
+    testing::assert_ok(builder.stack_store(slot, with_one));
+    let next = testing::expect_ok(builder.binary(ir::BinaryOp::Sub, remaining, one), "next");
+    testing::assert_ok(builder.jump(header, Vec::from_array([next])));
+    testing::assert_ok(builder.switch_to(exit));
+    let output = testing::expect_ok(builder.stack_load(slot), "final load");
+    testing::assert_ok(builder.ret(Vec::from_array([fresh, output])));
+    testing::expect_ok(builder.finish(), "stack loop")
+}
+
+fn typed_edge_corpus() -> Vec[TypedCases] {
+    let cases = Vec::new();
+    let narrow: Vec[i32] = Vec::from_array([-2147483648, -2147483647, -1, 0, 1, 2147483647]);
+    let wide: Vec[i64] = Vec::from_array(
+        [
+            -9223372036854775808,
+            -4294967297,
+            -2147483649,
+            -1,
+            0,
+            2147483648,
+            4294967295,
+            4294967296,
+            4294967297,
+            9223372036854775807,
+        ],
+    );
+    for left in narrow {
+        for right in wide {
+            cases.push(Vec::from_array([ir::Datum::I32(left), ir::Datum::I64(right)]));
+        }
+    }
+    let memory = Vec::new();
+    for value in Vec::from_array([-9223372036854775808, -1, 0, 1, 9223372036854775807]) {
+        for count in Vec::from_array([0, 1, 2, 31, 32, 33, -1]) {
+            memory.push(Vec::from_array([ir::Datum::I64(value), ir::Datum::I64(count)]));
+        }
+    }
+    Vec::from_array(
+        [
+            TypedCases { function: typed_narrow_immediates(), cases },
+            TypedCases { function: typed_stack_loop(), cases: memory },
+        ],
+    )
+}

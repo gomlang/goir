@@ -1,0 +1,451 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::abi;
+use ecosystem::goir::opt;
+use ecosystem::goir::regalloc;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::testing;
+
+struct TypedCases {
+    function: ir::Function,
+    cases: Vec[Vec[ir::Datum]],
+}
+
+fn typed_i32() -> ir::Function {
+    let types = Vec::new();
+    for _ in 0..9 {
+        types.push(ir::Type::I32);
+    }
+    for _ in 0..6 {
+        types.push(ir::Type::Bool);
+    }
+    types.push(ir::Type::I64);
+    types.push(ir::Type::I64);
+    let b = testing::expect_ok(
+        ir::Builder::new("Integer32", Vec::from_array([ir::Type::I32, ir::Type::I32]), types),
+        "i32 builder",
+    );
+    let p = testing::expect_ok(b.parameters(b.entry()), "parameters");
+    let out = Vec::new();
+    for op in Vec::from_array(
+        [
+            ir::BinaryOp::Add,
+            ir::BinaryOp::Sub,
+            ir::BinaryOp::Mul,
+            ir::BinaryOp::And,
+            ir::BinaryOp::Or,
+            ir::BinaryOp::Xor,
+            ir::BinaryOp::Shl,
+            ir::BinaryOp::ShrU,
+            ir::BinaryOp::ShrS,
+        ],
+    ) {
+        out.push(testing::expect_ok(b.binary(op, p[0], p[1]), "i32 operation"));
+    }
+    for cc in Vec::from_array(
+        [
+            ir::IntCC::Equal,
+            ir::IntCC::NotEqual,
+            ir::IntCC::SignedLess,
+            ir::IntCC::SignedLessEqual,
+            ir::IntCC::UnsignedLess,
+            ir::IntCC::UnsignedLessEqual,
+        ],
+    ) {
+        out.push(testing::expect_ok(b.icmp(cc, p[0], p[1]), "i32 compare"));
+    }
+    out.push(testing::expect_ok(b.convert(ir::IntConversion::SignExtend, p[0]), "sign extend"));
+    out.push(testing::expect_ok(b.convert(ir::IntConversion::ZeroExtend, p[0]), "zero extend"));
+    testing::assert_ok(b.ret(out));
+    testing::expect_ok(b.finish(), "i32 function")
+}
+
+fn typed_float() -> ir::Function {
+    let types = Vec::new();
+    for _ in 0..4 {
+        types.push(ir::Type::F64);
+    }
+    for _ in 0..4 {
+        types.push(ir::Type::Bool);
+    }
+    types.push(ir::Type::F64);
+    let b = testing::expect_ok(
+        ir::Builder::new(
+            "Floating",
+            Vec::from_array([ir::Type::F64, ir::Type::F64, ir::Type::Bool]),
+            types,
+        ),
+        "float builder",
+    );
+    let p = testing::expect_ok(b.parameters(b.entry()), "parameters");
+    let out = Vec::new();
+    for op in Vec::from_array(
+        [ir::FloatOp::Add, ir::FloatOp::Sub, ir::FloatOp::Mul, ir::FloatOp::Div],
+    ) {
+        out.push(testing::expect_ok(b.fbinary(op, p[0], p[1]), "float operation"));
+    }
+    for cc in Vec::from_array(
+        [ir::FloatCC::Equal, ir::FloatCC::NotEqual, ir::FloatCC::Less, ir::FloatCC::LessEqual],
+    ) {
+        out.push(testing::expect_ok(b.fcmp(cc, p[0], p[1]), "float compare"));
+    }
+    out.push(testing::expect_ok(b.select(p[2], p[0], p[1]), "float select"));
+    testing::assert_ok(b.ret(out));
+    testing::expect_ok(b.finish(), "float function")
+}
+
+fn typed_memory() -> ir::Function {
+    let types = Vec::from_array([ir::Type::Bool, ir::Type::I32, ir::Type::F64, ir::Type::I64]);
+    let outputs = Vec::new();
+    for ty in types {
+        outputs.push(ty);
+    }
+    for ty in types {
+        outputs.push(ty);
+    }
+    let b = testing::expect_ok(ir::Builder::new("StackValues", types, outputs), "memory builder");
+    let p = testing::expect_ok(b.parameters(b.entry()), "parameters");
+    let out = Vec::new();
+    let slots = Vec::new();
+    for ty in types {
+        let slot = testing::expect_ok(b.stack_slot(ty), "slot");
+        slots.push(slot);
+        out.push(testing::expect_ok(b.stack_load(slot), "initialized load"));
+    }
+    for index in 0..slots.len() {
+        testing::assert_ok(b.stack_store(slots[index], p[index]));
+    }
+    for slot in slots {
+        out.push(testing::expect_ok(b.stack_load(slot), "load after store"));
+    }
+    testing::assert_ok(b.ret(out));
+    testing::expect_ok(b.finish(), "memory function")
+}
+
+fn typed_rotation() -> ir::Function {
+    let inputs = Vec::new();
+    let outputs = Vec::new();
+    for _ in 0..10 {
+        inputs.push(ir::Type::F64);
+        outputs.push(ir::Type::F64);
+    }
+    inputs.push(ir::Type::I64);
+    let b = testing::expect_ok(ir::Builder::new("FloatRotate", inputs, outputs), "float loop");
+    let header = testing::expect_ok(b.append_block(inputs), "header");
+    let exit = testing::expect_ok(b.append_block(outputs), "exit");
+    let zero = testing::expect_ok(b.iconst(0), "zero");
+    let one = testing::expect_ok(b.iconst(1), "one");
+    testing::assert_ok(b.jump(header, testing::expect_ok(b.parameters(b.entry()), "args")));
+    testing::assert_ok(b.switch_to(header));
+    let p = testing::expect_ok(b.parameters(header), "loop values");
+    let condition = testing::expect_ok(b.icmp(ir::IntCC::SignedLess, zero, p[10]), "condition");
+    let remaining = testing::expect_ok(b.binary(ir::BinaryOp::Sub, p[10], one), "decrement");
+    let next = Vec::new();
+    let result = Vec::new();
+    for index in 0..10 {
+        next.push(p[(index + 1) % 10]);
+        result.push(p[index]);
+    }
+    next.push(remaining);
+    testing::assert_ok(
+        b.branch(
+            condition,
+            ir::Edge { target: header, arguments: next },
+            ir::Edge { target: exit, arguments: result },
+        ),
+    );
+    testing::assert_ok(b.switch_to(exit));
+    testing::assert_ok(b.ret(testing::expect_ok(b.parameters(exit), "results")));
+    testing::expect_ok(b.finish(), "float rotation")
+}
+
+fn typed_literal(value: ir::Datum) -> string {
+    match value {
+        F64(_) => "math.Float64frombits(" + value.bits().to_u64().to_string() + ")",
+        I32(integer) => "int32(" + integer.to_string() + ")",
+        I64(integer) => integer.to_string(),
+        Bool(boolean) => if boolean {
+            "true"
+        } else {
+            "false"
+        },
+    }
+}
+
+fn typed_expect(lines: Vec[string], source: string, expected: ir::Datum, label: string) -> () {
+    let test = match expected {
+        F64(value) => if value != value {
+            "!math.IsNaN(" + source + ")"
+        } else {
+            "math.Float64bits(" + source + ") != " + expected.bits().to_u64().to_string()
+        },
+        _ => source + " != " + typed_literal(expected),
+    };
+    lines.push("if " + test + " { t.Fatalf(\"" + label + ": %v\", " + source + ") }");
+}
+
+fn typed_corpus() -> Vec[TypedCases] {
+    let corpus = Vec::new();
+    let ints = Vec::new();
+    let boundaries: Vec[i32] = Vec::from_array(
+        [-2147483648, -2147483647, -65, -33, -32, -1, 0, 1, 31, 32, 33, 63, 2147483647],
+    );
+    for left in boundaries {
+        for right in boundaries {
+            ints.push(Vec::from_array([ir::Datum::I32(left), ir::Datum::I32(right)]));
+        }
+    }
+    corpus.push(TypedCases { function: typed_i32(), cases: ints });
+    let floats: Vec[i64] = Vec::from_array(
+        [
+            0,
+            -9223372036854775808,
+            1,
+            -9223372036854775807,
+            4607182418800017408,
+            -4616189618054758400,
+            4612811918334230528,
+            9218868437227405312,
+            -4503599627370496,
+            9221120237041090626,
+        ],
+    );
+    let cases = Vec::new();
+    for a in floats {
+        for b in floats {
+            for condition in Vec::from_array([false, true]) {
+                cases.push(
+                    Vec::from_array(
+                        [
+                            ir::datum_from_bits(ir::Type::F64, a),
+                            ir::datum_from_bits(ir::Type::F64, b),
+                            ir::Datum::Bool(condition),
+                        ],
+                    ),
+                );
+            }
+        }
+    }
+    corpus.push(TypedCases { function: typed_float(), cases });
+    let cases = Vec::new();
+    for bits in floats {
+        cases.push(
+            Vec::from_array(
+                [
+                    ir::Datum::Bool(true),
+                    ir::Datum::I32(-2147483648),
+                    ir::datum_from_bits(ir::Type::F64, bits),
+                    ir::Datum::I64(-9223372036854775808),
+                ],
+            ),
+        );
+    }
+    corpus.push(TypedCases { function: typed_memory(), cases });
+    let cases = Vec::new();
+    for count in Vec::from_array([0, 1, 2, 9, 10, 11, 101]) {
+        let values = Vec::new();
+        for bits in floats {
+            values.push(ir::datum_from_bits(ir::Type::F64, bits));
+        }
+        values.push(ir::Datum::I64(count));
+        cases.push(values);
+    }
+    corpus.push(TypedCases { function: typed_rotation(), cases });
+    corpus.extend(typed_edge_corpus());
+    corpus
+}
+
+#[test]
+fn native_i32_f64_stack_slots_and_float_edges_match_interpreter() -> () {
+    let directory = path::join(
+        "_artifact",
+        "goir-typed-" + hash::sha256(testing::expect_ok(rand::bytes(16), "unique artifact")),
+    );
+    testing::assert_ok(fs::create_dir_all(directory));
+    let corpus = typed_corpus();
+    let functions = Vec::new();
+    let optimized = Vec::new();
+    let lines = Vec::from_array(
+        [
+            "package generated",
+            "import (\"testing\"; \"math\"; baseline \"goir-typed-test/baseline\"; constrained \"goir-typed-test/constrained\"; spilled \"goir-typed-test/spilled\"; optimized \"goir-typed-test/optimized\"; optstack \"goir-typed-test/optstack\")",
+        ],
+    );
+    let context = amd64::CompilerContext::new();
+    let phases = Vec::from_array(
+        [
+            "function\tsample\tverify_ns\toptimize_ns\tlower_ns\tliveness_ns\tallocate_ns\tchecker_ns\temit_ns\ttotal_ns\tretained_capacity",
+        ],
+    );
+    for item in corpus {
+        for sample in 0..3 {
+            let compilation = testing::expect_ok(
+                context.compile(item.function),
+                "profile compilation",
+            );
+            let t = compilation.timings;
+            phases.push(
+                item.function.name() + f"\t{sample}\t" + t.verify_ns.to_string() + "\t"
+                    + t.optimize_ns.to_string()
+                    + "\t"
+                    + t.lowering_ns.to_string()
+                    + "\t"
+                    + t.liveness_ns.to_string()
+                    + "\t"
+                    + t.allocation_ns.to_string()
+                    + "\t"
+                    + t.checker_ns.to_string()
+                    + "\t"
+                    + t.emission_ns.to_string()
+                    + "\t"
+                    + t.total_ns.to_string()
+                    + "\t"
+                    + context.retained_capacity().to_string(),
+            );
+        }
+        functions.push(item.function);
+        let simplified = testing::expect_ok(opt::simplify(item.function), "optimize typed");
+        optimized.push(simplified);
+        testing::assert_ok(
+            fs::write_file_structured(
+                path::join(directory, item.function.name() + ".goir"),
+                testing::expect_ok(ir::display(item.function), "IR"),
+            ),
+        );
+        lines.push("func Test" + item.function.name() + "(t *testing.T) {");
+        let parameters = item.function.parameter_types();
+        let results = item.function.result_types();
+        lines.push("cases := []struct {");
+        for index in 0..parameters.len() {
+            lines.push(f"p{index} " + abi::go_type(parameters[index]));
+        }
+        for index in 0..results.len() {
+            lines.push(f"w{index} " + abi::go_type(results[index]));
+        }
+        lines.push("}{");
+        for arguments in item.cases {
+            let expected = testing::expect_ok(
+                ir::interpret(item.function, arguments, 100000),
+                "typed interpretation",
+            );
+            let after = testing::expect_ok(
+                ir::interpret(simplified, arguments, 100000),
+                "optimized typed interpretation",
+            );
+            for position in 0..expected.len() {
+                if expected[position] != after[position] {
+                    match (expected[position], after[position]) {
+                        (ir::Datum::F64(a), ir::Datum::F64(b)) => testing::assert(
+                            item.function.name() == "Floating" && position < 4 && a != a && b != b,
+                        ),
+                        _ => testing::fail("typed optimizer mismatch"),
+                    }
+                }
+            }
+            let fields = Vec::new();
+            for value in arguments {
+                fields.push(typed_literal(value));
+            }
+            for value in expected {
+                fields.push(typed_literal(value));
+            }
+            lines.push("{" + fields.join(",") + "},");
+        }
+        lines.push("}");
+        lines.push("for index,tc := range cases {");
+        let inputs = Vec::new();
+        for index in 0..parameters.len() {
+            inputs.push(f"tc.p{index}");
+        }
+        let names = Vec::new();
+        for index in 0..results.len() {
+            names.push(f"r{index}");
+        }
+        for prefix in Vec::from_array(
+            ["", "baseline.", "constrained.", "spilled.", "optimized.", "optstack."],
+        ) {
+            lines.push("{");
+            lines.push(
+                names.join(",") + " := " + prefix + item.function.name() + "(" + inputs.join(",")
+                    + ")",
+            );
+            for position in 0..results.len() {
+                let condition = if results[position] == ir::Type::F64 {
+                    if item.function.name() == "Floating" && position < 4 {
+                        f"math.Float64bits(r{position}) != math.Float64bits(tc.w{position}) && !(math.IsNaN(r{position}) && math.IsNaN(tc.w{position}))"
+                    } else {
+                        f"math.Float64bits(r{position}) != math.Float64bits(tc.w{position})"
+                    }
+                } else {
+                    f"r{position} != tc.w{position}"
+                };
+                lines.push(
+                    "if " + condition
+                        + f" {{ t.Fatalf(\"{prefix}case %d result{position}: %v != %v\",index,r{position},tc.w{position}) }}",
+                );
+            }
+            lines.push("}");
+        }
+        lines.push("}");
+        lines.push("}");
+    }
+    testing::assert_ok(
+        fs::write_file_structured("_artifact/typed-phases.tsv", phases.join("\n") + "\n"),
+    );
+    for (name, source, stack, registers) in Vec::from_array(
+        [
+            ("generated", functions, false, 7),
+            ("baseline", functions, true, 7),
+            ("constrained", functions, false, 1),
+            ("spilled", optimized, false, 0),
+            ("optimized", optimized, false, 7),
+            ("optstack", optimized, true, 7),
+        ],
+    ) {
+        let output = testing::expect_ok(
+            if stack {
+                amd64::emit_stack_package(name, source)
+            } else {
+                amd64::emit_package_with_options(
+                    name,
+                    source,
+                    regalloc::Options { registers, ..regalloc::Options::standard() },
+                )
+            },
+            "emit typed package",
+        );
+        let destination = if name == "generated" {
+            directory
+        } else {
+            path::join(directory, name)
+        };
+        testing::assert_ok(fs::create_dir_all(destination));
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated.go"), output.declarations),
+        );
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated_amd64.s"), output.assembly),
+        );
+    }
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "go.mod"),
+            "module goir-typed-test\n\ngo 1.26.0\n",
+        ),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(path::join(directory, "typed_test.go"), lines.join("\n") + "\n"),
+    );
+    let _ = run_go(directory, Vec::from_array(["vet", "./..."]));
+    let output = run_go(
+        directory,
+        Vec::from_array(["test", "-count=1", "-timeout=60s", "-v", "./..."]),
+    );
+    testing::assert(output.contains("PASS"));
+    testing::assert_ok(fs::remove_dir_all(directory));
+}

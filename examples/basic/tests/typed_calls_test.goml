@@ -1,0 +1,227 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::opt;
+use ecosystem::goir::regalloc;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::testing;
+
+fn typed_call_module(optimize: bool) -> ir::Module {
+    let m = ir::ModuleBuilder::new();
+    let types = Vec::from_array([ir::Type::F64, ir::Type::I32, ir::Type::Bool]);
+    let signature = testing::expect_ok(ir::Signature::new(types, types), "signature");
+    let helper = testing::expect_ok(m.import("TypedHelper", signature), "helper");
+    let pair = testing::expect_ok(m.declare("FloatPair", signature), "pair");
+    let caller = testing::expect_ok(
+        m.declare(
+            "FloatCaller",
+            testing::expect_ok(
+                ir::Signature::new(
+                    types,
+                    Vec::from_array([ir::Type::F64, ir::Type::I32, ir::Type::Bool, ir::Type::F64]),
+                ),
+                "caller signature",
+            ),
+        ),
+        "caller",
+    );
+    let b = testing::expect_ok(ir::Builder::for_function(pair), "pair builder");
+    let p = testing::expect_ok(b.parameters(b.entry()), "pair args");
+    let result = testing::expect_ok(b.call(helper, p), "Go helper call");
+    let sum = testing::expect_ok(b.fbinary(ir::FloatOp::Add, result[0], p[0]), "live across helper");
+    testing::assert_ok(b.ret(Vec::from_array([sum, result[1], result[2]])));
+    let f = testing::expect_ok(b.finish(), "pair function");
+    testing::assert_ok(
+        m.define(
+            pair,
+            if optimize {
+                testing::expect_ok(opt::simplify(f), "optimize pair")
+            } else {
+                f
+            },
+        ),
+    );
+    let b = testing::expect_ok(ir::Builder::for_function(caller), "caller builder");
+    let p = testing::expect_ok(b.parameters(b.entry()), "caller args");
+    let slot = testing::expect_ok(b.stack_slot(ir::Type::F64), "preserved slot");
+    testing::assert_ok(b.stack_store(slot, p[0]));
+    let constants = Vec::new();
+    for number in Vec::from_array([0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25]) {
+        constants.push(testing::expect_ok(b.fconst(number), "float constant"));
+    }
+    let result = testing::expect_ok(b.call(pair, p), "nested float call");
+    let mut sum = result[0];
+    for constant in constants {
+        sum = testing::expect_ok(b.fbinary(ir::FloatOp::Add, sum, constant), "constant across call");
+    }
+    let saved = testing::expect_ok(b.stack_load(slot), "load after call");
+    testing::assert_ok(b.ret(Vec::from_array([sum, result[1], result[2], saved])));
+    let f = testing::expect_ok(b.finish(), "caller function");
+    testing::assert_ok(
+        m.define(
+            caller,
+            if optimize {
+                testing::expect_ok(opt::simplify(f), "optimize caller")
+            } else {
+                f
+            },
+        ),
+    );
+    testing::expect_ok(m.finish(), "typed module")
+}
+
+fn typed_host(target: ir::FuncRef, arguments: Vec[ir::Datum]) -> Result[Vec[ir::Datum], ir::Error] {
+    if target.name() != "TypedHelper" {
+        return Result::Err(ir::error(ir::ErrorKind::Unsupported, "unknown typed helper"))
+    }
+    match (arguments[0], arguments[1], arguments[2]) {
+        (ir::Datum::F64(value), ir::Datum::I32(integer), ir::Datum::Bool(boolean)) => Result::Ok(
+            Vec::from_array(
+                [
+                    ir::Datum::F64(value * 0.5),
+                    ir::Datum::I32((integer.to_u32() + 7).to_i32()),
+                    ir::Datum::Bool(!boolean),
+                ],
+            ),
+        ),
+        _ => Result::Err(ir::error(ir::ErrorKind::TypeMismatch, "typed helper argument mismatch")),
+    }
+}
+
+#[test]
+fn native_mixed_float_calls_preserve_live_values_and_local_memory() -> () {
+    let directory = path::join(
+        "_artifact",
+        "goir-typed-calls-" + hash::sha256(testing::expect_ok(rand::bytes(16), "unique artifact")),
+    );
+    testing::assert_ok(fs::create_dir_all(directory));
+    let source = typed_call_module(false);
+    let optimized = typed_call_module(true);
+    let lines = Vec::from_array(
+        [
+            "package generated",
+            "import (\"testing\"; \"math\"; baseline \"goir-typed-calls/baseline\"; constrained \"goir-typed-calls/constrained\"; spilled \"goir-typed-calls/spilled\"; optimized \"goir-typed-calls/optimized\"; optstack \"goir-typed-calls/optstack\")",
+        ],
+    );
+    let bits: Vec[i64] = Vec::from_array(
+        [
+            0,
+            -9223372036854775808,
+            1,
+            4607182418800017408,
+            -4616189618054758400,
+            9218868437227405312,
+            9221120237041090626,
+        ],
+    );
+    for target in source.references() {
+        if target.is_imported() {
+            continue;
+        }
+        lines.push("func Test" + target.name() + "(t *testing.T) {");
+        for index in 0..bits.len() {
+            let args = Vec::from_array(
+                [
+                    ir::datum_from_bits(ir::Type::F64, bits[index]),
+                    ir::Datum::I32(2147483647),
+                    ir::Datum::Bool(index % 2 == 0),
+                ],
+            );
+            let expected = testing::expect_ok(
+                ir::interpret_module_with_host(source, target, args, 10000, 32, typed_host),
+                "typed host interpretation",
+            );
+            let inputs = Vec::new();
+            for arg in args {
+                inputs.push(typed_literal(arg));
+            }
+            let names = Vec::new();
+            for result in 0..expected.len() {
+                names.push(f"r{result}");
+            }
+            for prefix in Vec::from_array(
+                ["", "baseline.", "constrained.", "spilled.", "optimized.", "optstack."],
+            ) {
+                lines.push("{");
+                lines.push(
+                    names.join(",") + " := " + prefix + target.name() + "(" + inputs.join(",") + ")",
+                );
+                for position in 0..expected.len() {
+                    typed_expect(
+                        lines,
+                        names[position],
+                        expected[position],
+                        target.name() + f" {prefix} case{index} result{position}",
+                    );
+                }
+                lines.push("}");
+            }
+        }
+        lines.push("}");
+    }
+    for (name, module, stack, registers) in Vec::from_array(
+        [
+            ("generated", source, false, 7),
+            ("baseline", source, true, 7),
+            ("constrained", source, false, 1),
+            ("spilled", optimized, false, 0),
+            ("optimized", optimized, false, 7),
+            ("optstack", optimized, true, 7),
+        ],
+    ) {
+        let output = testing::expect_ok(
+            if stack {
+                amd64::emit_stack_module(name, module)
+            } else {
+                amd64::emit_module_with_options(
+                    name,
+                    module,
+                    regalloc::Options { registers, ..regalloc::Options::standard() },
+                )
+            },
+            "emit typed calls",
+        );
+        let destination = if name == "generated" {
+            directory
+        } else {
+            path::join(directory, name)
+        };
+        testing::assert_ok(fs::create_dir_all(destination));
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated.go"), output.declarations),
+        );
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated_amd64.s"), output.assembly),
+        );
+        testing::assert_ok(
+            fs::write_file_structured(
+                path::join(destination, "helper.go"),
+                "package " + name
+                    + "\n\nfunc TypedHelper(x float64, n int32, b bool) (float64,int32,bool) { return x*0.5,n+7,!b }\n",
+            ),
+        );
+    }
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "go.mod"),
+            "module goir-typed-calls\n\ngo 1.26.0\n",
+        ),
+    );
+    testing::assert_ok(
+        fs::write_file_structured(
+            path::join(directory, "typed_calls_test.go"),
+            lines.join("\n") + "\n",
+        ),
+    );
+    let _ = run_go(directory, Vec::from_array(["vet", "./..."]));
+    let result = run_go(
+        directory,
+        Vec::from_array(["test", "-count=1", "-timeout=60s", "-v", "./..."]),
+    );
+    testing::assert(result.contains("PASS"));
+    testing::assert_ok(fs::remove_dir_all(directory));
+}

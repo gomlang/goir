@@ -1,0 +1,220 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::amd64;
+use ecosystem::goir::filetest;
+use ecosystem::goir::opt;
+use ecosystem::goir::reader;
+use ecosystem::goir::regalloc;
+use std::fs;
+use std::num;
+use std::path;
+use std::testing;
+use std::text;
+use std::time;
+
+fn reproduce_module_failure(
+    directory: string,
+    source: ir::Module,
+    target: ir::FuncRef,
+    arguments: Vec[ir::Datum],
+    backend: string,
+    helpers: string,
+) -> Result[bool, ir::Error] {
+    let mut module = source;
+    if backend == "optimized." || backend == "optstack." || backend == "spilled." {
+        for reference in module.references() {
+            if let Some(function) = module.function(reference)? {
+                module = module.with_function(reference, opt::simplify(function)?)?;
+            }
+        }
+    }
+    let output = if backend == "baseline." || backend == "optstack." {
+        amd64::emit_stack_module("reproduce", module)?
+    } else {
+        amd64::emit_module_with_options(
+            "reproduce",
+            module,
+            regalloc::Options {
+                registers: if backend == "constrained." {
+                    1
+                } else if backend == "spilled." {
+                    0
+                } else {
+                    7
+                },
+                ..regalloc::Options::standard(),
+            },
+        )?
+    };
+    reproduce_module_emitted(directory, source, target, arguments, helpers, output)
+}
+
+fn reproduce_module_emitted(
+    directory: string,
+    source: ir::Module,
+    target: ir::FuncRef,
+    arguments: Vec[ir::Datum],
+    helpers: string,
+    output: amd64::Package,
+) -> Result[bool, ir::Error] {
+    let expected = ir::interpret_module_with_host(
+        source,
+        target,
+        arguments,
+        100000,
+        1024,
+        call_host,
+    )?;
+    let lines = Vec::from_array(
+        [
+            "package reproduce",
+            "import (\"testing\"; \"math\")",
+            "var _ = math.Float64bits",
+            "func TestReproduceModule(t *testing.T) {",
+        ],
+    );
+    let inputs = Vec::new();
+    let names = Vec::new();
+    for value in arguments {
+        inputs.push(literal(value));
+    }
+    for index in 0..expected.len() {
+        names.push(f"got{index}");
+    }
+    let call = target.name() + "(" + inputs.join(", ") + ")";
+    lines.push(
+        if names.is_empty() {
+            call
+        } else {
+            names.join(", ") + " := " + call
+        },
+    );
+    for index in 0..expected.len() {
+        lines.push(
+            "if " + result_mismatch(f"got{index}", expected[index])
+                + " { t.Fatal(\"goir module mismatch\") }",
+        );
+    }
+    lines.push("}");
+    let failure = |message: string| ir::error(ir::ErrorKind::InvalidState, message);
+    for (name, body) in Vec::from_array(
+        [
+            ("go.mod", "module goir-module-reproduction\n\ngo 1.26.0\n"),
+            ("generated.go", output.declarations),
+            ("generated_amd64.s", output.assembly),
+            ("helpers.go", "package reproduce\n\n" + helpers),
+            ("reproduce_test.go", lines.join("\n") + "\n"),
+        ],
+    ) {
+        fs::write_file_structured(path::join(directory, name), body).map_err(
+            |error| failure(error.to_string()),
+        )?;
+    }
+    let result = go_result(
+        directory,
+        Vec::from_array(["test", "-count=1", "-run=^TestReproduceModule$", "-timeout=5s"]),
+        15,
+    );
+    Result::Ok(!result.success && result.output.contains("goir module mismatch"))
+}
+
+fn reduce_module_native_failure(
+    directory: string,
+    module: ir::Module,
+    output: string,
+    helpers: string,
+) -> () {
+    let mut active = "";
+    for line in output.split("\n") {
+        if line.starts_with("=== RUN   Test") {
+            active = text::trim(line.byte_slice("=== RUN   Test".len(), line.len()));
+        }
+        if !line.contains("case ") || !line.contains(", result ") {
+            continue
+        }
+        let parts = line.split("case ");
+        if parts.len() != 2 {
+            continue
+        }
+        let index = match num::parse_int_structured(parts[1].split(",")[0]) {
+            Ok(index) => index,
+            Err(_) => continue,
+        };
+        let mut backend = "";
+        for name in Vec::from_array(
+            ["baseline.", "constrained.", "spilled.", "optimized.", "optstack."],
+        ) {
+            if parts[0].ends_with(name) {
+                backend = name;
+            }
+        }
+        for target in module.references() {
+            if target.is_imported() || target.name() != active {
+                continue
+            }
+            let cases = call_cases(target);
+            if index < 0 || index >= cases.len() {
+                continue
+            }
+            let arguments = cases[index];
+            let destination = path::join(directory, "reduced-module");
+            testing::assert_ok(fs::create_dir_all(destination));
+            let selected_backend = backend;
+            let started = time::Instant::now();
+            let predicate = |candidate: ir::Module| {
+                if started.elapsed().as_nanoseconds() > 30000000000 {
+                    Result::Err(
+                        ir::error(
+                            ir::ErrorKind::LimitExceeded,
+                            "module reduction exceeded 30 seconds",
+                        ),
+                    )
+                } else {
+                    reproduce_module_failure(
+                        destination,
+                        candidate,
+                        target,
+                        arguments,
+                        selected_backend,
+                        helpers,
+                    )
+                }
+            };
+            match filetest::reduce_module(module, 24, predicate) {
+                Ok(reduced) => {
+                    testing::assert_ok(
+                        fs::write_file_structured(
+                            path::join(destination, "reduced.goir"),
+                            testing::expect_ok(
+                                reader::display_module(reduced.module),
+                                "reduced module text",
+                            ),
+                        ),
+                    );
+                    let _ = reproduce_module_failure(
+                        destination,
+                        reduced.module,
+                        target,
+                        arguments,
+                        selected_backend,
+                        helpers,
+                    );
+                    testing::assert_ok(
+                        fs::write_file_structured(
+                            path::join(destination, "reduction.txt"),
+                            f"entry: {active}\nbackend: {selected_backend}\ncase: {index}\nattempts: {reduced.attempts}\naccepted: {reduced.accepted}\n",
+                        ),
+                    );
+                },
+                Err(problem) => testing::assert_ok(
+                    fs::write_file_structured(
+                        path::join(destination, "reduction.txt"),
+                        problem.to_string(),
+                    ),
+                ),
+            }
+            return
+        }
+    }
+}

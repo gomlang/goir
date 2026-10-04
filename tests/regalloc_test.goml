@@ -38,8 +38,8 @@ fn register_allocation_reuses_slots_and_reduces_stack_traffic() -> () {
         ),
         "all spills",
     );
-    testing::assert_eq(spilled.stack_slots(), 2);
-    testing::assert_eq(spilled.spill_count(), source.value_count());
+    testing::assert_eq(spilled.stack_slots(), 1);
+    testing::assert_eq(spilled.spill_count(), machine.register_count());
     let optimized = testing::expect_ok(amd64::emit(source), "allocated");
     let baseline = testing::expect_ok(amd64::emit_stack(source), "baseline");
     testing::assert_eq(optimized.frame_bytes, 0);
@@ -124,7 +124,10 @@ fn allocation_prefers_a_dying_operand_over_an_unrelated_free_register() -> () {
         ),
         testing::expect_ok(
             allocation.location(
-                testing::expect_ok(machine.register(result.index()), "result register"),
+                testing::expect_ok(
+                    machine.register(machine.register_count() - 1),
+                    "result register",
+                ),
             ),
             "result location",
         ),

@@ -1,0 +1,160 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::filetest;
+use ecosystem::goir::reader;
+use std::testing;
+
+fn module_fixture() -> string {
+    "module {\ndeclare Helper(i64) -> (i64)\ndeclare Main(i64) -> (i64)\nfunction Helper(i64) -> (i64) {\nblock0(v0: i64):\n    v1: i64 = iconst 1\n    v2: i64 = iadd v0, v1\n    return v2\n}\nfunction Main(i64) -> (i64) {\nblock0(v0: i64):\n    v1: i64 = iconst 99\n    v2: i64 = call Helper(v0)\n    return v2\n}\n}\n"
+}
+
+#[test]
+fn modules_roundtrip_run_and_reduce_without_losing_call_signatures() -> () {
+    let module = testing::expect_ok(reader::read_module(module_fixture()), "module");
+    let text = testing::expect_ok(reader::display_module(module), "text");
+    let again = testing::expect_ok(reader::read_module(text), "again");
+    testing::assert_eq(testing::expect_ok(reader::display_module(again), "again text"), text);
+    testing::assert(
+        testing::expect_ok(
+            filetest::run_module(
+                text,
+                "Main",
+                filetest::Stage::Run,
+                Vec::from_array([ir::Datum::I64(41)]),
+                100,
+            ),
+            "run",
+        ).values
+            == Vec::from_array([ir::Datum::I64(42)]),
+    );
+    let reduced = testing::expect_ok(
+        filetest::reduce_module(
+            module,
+            30,
+            |candidate| {
+                let target = candidate.references()[1];
+                Result::Ok(
+                    ir::interpret_module(
+                        candidate,
+                        target,
+                        Vec::from_array([ir::Datum::I64(41)]),
+                        100,
+                    )?
+                        == Vec::from_array([ir::Datum::I64(42)]),
+                )
+            },
+        ),
+        "reduce module",
+    );
+    testing::assert(reduced.accepted > 0);
+    testing::assert(reduced.attempts <= 30);
+    let reduced_text = testing::expect_ok(reader::display_module(reduced.module), "reduced text");
+    testing::assert(reduced_text.contains("call Helper"));
+    testing::assert(!reduced_text.contains("iconst 99"));
+    testing::assert_eq(
+        testing::expect_ok(reader::display_module(module), "original snapshot"),
+        text,
+    );
+    let foreign = testing::expect_ok(reader::read_module(text), "foreign");
+    let function = foreign.functions()[1];
+    testing::assert_eq(
+        testing::expect_err(module.with_function(module.references()[1], function), "foreign owner").kind,
+        ir::ErrorKind::WrongFunction,
+    );
+    testing::assert_err(reader::read_module("module {\ndeclare Missing() -> ()\n}\n"));
+    testing::assert_err(reader::read_module(text + "trailing\n"));
+    testing::assert_err(
+        reader::read_module("module {\nimport Same() -> ()\nimport Same() -> ()\n}\n"),
+    );
+    let imported = testing::expect_ok(
+        reader::read_module(
+            "module {\nimport Observe() -> ()\ndeclare Invoke() -> ()\nfunction Invoke() -> () {\nblock0():\n call Observe()\n return\n}\n}\n",
+        ),
+        "imported module",
+    );
+    let imported_text = testing::expect_ok(reader::display_module(imported), "imported text");
+    let imported_again = testing::expect_ok(
+        reader::read_module(imported_text),
+        "imported roundtrip",
+    );
+    testing::assert(imported_again.references()[0].is_imported());
+    testing::assert_eq(
+        testing::expect_ok(reader::display_module(imported_again), "imported second text"),
+        imported_text,
+    );
+    let unusual = ir::ModuleBuilder::new();
+    testing::expect_ok(
+        unusual.import(
+            "two words",
+            testing::expect_ok(ir::Signature::new(Vec::new(), Vec::new()), "empty signature"),
+        ),
+        "opaque symbol",
+    );
+    testing::assert_err(
+        reader::display_module(testing::expect_ok(unusual.finish(), "valid opaque module")),
+    );
+}
+
+#[test]
+fn typed_text_preserves_float_bits_conversions_and_effectful_slots() -> () {
+    let source = "function Typed() -> (i64, f64) {\n    slot0: f64\nblock0():\n    v0: i32 = i32const -1\n    v1: i64 = uextend v0\n    v2: f64 = fconst_bits 9223372036854775808\n    stack_store slot0, v2\n    v3: f64 = stack_load slot0\n    return v1, v3\n}\n";
+    let function = testing::expect_ok(reader::read(source), "typed reader");
+    let text = testing::expect_ok(ir::display(function), "display");
+    testing::assert_eq(text, source);
+    let values = testing::expect_ok(ir::interpret(function, Vec::new(), 100), "interpret");
+    testing::assert(values[0] == ir::Datum::I64(4294967295));
+    testing::assert_eq(values[1].bits().to_u64(), 9223372036854775808);
+    testing::assert_err(
+        reader::read(
+            "function Bad() -> (i32) {\nblock0():\n v0: i32 = i32const 2147483648\n return v0\n}\n",
+        ),
+    );
+    testing::assert_err(
+        reader::read(
+            "function Bad() -> (i64) {\nblock0():\n v0: i64 = stack_load slot0\n return v0\n}\n",
+        ),
+    );
+}
+
+#[test]
+fn machine_filetests_expose_constraints_edits_and_expected_text_checks() -> () {
+    let source = "function Shift(i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n v2: i64 = ishl v0, v1\n return v2\n}\n";
+    let lower = testing::expect_ok(
+        filetest::run(source, filetest::Stage::Lower, Vec::new(), 0),
+        "lower",
+    );
+    testing::assert_ok(
+        filetest::assert_output(
+            lower,
+            Vec::from_array(["ishl", "Fixed(FixedReg::CX)", "Reuse(0)"]),
+            Vec::from_array(["call"]),
+        ),
+    );
+    let allocated = testing::expect_ok(
+        filetest::run(source, filetest::Stage::Allocate, Vec::new(), 0),
+        "allocate",
+    );
+    testing::assert_ok(
+        filetest::assert_output(
+            allocated,
+            Vec::from_array(["before edit", " @ ", "Fixed(FixedReg::CX)"]),
+            Vec::new(),
+        ),
+    );
+    testing::assert_err(
+        filetest::assert_output(lower, Vec::from_array(["absent text"]), Vec::new()),
+    );
+    testing::assert_err(filetest::assert_output(lower, Vec::new(), Vec::from_array(["ishl"])));
+    let module_lower = testing::expect_ok(
+        filetest::run_module(module_fixture(), "Main", filetest::Stage::Lower, Vec::new(), 0),
+        "module lower",
+    );
+    testing::assert_ok(
+        filetest::assert_output(
+            module_lower,
+            Vec::from_array(["machine Helper", "machine Main", "call Helper"]),
+            Vec::new(),
+        ),
+    );
+}

@@ -1,0 +1,195 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use std::testing;
+
+fn frontend_program() -> (ir::Module, ir::FuncRef) {
+    let module = ir::ModuleBuilder::new();
+    let signature = testing::expect_ok(
+        ir::Signature::new(Vec::from_array([ir::Type::I64]), Vec::from_array([ir::Type::I64])),
+        "signature",
+    );
+    let helper = testing::expect_ok(module.declare("Twice", signature), "helper");
+    let main = testing::expect_ok(module.declare("Assignments", signature), "main");
+    let helper_builder = testing::expect_ok(ir::Builder::for_function(helper), "helper builder");
+    let input = testing::expect_ok(
+        helper_builder.parameters(helper_builder.entry()),
+        "helper input",
+    )[0];
+    let doubled = testing::expect_ok(
+        helper_builder.binary(ir::BinaryOp::Add, input, input),
+        "double",
+    );
+    testing::assert_ok(helper_builder.ret(Vec::from_array([doubled])));
+    testing::assert_ok(
+        module.define(helper, testing::expect_ok(helper_builder.finish(), "helper function")),
+    );
+    let frontend = testing::expect_ok(ir::Frontend::for_function(main), "frontend");
+    let builder = frontend.builder();
+    let n = testing::expect_ok(builder.parameters(builder.entry()), "n")[0];
+    let counter = testing::expect_ok(frontend.declare_var(ir::Type::I64), "counter");
+    let accumulator = testing::expect_ok(frontend.declare_var(ir::Type::I64), "accumulator");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    let three = testing::expect_ok(builder.iconst(3), "three");
+    testing::assert_ok(frontend.def_var(counter, zero));
+    testing::assert_ok(frontend.def_var(accumulator, zero));
+    let header = testing::expect_ok(frontend.append_block(), "header");
+    let body = testing::expect_ok(frontend.append_block(), "body");
+    let yes = testing::expect_ok(frontend.append_block(), "yes");
+    let no = testing::expect_ok(frontend.append_block(), "no");
+    let merge = testing::expect_ok(frontend.append_block(), "merge");
+    let exit = testing::expect_ok(frontend.append_block(), "exit");
+    testing::assert_ok(frontend.jump(header));
+    testing::assert_ok(frontend.switch_to(header));
+    let i = testing::expect_ok(frontend.use_var(counter), "loop counter");
+    let condition = testing::expect_ok(builder.icmp(ir::IntCC::SignedLess, i, n), "loop condition");
+    testing::assert_ok(frontend.branch(condition, body, exit));
+    testing::assert_ok(frontend.switch_to(body));
+    let condition = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, i, three),
+        "if condition",
+    );
+    testing::assert_ok(frontend.branch(condition, yes, no));
+    testing::assert_ok(frontend.switch_to(yes));
+    let increment = testing::expect_ok(builder.call(helper, Vec::from_array([i])), "call")[0];
+    let old = testing::expect_ok(frontend.use_var(accumulator), "old yes");
+    let sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, old, increment), "yes sum");
+    testing::assert_ok(frontend.def_var(accumulator, sum));
+    testing::assert_ok(frontend.jump(merge));
+    testing::assert_ok(frontend.switch_to(no));
+    let old = testing::expect_ok(frontend.use_var(accumulator), "old no");
+    let sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, old, i), "no sum");
+    testing::assert_ok(frontend.def_var(accumulator, sum));
+    testing::assert_ok(frontend.jump(merge));
+    testing::assert_ok(frontend.seal_block(merge));
+    testing::assert_ok(frontend.switch_to(merge));
+    let next = testing::expect_ok(builder.binary(ir::BinaryOp::Add, i, one), "next counter");
+    testing::assert_ok(frontend.def_var(counter, next));
+    testing::assert_ok(frontend.jump(header));
+    testing::assert_ok(frontend.seal_block(header));
+    testing::assert_ok(frontend.switch_to(exit));
+    let result = testing::expect_ok(frontend.use_var(accumulator), "result");
+    testing::assert_ok(frontend.ret(Vec::from_array([result])));
+    testing::assert_ok(module.define(main, testing::expect_ok(frontend.finish(), "SSA function")));
+    (testing::expect_ok(module.finish(), "module"), main)
+}
+
+#[test]
+fn frontend_builds_assignment_condition_loop_and_call_ssa() -> () {
+    let (module, target) = frontend_program();
+    let source = module.functions()[1];
+    let optimized = testing::expect_ok(
+        module.with_function(target, testing::expect_ok(opt::simplify(source), "optimize")),
+        "optimized module",
+    );
+    for n in 0..12 {
+        let mut expected: i64 = 0;
+        for i in 0..n {
+            expected += if i < 3 {
+                (i * 2).to_i64()
+            } else {
+                i.to_i64()
+            };
+        }
+        let args = Vec::from_array([ir::Datum::I64(n.to_i64())]);
+        let result = Vec::from_array([ir::Datum::I64(expected)]);
+        testing::assert(
+            testing::expect_ok(ir::interpret_module(module, target, args, 10000), "run") == result,
+        );
+        testing::assert(
+            testing::expect_ok(
+                ir::interpret_module(optimized, target, args, 10000),
+                "optimized run",
+            )
+                == result,
+        );
+    }
+    testing::assert_ok(ir::verify(source));
+}
+
+#[test]
+fn frontend_rejects_uninitialized_variables_foreign_handles_and_sealed_edges() -> () {
+    let frontend = testing::expect_ok(
+        ir::Frontend::new("Errors", Vec::new(), Vec::new()),
+        "frontend",
+    );
+    let variable = testing::expect_ok(frontend.declare_var(ir::Type::I64), "variable");
+    testing::assert_err(frontend.use_var(variable));
+    let value = testing::expect_ok(frontend.builder().bconst(true), "bool");
+    testing::assert_err(frontend.def_var(variable, value));
+    let other = testing::expect_ok(ir::Frontend::new("Other", Vec::new(), Vec::new()), "other");
+    testing::assert_eq(
+        testing::expect_err(other.use_var(variable), "foreign").kind,
+        ir::ErrorKind::WrongFunction,
+    );
+    let target = testing::expect_ok(frontend.append_block(), "target");
+    testing::assert_ok(frontend.seal_block(target));
+    testing::assert_err(frontend.jump(target));
+    let frontend = testing::expect_ok(
+        ir::Frontend::new(
+            "UninitializedPath",
+            Vec::from_array([ir::Type::Bool]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "frontend",
+    );
+    let builder = frontend.builder();
+    let condition = testing::expect_ok(builder.parameters(builder.entry()), "condition")[0];
+    let variable = testing::expect_ok(frontend.declare_var(ir::Type::I64), "variable");
+    let yes = testing::expect_ok(frontend.append_block(), "yes");
+    let no = testing::expect_ok(frontend.append_block(), "no");
+    let join = testing::expect_ok(frontend.append_block(), "join");
+    testing::assert_ok(frontend.branch(condition, yes, no));
+    testing::assert_ok(frontend.switch_to(yes));
+    testing::assert_ok(frontend.def_var(variable, testing::expect_ok(builder.iconst(1), "one")));
+    testing::assert_ok(frontend.jump(join));
+    testing::assert_ok(frontend.switch_to(no));
+    testing::assert_ok(frontend.jump(join));
+    testing::assert_ok(frontend.switch_to(join));
+    let result = testing::expect_ok(frontend.use_var(variable), "result");
+    testing::assert_ok(frontend.ret(Vec::from_array([result])));
+    testing::assert_eq(
+        testing::expect_err(frontend.finish(), "one path never assigned").kind,
+        ir::ErrorKind::InvalidState,
+    );
+}
+
+#[test]
+fn frontend_preserves_assignment_snapshots_and_reports_work_limits() -> () {
+    let frontend = testing::expect_ok(
+        ir::Frontend::new("Snapshots", Vec::new(), Vec::from_array([ir::Type::I64, ir::Type::I64])),
+        "frontend",
+    );
+    let variable = testing::expect_ok(frontend.declare_var(ir::Type::I64), "variable");
+    testing::assert_ok(
+        frontend.def_var(variable, testing::expect_ok(frontend.builder().iconst(1), "one")),
+    );
+    let before = testing::expect_ok(frontend.use_var(variable), "before");
+    testing::assert_ok(
+        frontend.def_var(variable, testing::expect_ok(frontend.builder().iconst(2), "two")),
+    );
+    let after = testing::expect_ok(frontend.use_var(variable), "after");
+    testing::assert_ok(frontend.ret(Vec::from_array([before, after])));
+    let function = testing::expect_ok(frontend.finish(), "function");
+    testing::assert(
+        testing::expect_ok(ir::interpret(function, Vec::new(), 100), "run")
+            == Vec::from_array([ir::Datum::I64(1), ir::Datum::I64(2)]),
+    );
+    testing::assert_err(frontend.declare_var(ir::Type::I64));
+    let limited = testing::expect_ok(
+        ir::Frontend::with_limits(
+            "Limited",
+            Vec::new(),
+            Vec::new(),
+            ir::Limits { max_verify_steps: 2, ..ir::Limits::standard() },
+        ),
+        "limited",
+    );
+    testing::expect_ok(limited.declare_var(ir::Type::I64), "first step");
+    testing::assert_eq(
+        testing::expect_err(limited.declare_var(ir::Type::I64), "work cap").kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+}

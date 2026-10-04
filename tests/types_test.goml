@@ -1,0 +1,252 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use std::testing;
+
+#[test]
+fn i32_wraps_masks_shifts_and_extends_explicitly() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Widths",
+            Vec::new(),
+            Vec::from_array(
+                [
+                    ir::Type::I32,
+                    ir::Type::I32,
+                    ir::Type::I32,
+                    ir::Type::I64,
+                    ir::Type::I64,
+                    ir::Type::I32,
+                    ir::Type::Bool,
+                ],
+            ),
+        ),
+        "builder",
+    );
+    let maximum = testing::expect_ok(builder.i32const(2147483647), "maximum");
+    let one = testing::expect_ok(builder.i32const(1), "one");
+    let negative = testing::expect_ok(builder.i32const(-1), "negative");
+    let count = testing::expect_ok(builder.i32const(33), "count");
+    let wrapped = testing::expect_ok(builder.binary(ir::BinaryOp::Add, maximum, one), "wrap");
+    let shifted = testing::expect_ok(builder.binary(ir::BinaryOp::Shl, one, count), "shift");
+    let unsigned_shift = testing::expect_ok(
+        builder.binary(ir::BinaryOp::ShrU, negative, one),
+        "unsigned shift",
+    );
+    let signed = testing::expect_ok(
+        builder.convert(ir::IntConversion::SignExtend, negative),
+        "sign extend",
+    );
+    let unsigned = testing::expect_ok(
+        builder.convert(ir::IntConversion::ZeroExtend, negative),
+        "zero extend",
+    );
+    let large = testing::expect_ok(builder.iconst(4294967297), "large");
+    let reduced = testing::expect_ok(
+        builder.convert(ir::IntConversion::Truncate, large),
+        "truncate",
+    );
+    let less = testing::expect_ok(builder.icmp(ir::IntCC::UnsignedLess, one, negative), "compare");
+    testing::assert_err(builder.binary(ir::BinaryOp::Add, one, large));
+    testing::assert_err(builder.convert(ir::IntConversion::Truncate, one));
+    testing::assert_ok(
+        builder.ret(
+            Vec::from_array([wrapped, shifted, unsigned_shift, signed, unsigned, reduced, less]),
+        ),
+    );
+    let function = testing::expect_ok(builder.finish(), "finish");
+    let expected = Vec::from_array(
+        [
+            ir::Datum::I32(-2147483647 - 1),
+            ir::Datum::I32(2),
+            ir::Datum::I32(2147483647),
+            ir::Datum::I64(-1),
+            ir::Datum::I64(4294967295),
+            ir::Datum::I32(1),
+            ir::Datum::Bool(true),
+        ],
+    );
+    assert_data(testing::expect_ok(ir::interpret(function, Vec::new(), 100), "interpret"), expected);
+    let optimized = testing::expect_ok(opt::simplify(function), "optimize");
+    assert_data(
+        testing::expect_ok(ir::interpret(optimized, Vec::new(), 100), "optimized interpret"),
+        expected,
+    );
+}
+
+#[test]
+fn f64_preserves_bits_and_ieee_comparison_semantics() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "FloatBits",
+            Vec::from_array([ir::Type::Bool]),
+            Vec::from_array(
+                [
+                    ir::Type::F64,
+                    ir::Type::F64,
+                    ir::Type::Bool,
+                    ir::Type::Bool,
+                    ir::Type::Bool,
+                    ir::Type::Bool,
+                ],
+            ),
+        ),
+        "builder",
+    );
+    let condition = testing::expect_ok(builder.parameters(builder.entry()), "params")[0];
+    let positive = testing::expect_ok(builder.fconst(0.0), "positive zero");
+    let negative = testing::expect_ok(
+        builder.fconst(float64_from_bits(9223372036854775808)),
+        "negative zero",
+    );
+    let nan = testing::expect_ok(builder.fconst(float64_from_bits(9221120237041090583)), "nan");
+    let selected = testing::expect_ok(
+        builder.select(condition, positive, negative),
+        "signed zero select",
+    );
+    let equal = testing::expect_ok(builder.fcmp(ir::FloatCC::Equal, nan, nan), "nan equal");
+    let unequal = testing::expect_ok(builder.fcmp(ir::FloatCC::NotEqual, nan, nan), "nan unequal");
+    let less = testing::expect_ok(builder.fcmp(ir::FloatCC::Less, nan, positive), "nan less");
+    let zero_equal = testing::expect_ok(
+        builder.fcmp(ir::FloatCC::Equal, positive, negative),
+        "zero equal",
+    );
+    testing::assert_err(builder.icmp(ir::IntCC::Equal, positive, negative));
+    testing::assert_ok(
+        builder.ret(Vec::from_array([selected, nan, equal, unequal, less, zero_equal])),
+    );
+    let function = testing::expect_ok(builder.finish(), "finish");
+    let optimized = testing::expect_ok(opt::simplify(function), "optimize NaN");
+    for condition in Vec::from_array([false, true]) {
+        let expected = Vec::from_array(
+            [
+                ir::datum_from_bits(
+                    ir::Type::F64,
+                    if condition {
+                        0
+                    } else {
+                        (-9223372036854775807 - 1)
+                    },
+                ),
+                ir::datum_from_bits(ir::Type::F64, 9221120237041090583),
+                ir::Datum::Bool(false),
+                ir::Datum::Bool(true),
+                ir::Datum::Bool(false),
+                ir::Datum::Bool(true),
+            ],
+        );
+        assert_data(
+            testing::expect_ok(
+                ir::interpret(function, Vec::from_array([ir::Datum::Bool(condition)]), 100),
+                "interpret",
+            ),
+            expected,
+        );
+        assert_data(
+            testing::expect_ok(
+                ir::interpret(optimized, Vec::from_array([ir::Datum::Bool(condition)]), 100),
+                "optimized",
+            ),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn f64_arithmetic_has_no_fast_math_identities() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "FloatArithmetic",
+            Vec::from_array([ir::Type::F64]),
+            Vec::from_array([ir::Type::F64, ir::Type::F64, ir::Type::F64, ir::Type::F64]),
+        ),
+        "builder",
+    );
+    let value = testing::expect_ok(builder.parameters(builder.entry()), "parameter")[0];
+    let zero = testing::expect_ok(builder.fconst(0.0), "zero");
+    let one = testing::expect_ok(builder.fconst(1.0), "one");
+    let sum = testing::expect_ok(builder.fbinary(ir::FloatOp::Add, value, zero), "add");
+    let difference = testing::expect_ok(builder.fbinary(ir::FloatOp::Sub, value, value), "sub");
+    let product = testing::expect_ok(builder.fbinary(ir::FloatOp::Mul, value, zero), "mul");
+    let quotient = testing::expect_ok(builder.fbinary(ir::FloatOp::Div, one, value), "div");
+    testing::assert_ok(builder.ret(Vec::from_array([sum, difference, product, quotient])));
+    let function = testing::expect_ok(builder.finish(), "finish");
+    let optimized = testing::expect_ok(opt::simplify(function), "optimize");
+    let negative_zero = ir::datum_from_bits(ir::Type::F64, -9223372036854775807 - 1);
+    let output = testing::expect_ok(
+        ir::interpret(optimized, Vec::from_array([negative_zero]), 100),
+        "negative zero",
+    );
+    testing::assert_eq(output[0].bits(), 0);
+    testing::assert_eq(output[1].bits(), 0);
+    testing::assert_eq(output[2].bits(), -9223372036854775807 - 1);
+    testing::assert_eq(output[3].bits(), -4503599627370496);
+    for bits in Vec::from_array([4613937818241073152, 9218868437227405312, 9221120237041090583]) {
+        let input = Vec::from_array([ir::datum_from_bits(ir::Type::F64, bits)]);
+        assert_data(
+            testing::expect_ok(ir::interpret(function, input, 100), "raw"),
+            testing::expect_ok(ir::interpret(optimized, input, 100), "optimized"),
+        );
+    }
+}
+
+fn assert_data(actual: Vec[ir::Datum], expected: Vec[ir::Datum]) -> () {
+    testing::assert(actual == expected);
+}
+
+#[test]
+fn i32_negative_shifts_and_overflow_survive_constant_folding() -> () {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "NarrowEdges",
+            Vec::new(),
+            Vec::from_array(
+                [ir::Type::I32, ir::Type::I32, ir::Type::I32, ir::Type::I32, ir::Type::I32],
+            ),
+        ),
+        "builder",
+    );
+    let minimum = testing::expect_ok(builder.i32const(-2147483647 - 1), "minimum");
+    let negative = testing::expect_ok(builder.i32const(-1), "negative");
+    let one = testing::expect_ok(builder.i32const(1), "one");
+    let subtraction = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Sub, minimum, one),
+        "subtraction",
+    );
+    let multiplication = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Mul, minimum, negative),
+        "multiplication",
+    );
+    let left = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Shl, one, negative),
+        "negative shift count",
+    );
+    let logical = testing::expect_ok(
+        builder.binary(ir::BinaryOp::ShrU, minimum, negative),
+        "logical shift",
+    );
+    let arithmetic = testing::expect_ok(
+        builder.binary(ir::BinaryOp::ShrS, minimum, negative),
+        "arithmetic shift",
+    );
+    testing::assert_ok(
+        builder.ret(Vec::from_array([subtraction, multiplication, left, logical, arithmetic])),
+    );
+    let function = testing::expect_ok(builder.finish(), "finish");
+    let expected = Vec::from_array(
+        [
+            ir::Datum::I32(2147483647),
+            ir::Datum::I32(-2147483647 - 1),
+            ir::Datum::I32(-2147483647 - 1),
+            ir::Datum::I32(1),
+            ir::Datum::I32(-1),
+        ],
+    );
+    assert_data(testing::expect_ok(ir::interpret(function, Vec::new(), 100), "original"), expected);
+    let optimized = testing::expect_ok(opt::simplify(function), "optimize");
+    assert_data(
+        testing::expect_ok(ir::interpret(optimized, Vec::new(), 100), "optimized"),
+        expected,
+    );
+}

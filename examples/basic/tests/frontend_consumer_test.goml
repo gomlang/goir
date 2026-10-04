@@ -1,0 +1,41 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::examples::basic as example;
+use ecosystem::goir::filetest;
+use ecosystem::goir::reader;
+use std::testing;
+
+#[test]
+fn independent_frontend_consumer_builds_calls_loops_and_branches() -> () {
+    let module = testing::expect_ok(example::frontend_module(), "frontend consumer");
+    let text = testing::expect_ok(reader::display_module(module), "consumer module text");
+    for count in 0..10 {
+        let mut expected: i64 = 0;
+        for index in 0..count {
+            expected += if index < 3 {
+                (index * 2).to_i64()
+            } else {
+                index.to_i64()
+            };
+        }
+        let output = testing::expect_ok(
+            filetest::run_module(
+                text,
+                "AssignedSum",
+                filetest::Stage::Run,
+                Vec::from_array([ir::Datum::I64(count.to_i64())]),
+                10000,
+            ),
+            "independent module run",
+        );
+        testing::assert(output.values == Vec::from_array([ir::Datum::I64(expected)]));
+    }
+    let output = testing::expect_ok(
+        filetest::run_module(text, "AssignedSum", filetest::Stage::Compile, Vec::new(), 0),
+        "independent module codegen",
+    );
+    testing::assert_ok(
+        filetest::assert_output(output, Vec::from_array(["CALL", "AssignedSum"]), Vec::new()),
+    );
+}

@@ -15,10 +15,14 @@ fn test_index(location: Location) -> isize {
     match location {
         Register(index) => index * 2,
         Stack(index) => index * 2 + 1,
+        Rematerialized { .. } => -1,
         Fixed(register) => match register {
             AX => 4,
             CX => 5,
             DX => 6,
+            X0 => 7,
+            X1 => 8,
+            X2 => 9,
         },
     }
 }

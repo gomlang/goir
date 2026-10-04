@@ -47,3 +47,16 @@ fn allocation_verifier_rejects_conflicts_and_invalid_locations() -> () {
         ir::ErrorKind::InvalidArgument,
     );
 }
+
+#[test]
+fn allocation_checker_rejects_inconsistent_physical_pool_shape() -> () {
+    let invalid = Allocation { register_limit: 0, ..conflict_fixture() };
+    testing::assert_eq(
+        testing::expect_err(verify(invalid), "pool shape").kind,
+        ir::ErrorKind::InvalidArgument,
+    );
+    testing::assert_eq(
+        testing::expect_err(check(invalid), "checker pool shape").kind,
+        ir::ErrorKind::InvalidArgument,
+    );
+}
