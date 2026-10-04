@@ -2,6 +2,8 @@ package tests;
 
 use ecosystem::goir as ir;
 use ecosystem::goir::amd64;
+use ecosystem::goir::regalloc;
+use std::env;
 use ecosystem::goir::examples::basic as example;
 use std::crypto::hash;
 use std::crypto::rand;
@@ -106,22 +108,28 @@ fn add_differential(lines: Vec[string], function: ir::Function, cases: Vec[Vec[i
         for position in 0..expected.len() {
             names.push(f"got{position}");
         }
-        lines.push("{");
-        let call = function.name() + "(" + inputs.join(", ") + ")";
-        lines.push(
-            if names.is_empty() {
-                call
-            } else {
-                names.join(", ") + " := " + call
-            },
-        );
-        for position in 0..expected.len() {
-            lines.push(
-                f"if got{position} != " + literal(expected[position])
-                    + f" {{ t.Fatalf(\"case {index}, result {position}: %v\", got{position}) }}",
-            );
+        let backends = Vec::from_array(["", "baseline.", "constrained."]);
+        if function.name() == "Rotate12" {
+            backends.push("spilled.");
         }
-        lines.push("}");
+        for backend in backends {
+            lines.push("{");
+            let call = backend + function.name() + "(" + inputs.join(", ") + ")";
+            lines.push(
+                if names.is_empty() {
+                    call
+                } else {
+                    names.join(", ") + " := " + call
+                },
+            );
+            for position in 0..expected.len() {
+                lines.push(
+                    f"if got{position} != " + literal(expected[position])
+                        + f" {{ t.Fatalf(\"{backend}case {index}, result {position}: %v\", got{position}) }}",
+                );
+            }
+            lines.push("}");
+        }
     }
     lines.push("}");
 }
@@ -194,7 +202,12 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
     let version = run_go(directory, Vec::from_array(["env", "GOVERSION", "GOOS", "GOARCH"]));
     testing::assert(version.contains("go1.26.") && version.contains("\nlinux\namd64\n"));
     let functions = Vec::new();
-    let lines = Vec::from_array(["package generated", "import \"testing\""]);
+    let lines = Vec::from_array(
+        [
+            "package generated",
+            "import (\"testing\"; baseline \"goir-native-test/baseline\"; constrained \"goir-native-test/constrained\"; spilled \"goir-native-test/spilled\")",
+        ],
+    );
     let ops = Vec::from_array(
         [
             ir::BinaryOp::Add,
@@ -335,6 +348,75 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
             ],
         ),
     );
+    let rotation = rotation_function();
+    let diamond = diamond_function();
+    functions.extend(Vec::from_array([rotation, diamond]));
+    let rotation_cases = Vec::new();
+    for n in 0..25 {
+        let args = Vec::new();
+        for index in 0..12 {
+            args.push(ir::Datum::I64(index.to_i64() * 19 - 41));
+        }
+        args.push(ir::Datum::I64(n.to_i64()));
+        rotation_cases.push(args);
+    }
+    add_differential(lines, rotation, rotation_cases);
+    let diamond_cases = Vec::new();
+    for values in integer_cases() {
+        diamond_cases.push(Vec::from_array([ir::Datum::Bool(true), values[0], values[1]]));
+        diamond_cases.push(Vec::from_array([ir::Datum::Bool(false), values[0], values[1]]));
+    }
+    add_differential(lines, diamond, diamond_cases);
+    let baseline = testing::expect_ok(
+        amd64::emit_stack_package("baseline", functions),
+        "stack backend",
+    );
+    let constrained = testing::expect_ok(
+        amd64::emit_package_with_options(
+            "constrained",
+            functions,
+            regalloc::Options { registers: 1, ..regalloc::Options::standard() },
+        ),
+        "single-register backend",
+    );
+    let spilled = testing::expect_ok(
+        amd64::emit_package_with_options(
+            "spilled",
+            Vec::from_array([rotation]),
+            regalloc::Options { registers: 0, ..regalloc::Options::standard() },
+        ),
+        "all-spill backend",
+    );
+    for (name, output) in Vec::from_array(
+        [("baseline", baseline), ("constrained", constrained), ("spilled", spilled)],
+    ) {
+        let destination = path::join(directory, name);
+        testing::assert_ok(fs::create_dir_all(destination));
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated.go"), output.declarations),
+        );
+        testing::assert_ok(
+            fs::write_file_structured(path::join(destination, "generated_amd64.s"), output.assembly),
+        );
+    }
+    let report = Vec::from_array(
+        ["function\tbackend\tframe_bytes\tstack_reads\tstack_writes\tinstructions\tassembly_bytes"],
+    );
+    for function in functions {
+        for (name, compiled) in Vec::from_array(
+            [
+                ("registers", testing::expect_ok(amd64::emit(function), "measure registers")),
+                ("stack", testing::expect_ok(amd64::emit_stack(function), "measure baseline")),
+            ],
+        ) {
+            let metrics = amd64::metrics(compiled);
+            report.push(
+                function.name()
+                    + f"\t{name}\t{compiled.frame_bytes}\t{metrics.stack_reads}\t{metrics.stack_writes}\t{metrics.instructions}\t{metrics.assembly_bytes}",
+            );
+        }
+    }
+    testing::assert_ok(fs::write_file_structured("_artifact/codegen.tsv", report.join("\n") + "\n"));
     let output = testing::expect_ok(amd64::emit_package("generated", functions), "native output");
     testing::assert_ok(
         fs::write_file_structured(
@@ -372,5 +454,12 @@ fn native_go_abi0_matches_interpreter_and_go_oracle() -> () {
         Vec::from_array(["test", "-count=1", "-timeout=60s", "-v", "./..."]),
     );
     testing::assert(output.contains("PASS"));
+    if env::var_structured("GOIR_BENCHMARK").unwrap_or("") == "1" {
+        let benchmark = run_go(
+            directory,
+            Vec::from_array(["test", "-run=^$", "-bench=Benchmark", "-benchtime=100ms", "-count=3"]),
+        );
+        testing::assert_ok(fs::write_file_structured("_artifact/benchmarks.txt", benchmark));
+    }
     testing::assert_ok(fs::remove_dir_all(directory));
 }

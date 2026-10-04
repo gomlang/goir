@@ -1,0 +1,85 @@
+package tests;
+
+use ecosystem::goir as ir;
+use std::testing;
+
+fn rotation_function() -> ir::Function {
+    let inputs = Vec::new();
+    let outputs = Vec::new();
+    for _ in 0..12 {
+        inputs.push(ir::Type::I64);
+        outputs.push(ir::Type::I64);
+    }
+    inputs.push(ir::Type::I64);
+    let builder = testing::expect_ok(ir::Builder::new("Rotate12", inputs, outputs), "rotation");
+    let header = testing::expect_ok(builder.append_block(inputs), "header");
+    let exit = testing::expect_ok(builder.append_block(outputs), "exit");
+    let zero = testing::expect_ok(builder.iconst(0), "zero");
+    let one = testing::expect_ok(builder.iconst(1), "one");
+    testing::assert_ok(
+        builder.jump(header, testing::expect_ok(builder.parameters(builder.entry()), "inputs")),
+    );
+    testing::assert_ok(builder.switch_to(header));
+    let values = testing::expect_ok(builder.parameters(header), "loop parameters");
+    let more = testing::expect_ok(
+        builder.icmp(ir::IntCC::SignedLess, zero, values[12]),
+        "condition",
+    );
+    let next = testing::expect_ok(builder.binary(ir::BinaryOp::Sub, values[12], one), "next");
+    let rotate = Vec::new();
+    let returned = Vec::new();
+    for index in 0..12 {
+        rotate.push(values[(index + 1) % 12]);
+        returned.push(values[index]);
+    }
+    rotate.push(next);
+    testing::assert_ok(
+        builder.branch(
+            more,
+            ir::Edge { target: header, arguments: rotate },
+            ir::Edge { target: exit, arguments: returned },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(exit));
+    testing::assert_ok(builder.ret(testing::expect_ok(builder.parameters(exit), "results")));
+    testing::expect_ok(builder.finish(), "rotation function")
+}
+
+fn diamond_function() -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Diamond",
+            Vec::from_array([ir::Type::Bool, ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "diamond",
+    );
+    let values = testing::expect_ok(builder.parameters(builder.entry()), "inputs");
+    let join = testing::expect_ok(builder.append_block(Vec::from_array([ir::Type::I64])), "join");
+    let left = testing::expect_ok(builder.append_block(Vec::new()), "left");
+    let right = testing::expect_ok(builder.append_block(Vec::new()), "right");
+    testing::assert_ok(
+        builder.branch(
+            values[0],
+            ir::Edge { target: left, arguments: Vec::new() },
+            ir::Edge { target: right, arguments: Vec::new() },
+        ),
+    );
+    testing::assert_ok(builder.switch_to(left));
+    let sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, values[1], values[2]), "sum");
+    testing::assert_ok(builder.jump(join, Vec::from_array([sum])));
+    testing::assert_ok(builder.switch_to(right));
+    let difference = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Sub, values[1], values[2]),
+        "difference",
+    );
+    testing::assert_ok(builder.jump(join, Vec::from_array([difference])));
+    testing::assert_ok(builder.switch_to(join));
+    let parameter = testing::expect_ok(builder.parameters(join), "join argument")[0];
+    let result = testing::expect_ok(
+        builder.binary(ir::BinaryOp::Mul, parameter, values[2]),
+        "live-through input",
+    );
+    testing::assert_ok(builder.ret(Vec::from_array([result])));
+    testing::expect_ok(builder.finish(), "diamond function")
+}

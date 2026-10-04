@@ -1,6 +1,8 @@
 package generated
 
 import (
+	"goir-native-test/baseline"
+	"goir-native-test/constrained"
 	"runtime"
 	"sync"
 	"testing"
@@ -38,6 +40,9 @@ func TestStackGrowthAndGoCallers(t *testing.T) {
 				if got := LargeStack(n); got != n+768*767/2 {
 					t.Errorf("large frame: got %d", got)
 				}
+				if baseline.LargeStack(n) != n+768*767/2 || constrained.LargeStack(n) != n+768*767/2 {
+					t.Error("alternate backend large frame")
+				}
 				a, b, c := Mixed(true, n, false)
 				if !a || b != n || c {
 					t.Errorf("mixed results: %v %d %v", a, b, c)
@@ -58,4 +63,30 @@ func TestStackGrowthAndGoCallers(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+var benchmarkResult int64
+
+func BenchmarkSumRegisters(b *testing.B) {
+	for b.Loop() {
+		benchmarkResult = Sum(100)
+	}
+}
+
+func BenchmarkSumStack(b *testing.B) {
+	for b.Loop() {
+		benchmarkResult = baseline.Sum(100)
+	}
+}
+
+func BenchmarkChainRegisters(b *testing.B) {
+	for b.Loop() {
+		benchmarkResult = LargeStack(17)
+	}
+}
+
+func BenchmarkChainStack(b *testing.B) {
+	for b.Loop() {
+		benchmarkResult = baseline.LargeStack(17)
+	}
 }

@@ -1,0 +1,49 @@
+package regalloc;
+
+use ecosystem::goir as ir;
+use module::mach;
+use std::testing;
+
+fn conflict_fixture() -> Allocation {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Conflict",
+            Vec::from_array([ir::Type::I64, ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let args = testing::expect_ok(builder.parameters(builder.entry()), "parameters");
+    let sum = testing::expect_ok(builder.binary(ir::BinaryOp::Add, args[0], args[1]), "sum");
+    testing::assert_ok(builder.ret(Vec::from_array([sum])));
+    let source = testing::expect_ok(builder.finish(), "function");
+    testing::expect_ok(allocate(testing::expect_ok(mach::lower(source), "machine")), "allocation")
+}
+
+#[test]
+fn allocation_verifier_rejects_conflicts_and_invalid_locations() -> () {
+    let allocation = conflict_fixture();
+    allocation.locations[1] = allocation.locations[0];
+    testing::assert_eq(
+        testing::expect_err(verify(allocation), "overlapping parameters").kind,
+        ir::ErrorKind::InvalidState,
+    );
+    let allocation = conflict_fixture();
+    allocation.locations[0] = Location::Register(allocation.register_limit);
+    testing::assert_eq(
+        testing::expect_err(verify(allocation), "register bound").kind,
+        ir::ErrorKind::InvalidHandle,
+    );
+    let allocation = conflict_fixture();
+    allocation.locations[0] = Location::Stack(allocation.slots);
+    testing::assert_eq(
+        testing::expect_err(verify(allocation), "slot bound").kind,
+        ir::ErrorKind::InvalidHandle,
+    );
+    let allocation = conflict_fixture();
+    allocation.locations.clear();
+    testing::assert_eq(
+        testing::expect_err(verify(allocation), "missing locations").kind,
+        ir::ErrorKind::InvalidArgument,
+    );
+}

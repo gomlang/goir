@@ -1,0 +1,94 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::mach;
+use ecosystem::goir::regalloc;
+use ecosystem::goir::amd64;
+use std::testing;
+
+fn allocation_chain() -> ir::Function {
+    let builder = testing::expect_ok(
+        ir::Builder::new(
+            "Chain",
+            Vec::from_array([ir::Type::I64]),
+            Vec::from_array([ir::Type::I64]),
+        ),
+        "builder",
+    );
+    let mut value = testing::expect_ok(builder.parameters(builder.entry()), "input")[0];
+    for index in 0..100 {
+        let constant = testing::expect_ok(builder.iconst(index.to_i64()), "constant");
+        value = testing::expect_ok(builder.binary(ir::BinaryOp::Add, value, constant), "add");
+    }
+    testing::assert_ok(builder.ret(Vec::from_array([value])));
+    testing::expect_ok(builder.finish(), "function")
+}
+
+#[test]
+fn register_allocation_reuses_slots_and_reduces_stack_traffic() -> () {
+    let source = allocation_chain();
+    let machine = testing::expect_ok(mach::lower(source), "lower");
+    let allocation = testing::expect_ok(regalloc::allocate(machine), "allocate");
+    testing::assert_ok(regalloc::verify(allocation));
+    testing::assert_eq(allocation.stack_slots(), 0);
+    let spilled = testing::expect_ok(
+        regalloc::allocate_with_options(
+            machine,
+            regalloc::Options { registers: 0, ..regalloc::Options::standard() },
+        ),
+        "all spills",
+    );
+    testing::assert_eq(spilled.stack_slots(), 2);
+    testing::assert_eq(spilled.spill_count(), source.value_count());
+    let optimized = testing::expect_ok(amd64::emit(source), "allocated");
+    let baseline = testing::expect_ok(amd64::emit_stack(source), "baseline");
+    testing::assert_eq(optimized.frame_bytes, 0);
+    testing::assert(optimized.frame_bytes < baseline.frame_bytes);
+    testing::assert(amd64::metrics(optimized).stack_reads < amd64::metrics(baseline).stack_reads);
+    testing::assert(amd64::metrics(optimized).stack_writes < amd64::metrics(baseline).stack_writes);
+}
+
+#[test]
+fn machine_snapshots_and_allocation_handles_remain_isolated() -> () {
+    let source = allocation_chain();
+    let first = testing::expect_ok(mach::lower(source), "first");
+    let second = testing::expect_ok(mach::lower(source), "second");
+    let allocation = testing::expect_ok(regalloc::allocate(first), "allocate");
+    testing::assert_eq(
+        testing::expect_err(
+            allocation.location(testing::expect_ok(second.register(0), "foreign")),
+            "owner",
+        ).kind,
+        ir::ErrorKind::WrongFunction,
+    );
+    testing::assert_err(first.register(-1));
+    testing::assert_err(first.register(first.register_count()));
+    first.blocks()[0].instructions.clear();
+    testing::assert(first.blocks()[0].instructions.len() > 0);
+    let intervals = allocation.liveness().intervals();
+    intervals.clear();
+    testing::assert_eq(allocation.liveness().intervals().len(), first.register_count());
+    testing::assert_err(allocation.liveness().live_in(-1));
+    testing::assert_err(
+        regalloc::allocate_with_options(
+            first,
+            regalloc::Options { registers: -1, ..regalloc::Options::standard() },
+        ),
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            regalloc::allocate_with_options(
+                first,
+                regalloc::Options { max_steps: 1, ..regalloc::Options::standard() },
+            ),
+            "work budget",
+        ).kind,
+        ir::ErrorKind::LimitExceeded,
+    );
+    testing::assert_err(
+        amd64::emit_with_options(
+            source,
+            regalloc::Options { registers: 8, ..regalloc::Options::standard() },
+        ),
+    );
+}

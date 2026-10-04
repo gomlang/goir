@@ -254,7 +254,7 @@ fn native_names_and_frame_sizes_fail_before_output() -> () {
     testing::assert_ok(builder.ret(Vec::new()));
     let function = testing::expect_ok(builder.finish(), "large IR");
     testing::assert_eq(
-        testing::expect_err(amd64::emit(function), "frame cap").kind,
+        testing::expect_err(amd64::emit_stack(function), "frame cap").kind,
         ir::ErrorKind::LimitExceeded,
     );
 }

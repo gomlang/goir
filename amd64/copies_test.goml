@@ -1,0 +1,67 @@
+package amd64;
+
+use module::regalloc;
+use std::testing;
+
+fn test_location(index: isize) -> regalloc::Location {
+    if index % 2 == 0 {
+        regalloc::Location::Register(index / 2)
+    } else {
+        regalloc::Location::Stack(index / 2)
+    }
+}
+
+fn test_index(location: regalloc::Location) -> isize {
+    match location {
+        Register(index) => index * 2,
+        Stack(index) => index * 2 + 1,
+    }
+}
+
+#[test]
+fn parallel_copies_preserve_cycles_and_broadcasts() -> () {
+    for combination in 0..256 {
+        let values: Vec[isize] = Vec::from_array([11, 29, 47, 83]);
+        let before: Vec[isize] = Vec::from_array([11, 29, 47, 83]);
+        let moves = Vec::new();
+        let expected = Vec::new();
+        let mut code = combination;
+        for destination in 0..4 {
+            let source = code % 4;
+            code = code / 4;
+            moves.push(
+                Move {
+                    source: CopySource::Location(test_location(source)),
+                    destination: test_location(destination),
+                },
+            );
+            expected.push(before[source]);
+        }
+        let mut temporary = 0;
+        for step in testing::expect_ok(schedule_copies(moves), "schedule") {
+            match step {
+                Save(location) => {
+                    temporary = values[test_index(location)];
+                },
+                Move(item) => {
+                    values[test_index(item.destination)] = match item.source {
+                        Location(location) => values[test_index(location)],
+                        Temporary => temporary,
+                    };
+                },
+            }
+        }
+        testing::assert(values == expected);
+    }
+    let location = regalloc::Location::Register(0);
+    testing::assert_err(
+        schedule_copies(
+            Vec::from_array(
+                [
+                    Move { source: CopySource::Temporary, destination: location },
+                    Move { source: CopySource::Temporary, destination: location },
+                ],
+            ),
+        ),
+    );
+}
