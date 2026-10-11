@@ -48,8 +48,7 @@ ordinary typed functions, for example `generated.Add(20, 22)`. Package emission
 checks symbol uniqueness and emits the assembler include once.
 
 The local module is ready for development and isolated downstream verification;
-it has not been published as a registry version. Sources use `.goml` and require
-GoML 0.1.57 or newer.
+registry dependencies track the repository default branch. Sources use `.goml`.
 
 ## IR and builder
 
@@ -458,13 +457,12 @@ limited to 1 MiB.
 
 ## Development and examples
 
-Put GoML 0.1.57+ and Go 1.26.x on PATH. Native tests require Linux amd64.
+Put the GoML toolchain pinned by the shared ecosystem verifier and Go 1.26.x on PATH. Native tests require Linux amd64.
 From this repository:
 
 ```sh
 goml fmt --check
 goml test --timeout 180s
-goml verify --timeout 180s
 goml run --example basic
 goml run --example basic -- _artifact/demo
 ```
@@ -611,20 +609,20 @@ The benchmarks compare a bounded sum loop, a long arithmetic chain and a chain
 with foldable constants and redundant operations before/after SSA optimization. Use
 repeated measurements on the target machine before drawing performance conclusions.
 
-`goml verify` copies the example into an independent module against an isolated
-registry snapshot, then repeats its interpreter/native checks.
+The shared ecosystem verifier runs the library and example tests, including
+the interpreter/native checks.
 
 The library is registered in the [ecosystem catalog](https://github.com/gomlang/ecosystem)
 and [shared verifier](https://github.com/gomlang/verification).
 CI pins the shared workflow at a published commit; that revision selects the
-checksum-pinned GoML release and sibling repository revisions and runs Go 1.26.x.
-It checks formatting, library/example tests, independent downstream verification,
-cached builds and the example program. The CI artifact includes the verification
+pinned GoML toolchain and sibling repository revisions and runs Go 1.26.x.
+It checks formatting, library/example tests, cached builds and the example
+program. The CI artifact includes the verification
 logs, generated performance/corpus reports and retained native reproducers.
 From the sibling verification checkout, run:
 
 ```sh
-python3 ci/ecosystem.py verify --libraries .. --module goir --goml /absolute/path/to/goml
+just ecosystem-test goir
 ```
 
 ## Source map and next steps
