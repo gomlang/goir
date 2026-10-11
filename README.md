@@ -613,7 +613,7 @@ The shared ecosystem verifier runs the library and example tests, including
 the interpreter/native checks.
 
 The library is registered in the [ecosystem catalog](https://github.com/gomlang/ecosystem)
-and [shared verifier](https://github.com/gomlang/verification).
+and [shared verifier](https://github.com/gomlang/workflows).
 CI pins the shared workflow at a published commit; that revision selects the
 pinned GoML toolchain and sibling repository revisions and runs Go 1.26.x.
 It checks formatting, library/example tests, cached builds and the example
