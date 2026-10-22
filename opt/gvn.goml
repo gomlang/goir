@@ -60,6 +60,7 @@ fn expression_key(operation: ir::Operation) -> string {
         Select(condition, yes, no) => f"select:{condition.index()}:{yes.index()}:{no.index()}",
         FloatBinary(op, left, right) => f"float:{op.debug()}:{left.index()}:{right.index()}",
         FloatCompare(cc, left, right) => f"float_compare:{cc.debug()}:{left.index()}:{right.index()}",
+        Unary(op, value) => f"unary:{op.debug()}:{value.index()}",
         Convert(conversion, value) => f"convert:{conversion.debug()}:{value.index()}",
         StackLoad(_) | StackStore(_, _) | Call(_, _) => "effectful",
     }

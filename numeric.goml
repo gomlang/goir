@@ -1,5 +1,7 @@
 package goir;
 
+use std::math::bits;
+
 impl PartialEq for Datum {
     fn eq(self: Datum, other: Datum) -> bool {
         self.value_type() == other.value_type() && self.bits() == other.bits()
@@ -31,6 +33,13 @@ pub fn datum_from_bits(ty: Type, value: i64) -> Datum {
 }
 
 impl BinaryOp {
+    pub fn is_minmax(self: BinaryOp) -> bool {
+        match self {
+            Smin | Smax | Umin | Umax => true,
+            _ => false,
+        }
+    }
+
     pub fn may_trap(self: BinaryOp) -> bool {
         match self {
             DivS | DivU | RemS | RemU | ShlChecked | ShrUChecked | ShrSChecked => true,
@@ -82,11 +91,32 @@ pub fn evaluate_binary(op: BinaryOp, left: Datum, right: Datum) -> Result[Datum,
         return Result::Ok(datum_from_bits(ty, result))
     }
     let shift = (b.to_u64() & (width - 1).to_u64()).to_isize();
+    let reverse = (width.to_isize() - shift) & (width.to_isize() - 1);
     let bits = if ty == Type::I32 {
         let x = a.to_u32();
         let y = b.to_u32();
         let minimum: i32 = -2147483648;
         match op {
+            Smin => if a < b {
+                x
+            } else {
+                y
+            },
+            Smax => if a > b {
+                x
+            } else {
+                y
+            },
+            Umin => if x < y {
+                x
+            } else {
+                y
+            },
+            Umax => if x > y {
+                x
+            } else {
+                y
+            },
             Add => x + y,
             Sub => x - y,
             Mul => x * y,
@@ -96,6 +126,8 @@ pub fn evaluate_binary(op: BinaryOp, left: Datum, right: Datum) -> Result[Datum,
             Shl | ShlChecked => x << shift,
             ShrU | ShrUChecked => x >> shift,
             ShrS | ShrSChecked => (a.to_i32() >> shift).to_u32(),
+            Rotl => (x << shift) | (x >> reverse),
+            Rotr => (x >> shift) | (x << reverse),
             DivS => if a.to_i32() == minimum && b == -1 {
                 minimum.to_u32()
             } else {
@@ -112,6 +144,26 @@ pub fn evaluate_binary(op: BinaryOp, left: Datum, right: Datum) -> Result[Datum,
     } else {
         let minimum: i64 = -9223372036854775808;
         match op {
+            Smin => if a < b {
+                a
+            } else {
+                b
+            },
+            Smax => if a > b {
+                a
+            } else {
+                b
+            },
+            Umin => if a.to_u64() < b.to_u64() {
+                a
+            } else {
+                b
+            },
+            Umax => if a.to_u64() > b.to_u64() {
+                a
+            } else {
+                b
+            },
             Add => (a.to_u64() + b.to_u64()).to_i64(),
             Sub => (a.to_u64() - b.to_u64()).to_i64(),
             Mul => (a.to_u64() * b.to_u64()).to_i64(),
@@ -121,6 +173,8 @@ pub fn evaluate_binary(op: BinaryOp, left: Datum, right: Datum) -> Result[Datum,
             Shl | ShlChecked => (a.to_u64() << shift).to_i64(),
             ShrU | ShrUChecked => (a.to_u64() >> shift).to_i64(),
             ShrS | ShrSChecked => a >> shift,
+            Rotl => ((a.to_u64() << shift) | (a.to_u64() >> reverse)).to_i64(),
+            Rotr => ((a.to_u64() >> shift) | (a.to_u64() << reverse)).to_i64(),
             DivS => if a == minimum && b == -1 {
                 minimum
             } else {
@@ -172,4 +226,25 @@ fn float_compare(cc: FloatCC, left: i64, right: i64) -> bool {
         Less => a < b,
         LessEqual => a <= b,
     }
+}
+
+pub fn evaluate_unary(op: UnaryOp, value: Datum) -> Result[Datum, Error] {
+    let result = match value {
+        I32(input) => match op {
+            Clz => bits::leading_zeros32(input.to_u32()).to_i64(),
+            Ctz => bits::trailing_zeros32(input.to_u32()).to_i64(),
+            Popcnt => bits::ones_count32(input.to_u32()).to_i64(),
+            Bswap => bits::reverse_bytes32(input.to_u32()).to_i64(),
+        },
+        I64(input) => match op {
+            Clz => bits::leading_zeros64(input.to_u64()).to_i64(),
+            Ctz => bits::trailing_zeros64(input.to_u64()).to_i64(),
+            Popcnt => bits::ones_count64(input.to_u64()).to_i64(),
+            Bswap => bits::reverse_bytes64(input.to_u64()).to_i64(),
+        },
+        _ => return Result::Err(
+            error(ErrorKind::TypeMismatch, "unary evaluation requires I32 or I64"),
+        ),
+    };
+    Result::Ok(datum_from_bits(value.value_type(), result))
 }

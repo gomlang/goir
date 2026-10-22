@@ -11,6 +11,7 @@ enum ParsedOperation {
     Call(ir::FuncRef, Vec[isize]),
     FloatBinary(ir::FloatOp, isize, isize),
     FloatCompare(ir::FloatCC, isize, isize),
+    Unary(ir::UnaryOp, isize),
     Convert(ir::IntConversion, isize),
     StackLoad(isize),
     StackStore(isize, isize),
@@ -55,6 +56,12 @@ fn binary_name(name: string, line: isize) -> Result[ir::BinaryOp, ir::Error] {
         "ishl" => Result::Ok(ir::BinaryOp::Shl),
         "ushr" => Result::Ok(ir::BinaryOp::ShrU),
         "sshr" => Result::Ok(ir::BinaryOp::ShrS),
+        "irotl" => Result::Ok(ir::BinaryOp::Rotl),
+        "irotr" => Result::Ok(ir::BinaryOp::Rotr),
+        "smin" => Result::Ok(ir::BinaryOp::Smin),
+        "smax" => Result::Ok(ir::BinaryOp::Smax),
+        "umin" => Result::Ok(ir::BinaryOp::Umin),
+        "umax" => Result::Ok(ir::BinaryOp::Umax),
         "sdiv" => Result::Ok(ir::BinaryOp::DivS),
         "udiv" => Result::Ok(ir::BinaryOp::DivU),
         "srem" => Result::Ok(ir::BinaryOp::RemS),
@@ -131,6 +138,15 @@ fn instruction(cursor: Cursor, references: Vec[ir::FuncRef]) -> Result[ParsedIns
             cursor.expect(",")?;
             ParsedOperation::FloatCompare(cc, left, value_id(cursor)?)
         },
+        "clz" | "ctz" | "popcnt" | "bswap" => ParsedOperation::Unary(
+            match name {
+                "clz" => ir::UnaryOp::Clz,
+                "ctz" => ir::UnaryOp::Ctz,
+                "popcnt" => ir::UnaryOp::Popcnt,
+                _ => ir::UnaryOp::Bswap,
+            },
+            value_id(cursor)?,
+        ),
         "sextend" | "uextend" | "ireduce" => ParsedOperation::Convert(
             match name {
                 "sextend" => ir::IntConversion::SignExtend,
@@ -188,7 +204,7 @@ fn instruction(cursor: Cursor, references: Vec[ir::FuncRef]) -> Result[ParsedIns
 fn operation_uses(operation: ParsedOperation) -> Vec[isize] {
     match operation {
         Constant(_) | StackLoad(_) => Vec::new(),
-        Convert(_, value) | StackStore(_, value) => Vec::from_array([value]),
+        Unary(_, value) | Convert(_, value) | StackStore(_, value) => Vec::from_array([value]),
         Binary(_, left, right) | Compare(_, left, right) | FloatBinary(_, left, right) | FloatCompare(_, left, right) => Vec::from_array(
             [left, right],
         ),
@@ -265,6 +281,7 @@ fn insert(
             resolve(values, left, line)?,
             resolve(values, right, line)?,
         ),
+        Unary(op, value) => ir::Operation::Unary(op, resolve(values, value, line)?),
         Convert(conversion, value) => ir::Operation::Convert(
             conversion,
             resolve(values, value, line)?,

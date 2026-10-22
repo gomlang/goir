@@ -1,0 +1,233 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use std::testing;
+
+#[test]
+fn i32_identities_fold_with_typed_constants_and_width_specific_masks() -> () {
+    // Each row is op, constant, constant-on-left, and expected result:
+    // 0 means the input, 1 means zero, and 2 means all-one bits.
+    let cases = Vec::from_array(
+        [
+            (ir::BinaryOp::Add, 0, false, 0),
+            (ir::BinaryOp::Add, 0, true, 0),
+            (ir::BinaryOp::Sub, 0, false, 0),
+            (ir::BinaryOp::Mul, 1, false, 0),
+            (ir::BinaryOp::Mul, 1, true, 0),
+            (ir::BinaryOp::Mul, 0, false, 1),
+            (ir::BinaryOp::Mul, 0, true, 1),
+            (ir::BinaryOp::And, -1, false, 0),
+            (ir::BinaryOp::And, -1, true, 0),
+            (ir::BinaryOp::And, 0, false, 1),
+            (ir::BinaryOp::And, 0, true, 1),
+            (ir::BinaryOp::Or, 0, false, 0),
+            (ir::BinaryOp::Or, 0, true, 0),
+            (ir::BinaryOp::Or, -1, false, 2),
+            (ir::BinaryOp::Or, -1, true, 2),
+            (ir::BinaryOp::Xor, 0, false, 0),
+            (ir::BinaryOp::Xor, 0, true, 0),
+            (ir::BinaryOp::Rotl, 32, false, 0),
+            (ir::BinaryOp::Rotr, -32, false, 0),
+            (ir::BinaryOp::Rotl, 0, true, 1),
+            (ir::BinaryOp::Rotr, 0, true, 1),
+            (ir::BinaryOp::Rotl, -1, true, 2),
+            (ir::BinaryOp::Rotr, -1, true, 2),
+            (ir::BinaryOp::Shl, 32, false, 0),
+            (ir::BinaryOp::ShrU, -32, false, 0),
+            (ir::BinaryOp::ShrS, -2147483648, false, 0),
+            (ir::BinaryOp::Shl, 0, true, 1),
+            (ir::BinaryOp::ShrU, 0, true, 1),
+            (ir::BinaryOp::ShrS, 0, true, 1),
+            (ir::BinaryOp::ShrS, -1, true, 2),
+        ],
+    );
+    for (op, constant, on_left, kind) in cases {
+        let builder = testing::expect_ok(
+            ir::Builder::new(
+                "Identity32",
+                Vec::from_array([ir::Type::I32]),
+                Vec::from_array([ir::Type::I32]),
+            ),
+            "builder",
+        );
+        let input = testing::expect_ok(builder.parameters(builder.entry()), "input")[0];
+        let constant = testing::expect_ok(builder.i32const(constant), "constant");
+        let result = testing::expect_ok(
+            builder.binary(
+                op,
+                if on_left {
+                    constant
+                } else {
+                    input
+                },
+                if on_left {
+                    input
+                } else {
+                    constant
+                },
+            ),
+            "binary",
+        );
+        testing::assert_ok(builder.ret(Vec::from_array([result])));
+        let source = testing::expect_ok(builder.finish(), "source");
+        let optimized = testing::expect_ok(opt::simplify(source), "optimize");
+        testing::assert_eq(
+            optimized.blocks()[0].instructions.len(),
+            if kind == 0 {
+                0
+            } else {
+                1
+            },
+        );
+        for value in Vec::from_array([-2147483648, -65, -32, -1, 0, 1, 31, 32, 65, 2147483647]) {
+            let expected = Vec::from_array(
+                [
+                    ir::Datum::I32(
+                        if kind == 0 {
+                            value
+                        } else if kind == 1 {
+                            0
+                        } else {
+                            -1
+                        },
+                    ),
+                ],
+            );
+            let arguments = Vec::from_array([ir::Datum::I32(value)]);
+            testing::assert(
+                testing::expect_ok(ir::interpret(source, arguments, 100), "source run") == expected,
+            );
+            testing::assert(
+                testing::expect_ok(ir::interpret(optimized, arguments, 100), "optimized run")
+                    == expected,
+            );
+        }
+    }
+}
+
+#[test]
+fn i32_reflexive_comparisons_fold_to_boolean_constants() -> () {
+    for (cc, expected) in Vec::from_array(
+        [
+            (ir::IntCC::Equal, true),
+            (ir::IntCC::NotEqual, false),
+            (ir::IntCC::SignedLess, false),
+            (ir::IntCC::SignedLessEqual, true),
+            (ir::IntCC::UnsignedLess, false),
+            (ir::IntCC::UnsignedLessEqual, true),
+        ],
+    ) {
+        let builder = testing::expect_ok(
+            ir::Builder::new(
+                "Compare32",
+                Vec::from_array([ir::Type::I32]),
+                Vec::from_array([ir::Type::Bool]),
+            ),
+            "builder",
+        );
+        let input = testing::expect_ok(builder.parameters(builder.entry()), "input")[0];
+        let result = testing::expect_ok(builder.icmp(cc, input, input), "compare");
+        testing::assert_ok(builder.ret(Vec::from_array([result])));
+        let optimized = testing::expect_ok(
+            opt::simplify(testing::expect_ok(builder.finish(), "finish")),
+            "optimize",
+        );
+        testing::assert_eq(optimized.blocks()[0].instructions.len(), 1);
+        testing::assert(
+            match optimized.blocks()[0].instructions[0].operation {
+                Constant(ir::Datum::Bool(value)) => value == expected,
+                _ => false,
+            },
+        );
+    }
+}
+
+#[test]
+fn i32_checked_shifts_and_division_keep_observable_traps() -> () {
+    for op in Vec::from_array(
+        [
+            ir::BinaryOp::ShlChecked,
+            ir::BinaryOp::ShrUChecked,
+            ir::BinaryOp::ShrSChecked,
+            ir::BinaryOp::DivS,
+            ir::BinaryOp::DivU,
+            ir::BinaryOp::RemS,
+            ir::BinaryOp::RemU,
+        ],
+    ) {
+        let builder = testing::expect_ok(
+            ir::Builder::new(
+                "Trap32",
+                Vec::from_array([ir::Type::I32]),
+                Vec::from_array([ir::Type::I32]),
+            ),
+            "builder",
+        );
+        let input = testing::expect_ok(builder.parameters(builder.entry()), "input")[0];
+        let zero = testing::expect_ok(builder.i32const(0), "zero");
+        let _ = testing::expect_ok(builder.binary(op, zero, input), "unused trapping operation");
+        testing::assert_ok(builder.ret(Vec::from_array([zero])));
+        let source = testing::expect_ok(builder.finish(), "source");
+        let optimized = testing::expect_ok(opt::simplify(source), "optimize");
+        for function in Vec::from_array([source, optimized]) {
+            let trap_count = if op.is_checked_shift() {
+                -1
+            } else {
+                0
+            };
+            testing::assert_eq(
+                testing::expect_err(
+                    ir::interpret(function, Vec::from_array([ir::Datum::I32(trap_count)]), 100),
+                    "trap preserved",
+                ).kind,
+                ir::ErrorKind::ArithmeticTrap,
+            );
+            testing::assert(
+                testing::expect_ok(
+                    ir::interpret(function, Vec::from_array([ir::Datum::I32(32)]), 100),
+                    "large count",
+                )
+                    == Vec::from_array([ir::Datum::I32(0)]),
+            );
+        }
+    }
+}
+
+#[test]
+fn i32_checked_width_and_nonidentity_masked_counts_keep_distinct_semantics() -> () {
+    for (op, count, expected) in Vec::from_array(
+        [
+            (ir::BinaryOp::Shl, 33, -2),
+            (ir::BinaryOp::ShrU, -31, 2147483647),
+            (ir::BinaryOp::ShrS, 33, -1),
+            (ir::BinaryOp::ShlChecked, 32, 0),
+            (ir::BinaryOp::ShrUChecked, 32, 0),
+            (ir::BinaryOp::ShrSChecked, 32, -1),
+        ],
+    ) {
+        let builder = testing::expect_ok(
+            ir::Builder::new(
+                "Shift32",
+                Vec::from_array([ir::Type::I32]),
+                Vec::from_array([ir::Type::I32]),
+            ),
+            "builder",
+        );
+        let input = testing::expect_ok(builder.parameters(builder.entry()), "input")[0];
+        let count = testing::expect_ok(builder.i32const(count), "count");
+        let result = testing::expect_ok(builder.binary(op, input, count), "shift");
+        testing::assert_ok(builder.ret(Vec::from_array([result])));
+        let source = testing::expect_ok(builder.finish(), "source");
+        let optimized = testing::expect_ok(opt::simplify(source), "optimize");
+        for function in Vec::from_array([source, optimized]) {
+            testing::assert(
+                testing::expect_ok(
+                    ir::interpret(function, Vec::from_array([ir::Datum::I32(-1)]), 100),
+                    "run",
+                )
+                    == Vec::from_array([ir::Datum::I32(expected)]),
+            );
+        }
+    }
+}

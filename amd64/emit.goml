@@ -31,6 +31,12 @@ fn binary_opcode(op: ir::BinaryOp) -> string {
         Shl | ShlChecked => "SHLQ",
         ShrU | ShrUChecked => "SHRQ",
         ShrS | ShrSChecked => "SARQ",
+        Rotl => "ROLQ",
+        Rotr => "RORQ",
+        Smin => "CMOVQGT",
+        Smax => "CMOVQLT",
+        Umin => "CMOVQHI",
+        Umax => "CMOVQCS",
         DivS | RemS => "IDIVQ",
         DivU | RemU => "DIVQ",
     }
@@ -73,7 +79,7 @@ fn instruction(
                 if op.is_checked_shift() {
                     emit_checked_shift(lines, op, ty, "AX", function.name(), serial);
                 } else {
-                    lines.push("    " + typed_binary_opcode(op, ty) + " CX, AX");
+                    emit_binary(lines, op, ty, "CX", "AX");
                 }
             }
         },
@@ -102,6 +108,10 @@ fn instruction(
             load(lines, left, "X0", base);
             load(lines, right, "X1", base);
             float_compare(lines, cc);
+        },
+        Unary(op, input) => {
+            load(lines, input, "AX", base);
+            emit_unary(lines, op, function.value_type(input)?, serial);
         },
         Convert(op, input) => {
             load(lines, input, "AX", base);
@@ -320,6 +330,12 @@ fn typed_binary_opcode(op: ir::BinaryOp, ty: ir::Type) -> string {
         Shl | ShlChecked => "SHLL",
         ShrU | ShrUChecked => "SHRL",
         ShrS | ShrSChecked => "SARL",
+        Rotl => "ROLL",
+        Rotr => "RORL",
+        Smin => "CMOVLGT",
+        Smax => "CMOVLLT",
+        Umin => "CMOVLHI",
+        Umax => "CMOVLCS",
         DivS | RemS => "IDIVL",
         DivU | RemU => "DIVL",
     }
@@ -473,4 +489,77 @@ fn emit_checked_shift(
     lines.push(f"shift_panic{label}:");
     lines.push("    CALL ·goirPanicNegativeShift_" + name + "(SB)");
     lines.push(f"shift_done{label}:");
+}
+
+fn emit_unary(lines: Vec[string], op: ir::UnaryOp, ty: ir::Type, serial: Ref[isize]) -> () {
+    if ty == ir::Type::I32 {
+        lines.push("    MOVL AX, AX");
+    }
+    if op == ir::UnaryOp::Bswap {
+        lines.push(
+            if ty == ir::Type::I32 {
+                "    BSWAPL AX"
+            } else {
+                "    BSWAPQ AX"
+            },
+        );
+    } else if op == ir::UnaryOp::Popcnt {
+        for line in Vec::from_array(
+            [
+                "MOVQ AX, CX",
+                "SHRQ $1, CX",
+                "MOVQ $6148914691236517205, DX",
+                "ANDQ DX, CX",
+                "SUBQ CX, AX",
+                "MOVQ AX, CX",
+                "MOVQ $3689348814741910323, DX",
+                "ANDQ DX, AX",
+                "SHRQ $2, CX",
+                "ANDQ DX, CX",
+                "ADDQ CX, AX",
+                "MOVQ AX, CX",
+                "SHRQ $4, CX",
+                "ADDQ CX, AX",
+                "MOVQ $1085102592571150095, DX",
+                "ANDQ DX, AX",
+                "MOVQ $72340172838076673, DX",
+                "IMULQ DX, AX",
+                "SHRQ $56, AX",
+            ],
+        ) {
+            lines.push("    " + line);
+        }
+    } else {
+        let label = serial.get();
+        serial.set(label + 1);
+        let width = if ty == ir::Type::I32 {
+            32
+        } else {
+            64
+        };
+        lines.push("    MOVQ AX, CX");
+        lines.push(f"    MOVQ ${width}, AX");
+        lines.push("    TESTQ CX, CX");
+        lines.push(f"    JE bitcount_done{label}");
+        if op == ir::UnaryOp::Clz {
+            lines.push("    BSRQ CX, AX");
+            lines.push(f"    XORQ ${width - 1}, AX");
+        } else {
+            lines.push("    BSFQ CX, AX");
+        }
+        lines.push(f"bitcount_done{label}:");
+    }
+}
+
+fn emit_binary(
+    lines: Vec[string],
+    op: ir::BinaryOp,
+    ty: ir::Type,
+    source: string,
+    destination: string,
+) -> () {
+    if op.is_minmax() {
+        lines.push("    " + compare_width(ty) + " " + destination + ", " + source);
+    }
+    lines.push("    " + typed_binary_opcode(op, ty) + " " + source + ", " + destination);
 }

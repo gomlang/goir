@@ -24,6 +24,9 @@ fn match_binary(
     constants: Vec[Option[ir::Operation]],
     ty: ir::Type,
 ) -> BinarySelection {
+    if op.is_minmax() {
+        return BinarySelection::Registers
+    }
     if op.is_division() {
         return BinarySelection::Divide
     }
@@ -41,7 +44,7 @@ fn match_binary(
             return BinarySelection::Lea(input, (value - 1).to_isize())
         }
         let immediate = match op {
-            Shl | ShrU | ShrS => value
+            Shl | ShrU | ShrS | Rotl | Rotr => value
                 & if ty == ir::Type::I32 {
                     31
                 } else {

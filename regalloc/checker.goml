@@ -204,6 +204,8 @@ fn checker_same_instruction(left: mach::Instruction, right: mach::Instruction) -
             FloatSelect { dst: a, condition: x, yes: p, no: q },
             FloatSelect { dst: b, condition: y, yes: r, no: s },
         ) => a == b && x == y && p == r && q == s,
+        (Unary { dst: a, op: x, value: p }, Unary { dst: b, op: y, value: q }) => a == b && x == y
+            && p == q,
         (Convert { dst: a, op: x, value: p }, Convert { dst: b, op: y, value: q }) => a == b
             && x == y
             && p == q,

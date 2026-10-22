@@ -26,6 +26,7 @@ fn safe_to_fold(operation: ir::Operation, constants: Vec[Option[ir::Datum]]) -> 
 fn integer(constants: Vec[Option[ir::Datum]], value: ir::Value) -> Option[i64] {
     match constants[value.index()] {
         Option::Some(ir::Datum::I64(value)) => Option::Some(value),
+        Option::Some(ir::Datum::I32(value)) => Option::Some(value.to_i64()),
         _ => Option::None,
     }
 }
@@ -34,7 +35,16 @@ fn constant_integer(value: i64) -> Replacement {
     Replacement::Constant(ir::Datum::I64(value))
 }
 
+fn typed_integer(value: i64, narrow: bool) -> Replacement {
+    if narrow {
+        Replacement::Constant(ir::Datum::I32(value.to_i32()))
+    } else {
+        constant_integer(value)
+    }
+}
+
 fn fold_binary(
+    narrow: bool,
     op: ir::BinaryOp,
     left: ir::Value,
     right: ir::Value,
@@ -42,9 +52,9 @@ fn fold_binary(
 ) -> Replacement {
     let a = integer(constants, left);
     let b = integer(constants, right);
-    match (a, b) {
+    match (constants[left.index()], constants[right.index()]) {
         (Option::Some(x), Option::Some(y)) => {
-            return match ir::evaluate_binary(op, ir::Datum::I64(x), ir::Datum::I64(y)) {
+            return match ir::evaluate_binary(op, x, y) {
                 Ok(value) => Replacement::Constant(value),
                 Err(_) => Replacement::Keep,
             }
@@ -53,8 +63,8 @@ fn fold_binary(
     }
     if left == right {
         match op {
-            Sub | Xor => return constant_integer(0),
-            And | Or => return Replacement::Alias(left),
+            Sub | Xor => return typed_integer(0, narrow),
+            And | Or | Smin | Smax | Umin | Umax => return Replacement::Alias(left),
             _ => (),
         }
     }
@@ -67,7 +77,7 @@ fn fold_binary(
                 return Replacement::Alias(left)
             }
             if op == ir::BinaryOp::Or && (a == Option::Some(-1) || b == Option::Some(-1)) {
-                return constant_integer(-1)
+                return typed_integer(-1, narrow)
             }
         },
         Sub => {
@@ -77,7 +87,7 @@ fn fold_binary(
         },
         Mul => {
             if a == Option::Some(0) || b == Option::Some(0) {
-                return constant_integer(0)
+                return typed_integer(0, narrow)
             }
             if a == Option::Some(1) {
                 return Replacement::Alias(right)
@@ -88,7 +98,7 @@ fn fold_binary(
         },
         And => {
             if a == Option::Some(0) || b == Option::Some(0) {
-                return constant_integer(0)
+                return typed_integer(0, narrow)
             }
             if a == Option::Some(-1) {
                 return Replacement::Alias(right)
@@ -97,20 +107,54 @@ fn fold_binary(
                 return Replacement::Alias(left)
             }
         },
-        Shl | ShrU | ShrS => {
+        Shl | ShrU | ShrS | Rotl | Rotr => {
             if a == Option::Some(0) {
-                return constant_integer(0)
+                return typed_integer(0, narrow)
             }
-            if op == ir::BinaryOp::ShrS && a == Option::Some(-1) {
-                return constant_integer(-1)
+            if (op == ir::BinaryOp::ShrS || op == ir::BinaryOp::Rotl || op == ir::BinaryOp::Rotr)
+                && a == Option::Some(-1) {
+                return typed_integer(-1, narrow)
             }
             match b {
                 Option::Some(count) => {
-                    if (count.to_u64() & 63) == 0 {
+                    if (count.to_u64()
+                        & if narrow {
+                            31
+                        } else {
+                            63
+                        })
+                        == 0 {
                         return Replacement::Alias(left)
                     }
                 },
                 _ => (),
+            }
+        },
+        Smin | Smax | Umin | Umax => {
+            let minimum: i64 = if narrow {
+                -2147483648
+            } else {
+                -9223372036854775808
+            };
+            let maximum: i64 = if narrow {
+                2147483647
+            } else {
+                9223372036854775807
+            };
+            let (absorbing, identity) = match op {
+                Smin => (minimum, maximum),
+                Smax => (maximum, minimum),
+                Umin => (0, -1),
+                _ => (-1, 0),
+            };
+            if a == Option::Some(absorbing) || b == Option::Some(absorbing) {
+                return typed_integer(absorbing, narrow)
+            }
+            if a == Option::Some(identity) {
+                return Replacement::Alias(right)
+            }
+            if b == Option::Some(identity) {
+                return Replacement::Alias(left)
             }
         },
         DivS | DivU | RemS | RemU | ShlChecked | ShrUChecked | ShrSChecked => (),
@@ -122,12 +166,15 @@ fn fold(function: ir::Function, operation: ir::Operation, constants: Vec[Option[
     match operation {
         Constant(value) => Replacement::Constant(value),
         Call(_, _) | StackLoad(_) | StackStore(_, _) | FloatBinary(_, _, _) | FloatCompare(_, _, _) => Replacement::Keep,
-        Convert(conversion, value) => fold_conversion(conversion, constants[value.index()]),
-        Binary(op, left, right) => if is_i32(function, left) {
-            fold_i32(op, left, right, constants)
-        } else {
-            fold_binary(op, left, right, constants)
+        Unary(op, value) => match constants[value.index()] {
+            Option::Some(input) => match ir::evaluate_unary(op, input) {
+                Result::Ok(output) => Replacement::Constant(output),
+                Result::Err(_) => Replacement::Keep,
+            },
+            Option::None => Replacement::Keep,
         },
+        Convert(conversion, value) => fold_conversion(conversion, constants[value.index()]),
+        Binary(op, left, right) => fold_binary(is_i32(function, left), op, left, right, constants),
         Compare(cc, left, right) => {
             if is_i32(function, left) {
                 return fold_compare_i32(cc, left, right, constants)
@@ -198,26 +245,6 @@ fn fold_conversion(conversion: ir::IntConversion, value: Option[ir::Datum]) -> R
     }
 }
 
-fn fold_i32(op: ir::BinaryOp, left: ir::Value, right: ir::Value, constants: Vec[Option[ir::Datum]]) -> Replacement {
-    match (constants[left.index()], constants[right.index()]) {
-        (Option::Some(ir::Datum::I32(a)), Option::Some(ir::Datum::I32(b))) => {
-            match ir::evaluate_binary(op, ir::Datum::I32(a), ir::Datum::I32(b)) {
-                Ok(value) => Replacement::Constant(value),
-                Err(_) => Replacement::Keep,
-            }
-        },
-        _ => if left == right {
-            match op {
-                Sub | Xor => Replacement::Constant(ir::Datum::I32(0)),
-                And | Or => Replacement::Alias(left),
-                _ => Replacement::Keep,
-            }
-        } else {
-            Replacement::Keep
-        },
-    }
-}
-
 fn fold_compare_i32(
     cc: ir::IntCC,
     left: ir::Value,
@@ -237,7 +264,18 @@ fn fold_compare_i32(
                 },
             ),
         ),
-        _ => Replacement::Keep,
+        _ => if left == right {
+            Replacement::Constant(
+                ir::Datum::Bool(
+                    match cc {
+                        Equal | SignedLessEqual | UnsignedLessEqual => true,
+                        _ => false,
+                    },
+                ),
+            )
+        } else {
+            Replacement::Keep
+        },
     }
 }
 

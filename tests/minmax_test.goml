@@ -1,0 +1,184 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use ecosystem::goir::reader;
+use std::testing;
+
+#[test]
+fn minmax_roundtrip_interpret_and_constant_fold() -> () {
+    for ty in Vec::from_array([ir::Type::I32, ir::Type::I64]) {
+        let minimum: i64 = if ty == ir::Type::I32 {
+            -2147483648
+        } else {
+            -9223372036854775808
+        };
+        let maximum: i64 = if ty == ir::Type::I32 {
+            2147483647
+        } else {
+            9223372036854775807
+        };
+        for (a, b, sm, sx, um, ux) in Vec::from_array(
+            [
+                (-1, 1, -1, 1, 1, -1),
+                (minimum, maximum, minimum, maximum, maximum, minimum),
+                (0, -1, -1, 0, 0, -1),
+                (-17, -2, -17, -2, -17, -2),
+                (17, 17, 17, 17, 17, 17),
+            ],
+        ) {
+            for (op, expected) in Vec::from_array(
+                [
+                    (ir::BinaryOp::Smin, sm),
+                    (ir::BinaryOp::Smax, sx),
+                    (ir::BinaryOp::Umin, um),
+                    (ir::BinaryOp::Umax, ux),
+                ],
+            ) {
+                let function = scalar_pair("Minmax", ty, op);
+                let text = testing::expect_ok(ir::display(function), "display");
+                let parsed = testing::expect_ok(reader::read(text), "read minmax");
+                testing::assert_eq(testing::expect_ok(ir::display(parsed), "redisplay"), text);
+                for (left, right) in Vec::from_array([(a, b), (b, a)]) {
+                    let args = Vec::from_array(
+                        [ir::datum_from_bits(ty, left), ir::datum_from_bits(ty, right)],
+                    );
+                    testing::assert_eq(
+                        testing::expect_ok(ir::interpret(parsed, args, 100), "interpret")[0].bits(),
+                        expected,
+                    );
+                    let builder = testing::expect_ok(
+                        ir::Builder::new("Constant", Vec::new(), Vec::from_array([ty])),
+                        "builder",
+                    );
+                    let x = testing::expect_ok(
+                        builder.ins(ir::Operation::Constant(args[0])),
+                        "left",
+                    );
+                    let y = testing::expect_ok(
+                        builder.ins(ir::Operation::Constant(args[1])),
+                        "right",
+                    );
+                    let out = testing::expect_ok(builder.binary(op, x, y), "minmax");
+                    testing::assert_ok(builder.ret(Vec::from_array([out])));
+                    let folded = testing::expect_ok(
+                        opt::simplify(testing::expect_ok(builder.finish(), "finish")),
+                        "simplify",
+                    );
+                    testing::assert_eq(folded.blocks()[0].instructions.len(), 1);
+                    testing::assert_eq(
+                        testing::expect_ok(ir::interpret(folded, Vec::new(), 100), "folded")[0].bits(),
+                        expected,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn minmax_identities_and_type_errors() -> () {
+    for ty in Vec::from_array([ir::Type::I32, ir::Type::I64]) {
+        let minimum: i64 = if ty == ir::Type::I32 {
+            -2147483648
+        } else {
+            -9223372036854775808
+        };
+        let maximum: i64 = if ty == ir::Type::I32 {
+            2147483647
+        } else {
+            9223372036854775807
+        };
+        for (op, absorbing, identity) in Vec::from_array(
+            [
+                (ir::BinaryOp::Smin, minimum, maximum),
+                (ir::BinaryOp::Smax, maximum, minimum),
+                (ir::BinaryOp::Umin, 0, -1),
+                (ir::BinaryOp::Umax, -1, 0),
+            ],
+        ) {
+            for mode in 0..5 {
+                let b = testing::expect_ok(
+                    ir::Builder::new("Identity", Vec::from_array([ty]), Vec::from_array([ty])),
+                    "builder",
+                );
+                let x = testing::expect_ok(b.parameters(b.entry()), "params")[0];
+                let c = testing::expect_ok(
+                    b.ins(
+                        ir::Operation::Constant(
+                            ir::datum_from_bits(
+                                ty,
+                                if mode < 2 {
+                                    absorbing
+                                } else {
+                                    identity
+                                },
+                            ),
+                        ),
+                    ),
+                    "constant",
+                );
+                let left = if mode == 0 || mode == 2 {
+                    c
+                } else {
+                    x
+                };
+                let right = if mode == 1 || mode == 3 {
+                    c
+                } else {
+                    x
+                };
+                let value = testing::expect_ok(b.binary(op, left, right), "minmax");
+                testing::assert_ok(b.ret(Vec::from_array([value])));
+                let folded = testing::expect_ok(
+                    opt::simplify(testing::expect_ok(b.finish(), "finish")),
+                    "simplify",
+                );
+                testing::assert_eq(
+                    folded.blocks()[0].instructions.len(),
+                    if mode < 2 {
+                        1
+                    } else {
+                        0
+                    },
+                );
+                for input in Vec::from_array([minimum, -1, 0, 17, maximum]) {
+                    testing::assert_eq(
+                        testing::expect_ok(
+                            ir::interpret(
+                                folded,
+                                Vec::from_array([ir::datum_from_bits(ty, input)]),
+                                100,
+                            ),
+                            "interpret",
+                        )[0].bits(),
+                        if mode < 2 {
+                            absorbing
+                        } else {
+                            input
+                        },
+                    );
+                }
+                for (lhs, rhs) in Vec::from_array(
+                    [
+                        (ir::Datum::F64(1.0), ir::Datum::F64(2.0)),
+                        (ir::Datum::Bool(true), ir::Datum::Bool(false)),
+                        (ir::Datum::I32(1), ir::Datum::I64(1)),
+                    ],
+                ) {
+                    testing::assert_err(ir::evaluate_binary(op, lhs, rhs));
+                    let bad = testing::expect_ok(
+                        ir::Builder::new("Bad", Vec::new(), Vec::new()),
+                        "bad builder",
+                    );
+                    let l = testing::expect_ok(bad.ins(ir::Operation::Constant(lhs)), "lhs");
+                    let r = testing::expect_ok(bad.ins(ir::Operation::Constant(rhs)), "rhs");
+                    testing::assert_eq(
+                        testing::expect_err(bad.binary(op, l, r), "invalid").kind,
+                        ir::ErrorKind::TypeMismatch,
+                    );
+                }
+            }
+        }
+    }
+}

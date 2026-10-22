@@ -178,6 +178,10 @@ impl Builder {
         self.ins(Operation::FloatCompare(cc, left, right))
     }
 
+    pub fn unary(self: Builder, op: UnaryOp, value: Value) -> Result[Value, Error] {
+        self.ins(Operation::Unary(op, value))
+    }
+
     pub fn convert(self: Builder, conversion: IntConversion, value: Value) -> Result[Value, Error] {
         self.ins(Operation::Convert(conversion, value))
     }

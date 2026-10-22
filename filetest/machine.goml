@@ -19,6 +19,7 @@ fn machine_text(instruction: mach::Instruction) -> string {
         FloatBinary { dst, op, left, right } => f"{dst.debug()} = {op.name()} {left.debug()}, {right.debug()}",
         FloatCompare { dst, cc, left, right } => f"{dst.debug()} = fcmp {cc.name()} {left.debug()}, {right.debug()}",
         FloatSelect { dst, condition, yes, no } => f"{dst.debug()} = float_select {condition.debug()}, {yes.debug()}, {no.debug()}",
+        Unary { dst, op, value } => f"{dst.debug()} = {op.name()} {value.debug()}",
         Convert { dst, op, value } => f"{dst.debug()} = {op.name()} {value.debug()}",
         StackLoad { dst, slot } => f"{dst.debug()} = stack_load slot{slot.index()}",
         StackStore { slot, value } => f"stack_store slot{slot.index()}, {value.debug()}",

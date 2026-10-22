@@ -156,6 +156,11 @@ pub enum Instruction {
         yes: Reg,
         no: Reg,
     },
+    Unary {
+        dst: Reg,
+        op: ir::UnaryOp,
+        value: Reg,
+    },
     Convert {
         dst: Reg,
         op: ir::IntConversion,
@@ -188,9 +193,10 @@ impl Instruction {
             } | Lea { dst, .. } | Compare { dst, .. } | Select { dst, .. } | FloatBinary { dst, .. } | FloatCompare {
                 dst,
                 ..,
-            } | FloatSelect { dst, .. } | Convert { dst, .. } | StackLoad { dst, .. } => Vec::from_array(
-                [dst],
-            ),
+            } | FloatSelect { dst, .. } | Unary { dst, .. } | Convert { dst, .. } | StackLoad {
+                dst,
+                ..,
+            } => Vec::from_array([dst]),
             StackStore { .. } => Vec::new(),
             Call { results, .. } => copy_vec(results),
         }
@@ -211,7 +217,8 @@ impl Instruction {
                 [
                     Constraint::Register,
                     match op {
-                        Shl | ShrU | ShrS => Constraint::Fixed(FixedReg::CX),
+                        Shl | ShrU | ShrS | Rotl | Rotr => Constraint::Fixed(FixedReg::CX),
+                        Smin | Smax | Umin | Umax => Constraint::Fixed(FixedReg::CX),
                         _ => Constraint::Any,
                     },
                 ],
@@ -229,6 +236,7 @@ impl Instruction {
             FloatSelect { .. } => Vec::from_array(
                 [Constraint::Any, Constraint::Fixed(FixedReg::X0), Constraint::Fixed(FixedReg::X1)],
             ),
+            Unary { .. } => Vec::from_array([Constraint::Fixed(FixedReg::AX)]),
             Convert { .. } | StackStore { .. } => Vec::from_array([Constraint::Any]),
             Call { .. } => {
                 let constraints = Vec::new();
@@ -260,7 +268,7 @@ impl Instruction {
                     FixedReg::AX
                 },
             ),
-            Compare { .. } | FloatCompare { .. } => Constraint::Fixed(FixedReg::AX),
+            Unary { .. } | Compare { .. } | FloatCompare { .. } => Constraint::Fixed(FixedReg::AX),
             Select { .. } => Constraint::Reuse(1),
             FloatSelect { .. } => Constraint::Fixed(FixedReg::X0),
             Call { .. } => Constraint::Any,
@@ -277,6 +285,9 @@ impl Instruction {
     pub fn clobbers(self: Instruction) -> Vec[Clobber] {
         match self {
             Immediate { .. } | Lea { .. } | StackLoad { .. } | Convert { .. } => Vec::new(),
+            Unary { .. } => Vec::from_array(
+                [Clobber::Flags, Clobber::Fixed(FixedReg::CX), Clobber::Fixed(FixedReg::DX)],
+            ),
             StackStore { .. } => Vec::from_array([Clobber::Fixed(FixedReg::AX)]),
             FloatImmediate { .. } => Vec::from_array([Clobber::Fixed(FixedReg::AX)]),
             FloatBinary { .. } | FloatBinaryStack { .. } => Vec::new(),
@@ -323,9 +334,10 @@ impl Instruction {
             BinaryImmediate { left, .. } | BinaryStack { left, .. } | FloatBinaryStack { left, .. } => Vec::from_array(
                 [left],
             ),
-            Lea { value, .. } | Convert { value, .. } | StackStore { value, .. } => Vec::from_array(
-                [value],
-            ),
+            Unary { value, .. } | Lea { value, .. } | Convert { value, .. } | StackStore {
+                value,
+                ..,
+            } => Vec::from_array([value]),
             Select { condition, yes, no, .. } | FloatSelect { condition, yes, no, .. } => Vec::from_array(
                 [condition, yes, no],
             ),

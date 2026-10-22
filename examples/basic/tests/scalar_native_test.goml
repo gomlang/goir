@@ -60,6 +60,136 @@ fn native_fold_function(name: string, ty: ir::Type) -> ir::Function {
     testing::expect_ok(b.finish(), "fold function")
 }
 
+fn native_identity_i32() -> ir::Function {
+    let b = testing::expect_ok(
+        ir::Builder::new(
+            "Identity32",
+            Vec::from_array([ir::Type::I32]),
+            Vec::from_array([ir::Type::I32, ir::Type::I32, ir::Type::I32]),
+        ),
+        "identity builder",
+    );
+    let input = testing::expect_ok(b.parameters(b.entry()), "input")[0];
+    let zero = testing::expect_ok(b.i32const(0), "zero");
+    let one = testing::expect_ok(b.i32const(1), "one");
+    let mask = testing::expect_ok(b.i32const(-1), "mask");
+    let negative_width = testing::expect_ok(b.i32const(-32), "negative width");
+    let mut value = input;
+    for (op, constant) in Vec::from_array(
+        [
+            (ir::BinaryOp::Add, zero),
+            (ir::BinaryOp::Sub, zero),
+            (ir::BinaryOp::Mul, one),
+            (ir::BinaryOp::And, mask),
+            (ir::BinaryOp::Or, zero),
+            (ir::BinaryOp::Xor, zero),
+            (ir::BinaryOp::Shl, negative_width),
+            (ir::BinaryOp::ShrU, negative_width),
+            (ir::BinaryOp::ShrS, negative_width),
+        ],
+    ) {
+        value = testing::expect_ok(b.binary(op, value, constant), "identity");
+    }
+    let equal = testing::expect_ok(
+        b.icmp(ir::IntCC::UnsignedLessEqual, input, input),
+        "self comparison",
+    );
+    value = testing::expect_ok(b.select(equal, value, zero), "select");
+    let erased = testing::expect_ok(b.binary(ir::BinaryOp::Mul, input, zero), "zero multiply");
+    let ones = testing::expect_ok(b.binary(ir::BinaryOp::Or, input, mask), "all ones");
+    testing::assert_ok(b.ret(Vec::from_array([value, erased, ones])));
+    testing::expect_ok(b.finish(), "identity function")
+}
+
+fn native_rotate_function(name: string, ty: ir::Type) -> ir::Function {
+    let b = testing::expect_ok(
+        ir::Builder::new(name, Vec::from_array([ty, ty]), Vec::from_array([ty, ty, ty, ty, ty, ty])),
+        "rotate builder",
+    );
+    let p = testing::expect_ok(b.parameters(b.entry()), "parameters");
+    let constant = testing::expect_ok(
+        b.ins(ir::Operation::Constant(ir::datum_from_bits(ty, -1))),
+        "count",
+    );
+    let value = testing::expect_ok(
+        b.ins(ir::Operation::Constant(ir::datum_from_bits(ty, 1))),
+        "value",
+    );
+    let out = Vec::new();
+    for op in Vec::from_array([ir::BinaryOp::Rotl, ir::BinaryOp::Rotr]) {
+        out.push(testing::expect_ok(b.binary(op, p[0], p[1]), "variable rotate"));
+        out.push(testing::expect_ok(b.binary(op, p[0], constant), "immediate rotate"));
+        out.push(testing::expect_ok(b.binary(op, value, constant), "constant rotate"));
+    }
+    testing::assert_ok(b.ret(out));
+    testing::expect_ok(b.finish(), "rotate function")
+}
+
+fn native_bitcount_function(name: string, ty: ir::Type) -> ir::Function {
+    let b = testing::expect_ok(
+        ir::Builder::new(name, Vec::from_array([ty]), Vec::from_array([ty, ty, ty, ty, ty, ty, ty])),
+        "count builder",
+    );
+    let input = testing::expect_ok(b.parameters(b.entry()), "parameters")[0];
+    let zero = testing::expect_ok(
+        b.ins(ir::Operation::Constant(ir::datum_from_bits(ty, 0))),
+        "zero",
+    );
+    let out = Vec::new();
+    for op in Vec::from_array([ir::UnaryOp::Clz, ir::UnaryOp::Ctz, ir::UnaryOp::Popcnt]) {
+        out.push(testing::expect_ok(b.unary(op, input), "variable count"));
+        out.push(testing::expect_ok(b.unary(op, zero), "constant count"));
+    }
+    out.push(input);
+    testing::assert_ok(b.ret(out));
+    testing::expect_ok(b.finish(), "count function")
+}
+
+fn native_bswap_function(name: string, ty: ir::Type) -> ir::Function {
+    let b = testing::expect_ok(
+        ir::Builder::new(name, Vec::from_array([ty]), Vec::from_array([ty, ty, ty, ty])),
+        "bswap builder",
+    );
+    let input = testing::expect_ok(b.parameters(b.entry()), "parameters")[0];
+    let constant = testing::expect_ok(
+        b.ins(ir::Operation::Constant(ir::datum_from_bits(ty, 128))),
+        "constant",
+    );
+    let swapped = testing::expect_ok(b.unary(ir::UnaryOp::Bswap, input), "bswap");
+    let twice = testing::expect_ok(b.unary(ir::UnaryOp::Bswap, swapped), "bswap twice");
+    let folded = testing::expect_ok(b.unary(ir::UnaryOp::Bswap, constant), "constant bswap");
+    testing::assert_ok(b.ret(Vec::from_array([swapped, twice, folded, input])));
+    testing::expect_ok(b.finish(), "bswap function")
+}
+
+fn native_minmax_function(name: string, ty: ir::Type) -> ir::Function {
+    let outputs = Vec::new();
+    for _ in 0..14 {
+        outputs.push(ty);
+    }
+    let b = testing::expect_ok(
+        ir::Builder::new(name, Vec::from_array([ty, ty]), outputs),
+        "minmax builder",
+    );
+    let p = testing::expect_ok(b.parameters(b.entry()), "parameters");
+    let constant = testing::expect_ok(
+        b.ins(ir::Operation::Constant(ir::datum_from_bits(ty, 17))),
+        "constant",
+    );
+    let out = Vec::new();
+    for op in Vec::from_array(
+        [ir::BinaryOp::Smin, ir::BinaryOp::Smax, ir::BinaryOp::Umin, ir::BinaryOp::Umax],
+    ) {
+        out.push(testing::expect_ok(b.binary(op, p[0], p[1]), "variable minmax"));
+        out.push(testing::expect_ok(b.binary(op, p[0], constant), "constant right minmax"));
+        out.push(testing::expect_ok(b.binary(op, constant, p[0]), "constant left minmax"));
+    }
+    out.push(p[0]);
+    out.push(p[1]);
+    testing::assert_ok(b.ret(out));
+    testing::expect_ok(b.finish(), "minmax function")
+}
+
 #[test]
 fn native_division_checked_shifts_and_folded_loads_match_go_reference() -> () {
     let directory = path::join(
@@ -69,6 +199,15 @@ fn native_division_checked_shifts_and_folded_loads_match_go_reference() -> () {
     testing::assert_ok(fs::create_dir_all(directory));
     let source = Vec::from_array(
         [
+            native_identity_i32(),
+            native_bswap_function("Bswap32", ir::Type::I32),
+            native_bswap_function("Bswap64", ir::Type::I64),
+            native_minmax_function("Minmax32", ir::Type::I32),
+            native_minmax_function("Minmax64", ir::Type::I64),
+            native_bitcount_function("Count32", ir::Type::I32),
+            native_bitcount_function("Count64", ir::Type::I64),
+            native_rotate_function("Rotate32", ir::Type::I32),
+            native_rotate_function("Rotate64", ir::Type::I64),
             native_scalar_function("Div64", ir::Type::I64, false),
             native_scalar_function("Div32", ir::Type::I32, false),
             native_scalar_function("Shift64", ir::Type::I64, true),

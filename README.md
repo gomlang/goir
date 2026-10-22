@@ -57,7 +57,7 @@ registry dependencies track the repository default branch. Sources use `.goml`.
 | Types | `Type::I64`, `Type::I32`, `Type::F64`, `Type::Bool` |
 | Handles | Function-specific `Value`, `Block` and `StackSlot`, with `index()` |
 | Constants | `iconst`, `i32const`, `fconst`, `bconst`, `Operation::Constant` |
-| Integer operations | `Add`, `Sub`, `Mul`, `And`, `Or`, `Xor`, masked `Shl`/`ShrU`/`ShrS`, checked `ShlChecked`/`ShrUChecked`/`ShrSChecked`, `DivS`/`DivU`/`RemS`/`RemU` |
+| Integer operations | `Add`, `Sub`, `Mul`, `And`, `Or`, `Xor`, masked `Shl`/`ShrU`/`ShrS`, rotations `Rotl`/`Rotr`, checked `ShlChecked`/`ShrUChecked`/`ShrSChecked`, `DivS`/`DivU`/`RemS`/`RemU` |
 | Integer comparisons | `icmp`: `Equal`, `NotEqual`, signed and unsigned less-than/less-or-equal |
 | Integer conversions | `convert`: `IntConversion::SignExtend`, `ZeroExtend`, `Truncate` |
 | Floating-point operations | `fbinary`: `FloatOp::Add`, `Sub`, `Mul`, `Div`; `fcmp`: `FloatCC::Equal`, `NotEqual`, `Less`, `LessEqual` |
@@ -125,6 +125,41 @@ negative counts; Go source shifts need explicit masking to match. `ShrS`
 sign-extends and `ShrU` zero-extends. Unsigned comparisons reinterpret the
 operands' bit patterns. `SignExtend` and `ZeroExtend` convert `I32` to `I64`;
 `Truncate` keeps the low 32 bits of an `I64`.
+
+`UnaryOp::Bswap` reverses the byte order of I32 or I64 values, preserving the
+integer type (text opcode `bswap`). It supports interpretation, constant folding,
+and both amd64 backends using BSWAPL/BSWAPQ. Native differential tests compare
+with Go [math/bits.ReverseBytes32/64](https://pkg.go.dev/math/bits#ReverseBytes32)
+under normal, constrained, zero-register, and linear-scan allocation.
+
+`UnaryOp::{Clz, Ctz, Popcnt}` and `Builder.unary` count leading zeros,
+trailing zeros, and set bits in `I32`/`I64` values, returning the same integer
+width. `Clz` and `Ctz` return 32 or 64 for zero; `Popcnt` returns zero.
+The text opcodes are `clz`, `ctz`, and `popcnt`. Interpretation and constant
+folding use GoML's `std::math::bits`. The amd64 backends use baseline
+BSR/BSF with explicit zero handling and a branch-free SWAR population count;
+POPCNT/LZCNT CPU extensions are not required. Native tests compare Go
+`math/bits` across both widths, every single-bit position, complements,
+deterministic random values, and all allocator/backend configurations.
+
+`BinaryOp::{Smin, Smax, Umin, Umax}` select the signed/unsigned minimum or
+maximum of two matching `I32`/`I64` operands. Unsigned operations compare bit
+patterns, so `Umin(-1, 1)` is `1`; signed `Smin(-1, 1)` is `-1`.
+The text opcodes are `smin`, `smax`, `umin`, and `umax`, following
+[Cranelift integer min/max semantics](https://docs.rs/cranelift-codegen/latest/cranelift_codegen/ir/trait.InstBuilder.html#method.smin).
+Both amd64 backends use width-specific CMP/CMOV instructions without additional
+CPU extensions. Constant inputs, identical operands, and signed/unsigned extrema
+simplify. Native Go `min`/`max` oracles exercise boundary and deterministic random
+pairs, constant operands on either side, live input preservation, and all seven
+backend/allocator configurations.
+
+`Rotl` and `Rotr` rotate all bits left/right, using the same masked counts as
+shifts. Zero and whole-width counts preserve the input; negative counts rotate
+in the opposite direction. Text IR spells these operations `irotl` and `irotr`.
+Both native backends use width-specific ROL/ROR instructions, including immediate
+counts. Constant rotations, zero/all-one inputs and whole-width counts simplify.
+The native suite compares both widths with Go `math/bits.RotateLeft32/64` across
+both backends, optimized code and constrained/fully spilled register allocation.
 
 `DivS` and `RemS` use signed truncation toward zero; `DivU` and `RemU`
 reinterpret both operands as unsigned bit patterns. Division by zero returns
@@ -215,7 +250,9 @@ algebraic identities, folds constant or identical branches, and removes
 unreachable blocks, unused instructions and unused non-entry block parameters.
 Dead parameter cycles are removed by tracing dependencies from returned values
 and branch conditions, including dependencies carried by control-flow edges.
-Folding respects wrapping arithmetic and masked shift counts. Control-flow
+Integer identities and reflexive comparisons apply to both `I32` and `I64`.
+Folding preserves the result width and respects wrapping arithmetic and each
+width's masked shift counts; checked shifts retain their separate trap semantics. Control-flow
 cleanup repeats while the number of values, blocks or branches decreases.
 Block storage order need not follow dominance order.
 
@@ -539,8 +576,10 @@ checked as NaN; other arithmetic results are checked by bits. Separate tests
 exercise mixed floating-point calls and runtime-boundary probes.
 
 The scalar extension suite checks signed/unsigned division and remainder,
-checked shifts, exceptional paths and private-load folding against an independent
-Go implementation in seven configurations. The allocator comparison checks
+checked shifts, exceptional paths, I32 identity chains and private-load folding
+against an independent Go implementation in seven configurations. Identity
+regressions also check typed zero/all-one constants, reflexive comparisons,
+masked negative counts and preservation of dead arithmetic traps. The allocator comparison checks
 I64/F64 hot/cold pressure with both algorithms and 0/1/7 pool registers. Its
 seven-register fixtures reduced heuristic weighted spill traffic from 293 to 50
 and 243 to 15; one-register traffic can increase, and compile-time cost is reported

@@ -1,0 +1,90 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use ecosystem::goir::reader;
+use std::testing;
+
+#[test]
+fn bswap_preserves_width_and_roundtrip_fold() -> () {
+    for ty in Vec::from_array([ir::Type::I32, ir::Type::I64]) {
+        let cases = if ty == ir::Type::I32 {
+            Vec::from_array(
+                [
+                    (0, 0),
+                    (-1, -1),
+                    (1, 16777216),
+                    (128, -2147483648),
+                    (-2147483648, 128),
+                    (305419896, 2018915346),
+                    (2147483647, -129),
+                ],
+            )
+        } else {
+            Vec::from_array(
+                [
+                    (0, 0),
+                    (-1, -1),
+                    (1, 72057594037927936),
+                    (128, -9223372036854775808),
+                    (-9223372036854775808, 128),
+                    (81985529216486895, -1167088121787636991),
+                    (9223372036854775807, -129),
+                ],
+            )
+        };
+        for (input, expected) in cases {
+            let op = ir::UnaryOp::Bswap;
+            let datum = ir::datum_from_bits(ty, input);
+            testing::assert_eq(
+                testing::expect_ok(ir::evaluate_unary(op, datum), "evaluate").bits(),
+                expected,
+            );
+            for constant in Vec::from_array([false, true]) {
+                let b = testing::expect_ok(
+                    ir::Builder::new(
+                        "Swap",
+                        if constant {
+                            Vec::new()
+                        } else {
+                            Vec::from_array([ty])
+                        },
+                        Vec::from_array([ty]),
+                    ),
+                    "builder",
+                );
+                let input = if constant {
+                    testing::expect_ok(b.ins(ir::Operation::Constant(datum)), "constant")
+                } else {
+                    testing::expect_ok(b.parameters(b.entry()), "parameters")[0]
+                };
+                let result = testing::expect_ok(b.unary(op, input), "byte swap");
+                testing::assert_ok(b.ret(Vec::from_array([result])));
+                let f = testing::expect_ok(b.finish(), "function");
+                let text = testing::expect_ok(ir::display(f), "display");
+                let parsed = testing::expect_ok(reader::read(text), "parse");
+                testing::assert_eq(testing::expect_ok(ir::display(parsed), "redisplay"), text);
+                let optimized = testing::expect_ok(opt::simplify(parsed), "simplify");
+                if constant {
+                    testing::assert_eq(optimized.blocks()[0].instructions.len(), 1);
+                    match optimized.blocks()[0].instructions[0].operation {
+                        Constant(value) => testing::assert_eq(
+                            value,
+                            ir::datum_from_bits(ty, expected),
+                        ),
+                        _ => testing::assert(false),
+                    }
+                }
+                let args = if constant {
+                    Vec::new()
+                } else {
+                    Vec::from_array([datum])
+                };
+                testing::assert_eq(
+                    testing::expect_ok(ir::interpret(optimized, args, 100), "interpret")[0],
+                    ir::datum_from_bits(ty, expected),
+                );
+            }
+        }
+    }
+}

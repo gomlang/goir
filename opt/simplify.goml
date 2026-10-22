@@ -53,6 +53,7 @@ fn resolve_operation(operation: ir::Operation, aliases: Vec[Option[ir::Value]], 
         StackStore(slot, value) => Result::Ok(
             ir::Operation::StackStore(slot, resolve(value, aliases, budget)?),
         ),
+        Unary(op, value) => Result::Ok(ir::Operation::Unary(op, resolve(value, aliases, budget)?)),
         Convert(conversion, value) => Result::Ok(
             ir::Operation::Convert(conversion, resolve(value, aliases, budget)?),
         ),

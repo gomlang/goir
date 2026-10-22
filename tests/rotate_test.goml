@@ -1,0 +1,87 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use ecosystem::goir::reader;
+use std::testing;
+
+#[test]
+fn rotations_mask_counts_roundtrip_and_fold_at_each_width() -> () {
+    for ty in Vec::from_array([ir::Type::I32, ir::Type::I64]) {
+        let width: i64 = if ty == ir::Type::I32 {
+            32
+        } else {
+            64
+        };
+        let minimum: i64 = if ty == ir::Type::I32 {
+            -2147483648
+        } else {
+            -9223372036854775808
+        };
+        for (op, value, count, expected) in Vec::from_array(
+            [
+                (ir::BinaryOp::Rotl, 1, -1, minimum),
+                (ir::BinaryOp::Rotl, 123, minimum, 123),
+                (ir::BinaryOp::Rotr, 123, minimum, 123),
+                (ir::BinaryOp::Rotr, minimum, -1, 1),
+                (ir::BinaryOp::Rotl, minimum, 1, 1),
+                (ir::BinaryOp::Rotr, 1, 1, minimum),
+                (ir::BinaryOp::Rotl, 123, width, 123),
+                (ir::BinaryOp::Rotr, 123, -width, 123),
+                (ir::BinaryOp::Rotl, 123, 0, 123),
+                (ir::BinaryOp::Rotr, -1, width + 3, -1),
+                (ir::BinaryOp::Rotl, 1, width + 1, 2),
+                (ir::BinaryOp::Rotr, 2, width + 1, 1),
+            ],
+        ) {
+            let function = scalar_pair("Rotate", ty, op);
+            let text = testing::expect_ok(ir::display(function), "display");
+            let parsed = testing::expect_ok(reader::read(text), "read rotation");
+            testing::assert_eq(testing::expect_ok(ir::display(parsed), "redisplay"), text);
+            let args = Vec::from_array(
+                [ir::datum_from_bits(ty, value), ir::datum_from_bits(ty, count)],
+            );
+            testing::assert_eq(
+                testing::expect_ok(ir::interpret(parsed, args, 100), "rotate")[0].bits(),
+                expected,
+            );
+            let b = testing::expect_ok(
+                ir::Builder::new("ConstantRotate", Vec::new(), Vec::from_array([ty])),
+                "builder",
+            );
+            let x = testing::expect_ok(b.ins(ir::Operation::Constant(args[0])), "value");
+            let n = testing::expect_ok(b.ins(ir::Operation::Constant(args[1])), "count");
+            let out = testing::expect_ok(b.binary(op, x, n), "rotation");
+            testing::assert_ok(b.ret(Vec::from_array([out])));
+            let folded = testing::expect_ok(
+                opt::simplify(testing::expect_ok(b.finish(), "finish")),
+                "fold",
+            );
+            testing::assert_eq(folded.blocks()[0].instructions.len(), 1);
+            testing::assert_eq(
+                testing::expect_ok(ir::interpret(folded, Vec::new(), 100), "folded rotate")[0].bits(),
+                expected,
+            );
+        }
+    }
+}
+
+#[test]
+fn rotations_reject_noninteger_and_mixed_width_operands() -> () {
+    let b = testing::expect_ok(ir::Builder::new("InvalidRotate", Vec::new(), Vec::new()), "builder");
+    let f = testing::expect_ok(b.fconst(1.0), "float");
+    let boolean = testing::expect_ok(b.bconst(true), "bool");
+    let narrow = testing::expect_ok(b.i32const(1), "i32");
+    let wide = testing::expect_ok(b.iconst(1), "i64");
+    for op in Vec::from_array([ir::BinaryOp::Rotl, ir::BinaryOp::Rotr]) {
+        for (left, right) in Vec::from_array(
+            [(f, f), (boolean, boolean), (narrow, wide), (wide, narrow)],
+        ) {
+            testing::assert_eq(
+                testing::expect_err(b.binary(op, left, right), "invalid rotate").kind,
+                ir::ErrorKind::TypeMismatch,
+            );
+        }
+        testing::assert_err(b.checked_shift(op, wide, wide));
+    }
+}

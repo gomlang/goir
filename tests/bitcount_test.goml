@@ -1,0 +1,115 @@
+package tests;
+
+use ecosystem::goir as ir;
+use ecosystem::goir::opt;
+use ecosystem::goir::reader;
+use std::testing;
+
+#[test]
+fn bitcounts_define_zero_width_and_roundtrip_fold() -> () {
+    for ty in Vec::from_array([ir::Type::I32, ir::Type::I64]) {
+        let width: i64 = if ty == ir::Type::I32 {
+            32
+        } else {
+            64
+        };
+        let minimum: i64 = if ty == ir::Type::I32 {
+            -2147483648
+        } else {
+            -9223372036854775808
+        };
+        for (input, leading, trailing, population) in Vec::from_array(
+            [
+                (0, width, width, 0),
+                (1, width - 1, 0, 1),
+                (-1, 0, 0, width),
+                (8, width - 4, 3, 1),
+                (minimum, 0, width - 1, 1),
+                (minimum + 1, 0, 0, 2),
+                (-2, 0, 1, width - 1),
+            ],
+        ) {
+            for (op, expected) in Vec::from_array(
+                [
+                    (ir::UnaryOp::Clz, leading),
+                    (ir::UnaryOp::Ctz, trailing),
+                    (ir::UnaryOp::Popcnt, population),
+                ],
+            ) {
+                let datum = ir::datum_from_bits(ty, input);
+                testing::assert_eq(
+                    testing::expect_ok(ir::evaluate_unary(op, datum), "evaluate").bits(),
+                    expected,
+                );
+                for constant in Vec::from_array([false, true]) {
+                    let b = testing::expect_ok(
+                        ir::Builder::new(
+                            "Count",
+                            if constant {
+                                Vec::new()
+                            } else {
+                                Vec::from_array([ty])
+                            },
+                            Vec::from_array([ty]),
+                        ),
+                        "builder",
+                    );
+                    let input = if constant {
+                        testing::expect_ok(b.ins(ir::Operation::Constant(datum)), "constant")
+                    } else {
+                        testing::expect_ok(b.parameters(b.entry()), "parameters")[0]
+                    };
+                    let result = testing::expect_ok(b.unary(op, input), "count");
+                    testing::assert_ok(b.ret(Vec::from_array([result])));
+                    let f = testing::expect_ok(b.finish(), "function");
+                    let text = testing::expect_ok(ir::display(f), "display");
+                    let parsed = testing::expect_ok(reader::read(text), "parse");
+                    testing::assert_eq(testing::expect_ok(ir::display(parsed), "redisplay"), text);
+                    let optimized = testing::expect_ok(opt::simplify(parsed), "simplify");
+                    if constant {
+                        testing::assert_eq(optimized.blocks()[0].instructions.len(), 1);
+                        match optimized.blocks()[0].instructions[0].operation {
+                            Constant(value) => testing::assert_eq(
+                                value,
+                                ir::datum_from_bits(ty, expected),
+                            ),
+                            _ => testing::assert(false),
+                        }
+                    }
+                    let args = if constant {
+                        Vec::new()
+                    } else {
+                        Vec::from_array([datum])
+                    };
+                    testing::assert_eq(
+                        testing::expect_ok(ir::interpret(optimized, args, 100), "interpret")[0],
+                        ir::datum_from_bits(ty, expected),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn bitcounts_reject_nonintegers_and_foreign_values() -> () {
+    let b = testing::expect_ok(ir::Builder::new("InvalidCount", Vec::new(), Vec::new()), "builder");
+    let other = testing::expect_ok(ir::Builder::new("Other", Vec::new(), Vec::new()), "builder");
+    let foreign = testing::expect_ok(other.iconst(1), "foreign");
+    for op in Vec::from_array(
+        [ir::UnaryOp::Clz, ir::UnaryOp::Ctz, ir::UnaryOp::Popcnt, ir::UnaryOp::Bswap],
+    ) {
+        for datum in Vec::from_array([ir::Datum::Bool(true), ir::Datum::F64(1.0)]) {
+            let value = testing::expect_ok(b.ins(ir::Operation::Constant(datum)), "constant");
+            testing::assert_eq(
+                testing::expect_err(b.unary(op, value), "invalid type").kind,
+                ir::ErrorKind::TypeMismatch,
+            );
+            testing::assert_err(ir::evaluate_unary(op, datum));
+        }
+        testing::assert_eq(
+            testing::expect_err(b.unary(op, foreign), "foreign value").kind,
+            ir::ErrorKind::WrongFunction,
+        );
+    }
+}

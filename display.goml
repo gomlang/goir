@@ -11,6 +11,17 @@ impl Type {
     }
 }
 
+impl UnaryOp {
+    pub fn name(self: UnaryOp) -> string {
+        match self {
+            Clz => "clz",
+            Ctz => "ctz",
+            Popcnt => "popcnt",
+            Bswap => "bswap",
+        }
+    }
+}
+
 impl BinaryOp {
     pub fn name(self: BinaryOp) -> string {
         match self {
@@ -23,6 +34,12 @@ impl BinaryOp {
             Shl => "ishl",
             ShrU => "ushr",
             ShrS => "sshr",
+            Rotl => "irotl",
+            Rotr => "irotr",
+            Smin => "smin",
+            Smax => "smax",
+            Umin => "umin",
+            Umax => "umax",
             DivS => "sdiv",
             DivU => "udiv",
             RemS => "srem",
@@ -70,6 +87,7 @@ fn operation_text(operation: Operation) -> string {
         Select(condition, yes, no) => f"select v{condition.slot}, v{yes.slot}, v{no.slot}",
         FloatBinary(op, left, right) => op.name() + f" v{left.slot}, v{right.slot}",
         FloatCompare(cc, left, right) => "fcmp " + cc.name() + f" v{left.slot}, v{right.slot}",
+        Unary(op, value) => op.name() + f" v{value.slot}",
         Convert(conversion, value) => conversion.name() + f" v{value.slot}",
         StackLoad(slot) => f"stack_load slot{slot.slot}",
         StackStore(slot, value) => f"stack_store slot{slot.slot}, v{value.slot}",

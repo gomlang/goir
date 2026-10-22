@@ -46,6 +46,10 @@ fn evaluate(function: Function, operation: Operation, values: Vec[i64], slots: V
         } else {
             0
         },
+        Unary(op, value) => evaluate_unary(
+            op,
+            datum_from_bits(function.values[value.slot].ty, values[value.slot]),
+        )?.bits(),
         Convert(conversion, value) => match conversion {
             SignExtend | Truncate => values[value.slot].to_i32().to_i64(),
             ZeroExtend => values[value.slot].to_u32().to_i64(),

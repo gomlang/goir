@@ -9,6 +9,14 @@ pub enum Type {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub enum UnaryOp {
+    Clz,
+    Ctz,
+    Popcnt,
+    Bswap,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -19,6 +27,12 @@ pub enum BinaryOp {
     Shl,
     ShrU,
     ShrS,
+    Rotl,
+    Rotr,
+    Smin,
+    Smax,
+    Umin,
+    Umax,
     DivS,
     DivU,
     RemS,
@@ -180,6 +194,7 @@ pub enum Operation {
     Select(Value, Value, Value),
     FloatBinary(FloatOp, Value, Value),
     FloatCompare(FloatCC, Value, Value),
+    Unary(UnaryOp, Value),
     Convert(IntConversion, Value),
     StackLoad(StackSlot),
     StackStore(StackSlot, Value),
@@ -361,7 +376,7 @@ fn check_block(function: Function, block: Block) -> Result[(), Error] {
 pub fn operands(operation: Operation) -> Vec[Value] {
     match operation {
         Constant(_) | StackLoad(_) => Vec::new(),
-        Convert(_, value) | StackStore(_, value) => Vec::from_array([value]),
+        Unary(_, value) | Convert(_, value) | StackStore(_, value) => Vec::from_array([value]),
         Binary(_, left, right) | Compare(_, left, right) | FloatBinary(_, left, right) | FloatCompare(_, left, right) => Vec::from_array(
             [left, right],
         ),
@@ -409,6 +424,10 @@ fn operation_types(function: Function, operation: Operation) -> Result[Vec[Type]
                 FloatBinary(_, _, _) => Type::F64,
                 _ => Type::Bool,
             };
+            Result::Ok(Vec::from_array([ty]))
+        },
+        Unary(_, value) => {
+            let ty = require_integer_pair(function, value, value)?;
             Result::Ok(Vec::from_array([ty]))
         },
         Convert(conversion, value) => {

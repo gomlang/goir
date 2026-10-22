@@ -51,6 +51,9 @@ fn rewritten_operation(
                 rewritten_value(source, values, right)?,
             ),
         ),
+        Unary(op, value) => Result::Ok(
+            Operation::Unary(op, rewritten_value(source, values, value)?),
+        ),
         Convert(conversion, value) => Result::Ok(
             Operation::Convert(conversion, rewritten_value(source, values, value)?),
         ),

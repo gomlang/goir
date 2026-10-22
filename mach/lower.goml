@@ -187,6 +187,11 @@ fn lower_source(source: ir::Function) -> Result[Function, ir::Error] {
                         left: reg(identity, left, source)?,
                         right: reg(identity, right, source)?,
                     },
+                    Unary(op, value) => Instruction::Unary {
+                        dst,
+                        op,
+                        value: reg(identity, value, source)?,
+                    },
                     Convert(op, value) => Instruction::Convert {
                         dst,
                         op,
@@ -341,6 +346,11 @@ fn map_instruction(instruction: Instruction, mapping: Vec[isize]) -> Instruction
             condition: map_reg(condition, mapping),
             yes: map_reg(yes, mapping),
             no: map_reg(no, mapping),
+        },
+        Unary { dst, op, value } => Instruction::Unary {
+            dst: map_reg(dst, mapping),
+            op,
+            value: map_reg(value, mapping),
         },
         Convert { dst, op, value } => Instruction::Convert {
             dst: map_reg(dst, mapping),

@@ -76,11 +76,12 @@ fn allocated_instruction(
             lines.push("    MOVQ $" + bits.to_string() + ", AX");
             move_operand(lines, "AX", place_at(operands[0].location, base));
         },
-        Binary { op, dst, .. } => lines.push(
-            "    " + typed_binary_opcode(op, function.register_type(dst)?) + " "
-                + place_at(operands[1].location, base)
-                + ", "
-                + place_at(operands[2].location, base),
+        Binary { op, dst, .. } => emit_binary(
+            lines,
+            op,
+            function.register_type(dst)?,
+            place_at(operands[1].location, base),
+            place_at(operands[2].location, base),
         ),
         Divide { op, dst, .. } => emit_division(lines, op, function.register_type(dst)?, serial),
         CheckedShift { op, dst, .. } => emit_checked_shift(
@@ -153,6 +154,7 @@ fn allocated_instruction(
             lines.push("    MOVQ X1, X0");
             lines.push(f"select_done{label}:");
         },
+        Unary { op, dst, .. } => emit_unary(lines, op, function.register_type(dst)?, serial),
         Convert { op, .. } => lines.push(
             "    " + conversion_opcode(op) + " " + place_at(operands[0].location, base) + ", "
                 + place_at(operands[1].location, base),
